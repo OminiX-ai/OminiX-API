@@ -40,6 +40,11 @@ enum InferenceRequest {
         request: ImageGenerationRequest,
         response_tx: oneshot::Sender<eyre::Result<ImageGenerationResponse>>,
     },
+    /// Load/switch image generation model dynamically
+    LoadImageModel {
+        model_id: String,
+        response_tx: oneshot::Sender<eyre::Result<String>>,
+    },
 }
 
 /// Application state shared across HTTP handlers
@@ -157,26 +162,42 @@ fn inference_thread(
         None
     };
 
-    // Load Image model
-    let image_engine = if !config.image_model.is_empty() {
+    // Load Image model (can be changed dynamically)
+    let mut image_engine: Option<image::ImageEngine> = None;
+    let mut current_image_model: String = String::new();
+
+    if !config.image_model.is_empty() {
         tracing::info!("Loading image model: {}", config.image_model);
         match image::ImageEngine::new(&config.image_model) {
             Ok(engine) => {
                 tracing::info!("Image model loaded successfully");
+                current_image_model = config.image_model.clone();
                 models.push(ModelInfo {
-                    id: "flux-klein".to_string(),
+                    id: current_image_model.clone(),
                     model_type: "image".to_string(),
                 });
-                Some(engine)
+                image_engine = Some(engine);
             }
             Err(e) => {
                 tracing::warn!("Failed to load image model: {}", e);
-                None
             }
         }
-    } else {
-        None
-    };
+    }
+
+    // Helper to determine canonical model ID from user input
+    fn normalize_image_model(model: &str) -> &'static str {
+        let lower = model.to_lowercase();
+        if lower.contains("zimage") || lower.contains("z-image") {
+            "zimage"
+        } else if lower.contains("flux") {
+            "flux"
+        } else if lower == "zimage" || lower == "z-image-turbo" {
+            "zimage"
+        } else {
+            // Default to zimage for unknown models
+            "zimage"
+        }
+    }
 
     // Send models info back to main thread
     let _ = models_tx.send(models);
@@ -211,10 +232,55 @@ fn inference_thread(
                 let _ = response_tx.send(result);
             }
             InferenceRequest::Image { request, response_tx } => {
-                let result = if let Some(ref engine) = image_engine {
+                // Check if we need to switch models based on request
+                let requested_model = request.model.as_deref().unwrap_or("");
+                if !requested_model.is_empty() {
+                    let normalized = normalize_image_model(requested_model);
+                    let current_normalized = normalize_image_model(&current_image_model);
+
+                    if normalized != current_normalized || image_engine.is_none() {
+                        tracing::info!("Switching image model: {} -> {}", current_image_model, normalized);
+                        // Drop old engine to free memory
+                        image_engine = None;
+
+                        match image::ImageEngine::new(normalized) {
+                            Ok(engine) => {
+                                tracing::info!("Image model {} loaded successfully", normalized);
+                                current_image_model = normalized.to_string();
+                                image_engine = Some(engine);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to load image model {}: {}", normalized, e);
+                            }
+                        }
+                    }
+                }
+
+                let result = if let Some(ref mut engine) = image_engine {
                     engine.generate(&request)
                 } else {
-                    Err(eyre::eyre!("Image model not loaded"))
+                    Err(eyre::eyre!("Image model not loaded. Specify 'model': 'zimage' or 'flux' in your request."))
+                };
+                let _ = response_tx.send(result);
+            }
+            InferenceRequest::LoadImageModel { model_id, response_tx } => {
+                let normalized = normalize_image_model(&model_id);
+                tracing::info!("Loading image model: {} (normalized: {})", model_id, normalized);
+
+                // Drop old engine to free memory
+                image_engine = None;
+
+                let result = match image::ImageEngine::new(normalized) {
+                    Ok(engine) => {
+                        tracing::info!("Image model {} loaded successfully", normalized);
+                        current_image_model = normalized.to_string();
+                        image_engine = Some(engine);
+                        Ok(normalized.to_string())
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to load image model {}: {}", normalized, e);
+                        Err(e)
+                    }
                 };
                 let _ = response_tx.send(result);
             }
@@ -269,6 +335,7 @@ async fn main() -> eyre::Result<()> {
         // Health & Models
         .push(Router::with_path("health").get(health))
         .push(Router::with_path("v1/models").get(list_models))
+        .push(Router::with_path("v1/models/load").post(load_model))
         // Chat completions
         .push(Router::with_path("v1/chat/completions").post(chat_completions))
         // Audio endpoints
@@ -284,10 +351,11 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("Endpoints:");
     tracing::info!("  GET  /health");
     tracing::info!("  GET  /v1/models");
+    tracing::info!("  POST /v1/models/load         - Load model dynamically");
     tracing::info!("  POST /v1/chat/completions");
     tracing::info!("  POST /v1/audio/transcriptions");
     tracing::info!("  POST /v1/audio/speech");
-    tracing::info!("  POST /v1/images/generations");
+    tracing::info!("  POST /v1/images/generations  - Supports 'model': 'zimage' or 'flux'");
 
     Server::new(acceptor).serve(router).await;
 
@@ -325,6 +393,69 @@ async fn list_models(depot: &mut Depot, res: &mut Response) -> Result<(), Status
         "object": "list",
         "data": data
     })));
+    Ok(())
+}
+
+/// POST /v1/models/load - Load a model dynamically
+#[handler]
+async fn load_model(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = depot
+        .obtain::<AppState>()
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    #[derive(serde::Deserialize)]
+    struct LoadModelRequest {
+        model: String,
+        #[serde(default)]
+        model_type: Option<String>,
+    }
+
+    let request: LoadModelRequest = req.parse_json().await.map_err(|e| {
+        tracing::error!("Failed to parse request: {}", e);
+        StatusError::bad_request()
+    })?;
+
+    let model_type = request.model_type.as_deref().unwrap_or("image");
+
+    match model_type {
+        "image" => {
+            let (response_tx, response_rx) = oneshot::channel();
+            state.inference_tx.send(InferenceRequest::LoadImageModel {
+                model_id: request.model.clone(),
+                response_tx,
+            }).await.map_err(|_| StatusError::internal_server_error())?;
+
+            let result = response_rx.await
+                .map_err(|_| StatusError::internal_server_error())?;
+
+            match result {
+                Ok(loaded_model) => {
+                    res.render(Json(serde_json::json!({
+                        "status": "success",
+                        "model": loaded_model,
+                        "model_type": "image"
+                    })));
+                }
+                Err(e) => {
+                    res.render(Json(serde_json::json!({
+                        "status": "error",
+                        "error": e.to_string()
+                    })));
+                }
+            }
+        }
+        _ => {
+            res.render(Json(serde_json::json!({
+                "status": "error",
+                "error": format!("Dynamic loading not supported for model_type: {}", model_type)
+            })));
+        }
+    }
+
     Ok(())
 }
 
@@ -379,7 +510,8 @@ async fn audio_transcriptions(
         .obtain::<AppState>()
         .map_err(|_| StatusError::internal_server_error())?;
 
-    let request: TranscriptionRequest = req.parse_json().await.map_err(|e| {
+    // Use larger body size limit for audio uploads (10MB)
+    let request: TranscriptionRequest = req.parse_json_with_max_size(10 * 1024 * 1024).await.map_err(|e| {
         tracing::error!("Failed to parse request: {}", e);
         StatusError::bad_request()
     })?;
@@ -447,7 +579,8 @@ async fn images_generations(
         .obtain::<AppState>()
         .map_err(|_| StatusError::internal_server_error())?;
 
-    let request: ImageGenerationRequest = req.parse_json().await.map_err(|e| {
+    // Use larger body size limit for image uploads (10MB for img2img)
+    let request: ImageGenerationRequest = req.parse_json_with_max_size(10 * 1024 * 1024).await.map_err(|e| {
         tracing::error!("Failed to parse request: {}", e);
         StatusError::bad_request()
     })?;
