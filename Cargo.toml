@@ -22,7 +22,7 @@ mlx-rs-core = { path = "../OminiX-MLX/mlx-rs-core" }
 # Model-specific crates
 qwen3-mlx = { path = "../OminiX-MLX/qwen3-mlx" }
 funasr-mlx = { path = "../OminiX-MLX/funasr-mlx" }
-gpt-sovits-mlx = { path = "../OminiX-MLX/gpt-sovits-mlx/rust" }
+gpt-sovits-mlx = { path = "../OminiX-MLX/gpt-sovits-mlx" }
 flux-klein-mlx = { path = "../OminiX-MLX/flux-klein-mlx" }
 zimage-mlx = { path = "../OminiX-MLX/zimage-mlx" }
 
