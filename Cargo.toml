@@ -16,7 +16,7 @@ futures = "0.3"
 
 # MLX inference
 mlx-rs = { path = "../OminiX-MLX/mlx-rs", features = ["metal", "accelerate"] }
-mlx-sys = { path = "../OminiX-MLX/mlx-sys" }
+mlx-sys = { path = "../OminiX-MLX/mlx-rs/mlx-sys" }
 mlx-rs-core = { path = "../OminiX-MLX/mlx-rs-core" }
 
 # Model-specific crates
