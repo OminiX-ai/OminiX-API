@@ -521,12 +521,8 @@ impl ImageEngine {
         let image_data: Vec<f32> = image_flat.as_slice().to_vec();
         let rgb_bytes: Vec<u8> = image_data.iter().map(|&v| v.round() as u8).collect();
 
-        let mut ppm_data = Vec::new();
-        let header = format!("P6\n{} {}\n255\n", out_width, out_height);
-        ppm_data.extend_from_slice(header.as_bytes());
-        ppm_data.extend_from_slice(&rgb_bytes);
-
-        Ok(ppm_data)
+        // Convert to PNG
+        rgb_to_png(&rgb_bytes, out_width as u32, out_height as u32)
     }
 
     /// Z-Image-Turbo img2img generation
@@ -690,12 +686,8 @@ impl ImageEngine {
         let image_data: Vec<f32> = image_flat.as_slice().to_vec();
         let rgb_bytes: Vec<u8> = image_data.iter().map(|&v| v.round() as u8).collect();
 
-        let mut ppm_data = Vec::new();
-        let header = format!("P6\n{} {}\n255\n", out_width, out_height);
-        ppm_data.extend_from_slice(header.as_bytes());
-        ppm_data.extend_from_slice(&rgb_bytes);
-
-        Ok(ppm_data)
+        // Convert to PNG
+        rgb_to_png(&rgb_bytes, out_width as u32, out_height as u32)
     }
 
     /// Generate a single image
@@ -828,13 +820,8 @@ impl ImageEngine {
         let image_data: Vec<f32> = image_flat.as_slice().to_vec();
         let rgb_bytes: Vec<u8> = image_data.iter().map(|&v| v.round() as u8).collect();
 
-        // Create PPM image (simple format)
-        let mut ppm_data = Vec::new();
-        let header = format!("P6\n{} {}\n255\n", out_width, out_height);
-        ppm_data.extend_from_slice(header.as_bytes());
-        ppm_data.extend_from_slice(&rgb_bytes);
-
-        Ok(ppm_data)
+        // Convert to PNG
+        rgb_to_png(&rgb_bytes, out_width as u32, out_height as u32)
     }
 
     /// Z-Image-Turbo text-to-image generation
@@ -982,26 +969,59 @@ impl ImageEngine {
         let image_data: Vec<f32> = image_flat.as_slice().to_vec();
         let rgb_bytes: Vec<u8> = image_data.iter().map(|&v| v.round() as u8).collect();
 
-        let mut ppm_data = Vec::new();
-        let header = format!("P6\n{} {}\n255\n", out_width, out_height);
-        ppm_data.extend_from_slice(header.as_bytes());
-        ppm_data.extend_from_slice(&rgb_bytes);
-
-        Ok(ppm_data)
+        // Convert to PNG
+        rgb_to_png(&rgb_bytes, out_width as u32, out_height as u32)
     }
 }
 
-/// Parse size string like "512x512" into (width, height)
+/// Maximum allowed image dimension
+const MAX_IMAGE_DIM: u32 = 2048;
+/// Minimum allowed image dimension
+const MIN_IMAGE_DIM: u32 = 64;
+
+/// Parse size string like "512x512" into (width, height) with validation
 fn parse_size(size: &str) -> Result<(u32, u32)> {
     let parts: Vec<&str> = size.split('x').collect();
     if parts.len() != 2 {
-        return Err(eyre::eyre!("Invalid size format: {}", size));
+        return Err(eyre::eyre!("Invalid size format: {}. Expected WIDTHxHEIGHT (e.g., 512x512)", size));
     }
 
     let width: u32 = parts[0].parse().context("Invalid width")?;
     let height: u32 = parts[1].parse().context("Invalid height")?;
 
+    // Validate dimensions to prevent OOM
+    if width < MIN_IMAGE_DIM || width > MAX_IMAGE_DIM {
+        return Err(eyre::eyre!("Width must be between {} and {}, got {}", MIN_IMAGE_DIM, MAX_IMAGE_DIM, width));
+    }
+    if height < MIN_IMAGE_DIM || height > MAX_IMAGE_DIM {
+        return Err(eyre::eyre!("Height must be between {} and {}, got {}", MIN_IMAGE_DIM, MAX_IMAGE_DIM, height));
+    }
+
+    // Ensure dimensions are multiples of 8 (required for VAE)
+    if width % 8 != 0 || height % 8 != 0 {
+        return Err(eyre::eyre!("Width and height must be multiples of 8, got {}x{}", width, height));
+    }
+
     Ok((width, height))
+}
+
+/// Convert RGB bytes to PNG format
+fn rgb_to_png(rgb_bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    use image::{ImageBuffer, Rgb, ImageEncoder};
+
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(width, height, rgb_bytes.to_vec())
+        .ok_or_else(|| eyre::eyre!("Failed to create image buffer"))?;
+
+    let mut png_data = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
+    encoder.write_image(
+        img.as_raw(),
+        width,
+        height,
+        image::ExtendedColorType::Rgb8,
+    ).context("Failed to encode PNG")?;
+
+    Ok(png_data)
 }
 
 /// Create image position IDs for 4D RoPE

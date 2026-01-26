@@ -6,7 +6,7 @@ description = "OpenAI-compatible API server for OminiX-MLX models"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# HTTP Server (following dora-local-llm pattern)
+# HTTP Server
 salvo = { version = "0.81.0", default-features = false, features = [
     "affix-state", "cors", "server", "http1", "http2"
 ] }
@@ -14,25 +14,23 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
 
-# MLX inference (path to local workspace)
+# MLX inference
 mlx-rs = { path = "../OminiX-MLX/mlx-rs", features = ["metal", "accelerate"] }
 mlx-sys = { path = "../OminiX-MLX/mlx-sys" }
+mlx-rs-core = { path = "../OminiX-MLX/mlx-rs-core" }
 
 # Model-specific crates
-mistral-mlx = { path = "../OminiX-MLX/mistral-mlx" }
 qwen3-mlx = { path = "../OminiX-MLX/qwen3-mlx" }
-glm4-mlx = { path = "../OminiX-MLX/glm4-mlx" }
-mixtral-mlx = { path = "../OminiX-MLX/mixtral-mlx" }
-mlx-rs-lm = { path = "../OminiX-MLX/mlx-rs-lm" }
 funasr-mlx = { path = "../OminiX-MLX/funasr-mlx" }
+gpt-sovits-mlx = { path = "../OminiX-MLX/gpt-sovits-mlx/rust" }
 flux-klein-mlx = { path = "../OminiX-MLX/flux-klein-mlx" }
-qwen-image-mlx = { path = "../OminiX-MLX/qwen-image-mlx" }
+zimage-mlx = { path = "../OminiX-MLX/zimage-mlx" }
 
 # Model downloads
 hf-hub = "0.4"
 
 # Tokenization
-tokenizers = "0.21"
+tokenizers = "0.22"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -50,6 +48,9 @@ base64 = "0.22"
 
 # Audio processing
 hound = "3.5"
+
+# Image processing
+image = "0.25"
 
 [[bin]]
 name = "ominix-api"

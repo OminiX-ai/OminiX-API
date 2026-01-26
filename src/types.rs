@@ -131,6 +131,16 @@ pub struct ImageGenerationRequest {
     /// Quality: "standard" or "hd"
     #[serde(default)]
     pub quality: Option<String>,
+    /// Reference image (base64 encoded PNG/JPEG) for img2img
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Strength for img2img (0.0-1.0, higher = more variation from reference)
+    #[serde(default = "default_strength")]
+    pub strength: f32,
+}
+
+fn default_strength() -> f32 {
+    0.75
 }
 
 fn default_n() -> usize {

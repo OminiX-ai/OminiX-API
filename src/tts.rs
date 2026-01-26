@@ -1,7 +1,7 @@
-//! TTS (Text-to-Speech) engine using GPT-SoVITS via mlx-rs-lm
+//! TTS (Text-to-Speech) engine using GPT-SoVITS
 
 use eyre::{Context, Result};
-use mlx_rs_lm::voice_clone::{VoiceCloner, VoiceClonerConfig};
+use gpt_sovits_mlx::{VoiceCloner, VoiceClonerConfig};
 
 use crate::types::SpeechRequest;
 
