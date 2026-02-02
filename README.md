@@ -9,6 +9,8 @@ OpenAI-compatible API server for OminiX-MLX models on Apple Silicon.
 - **Speech-to-text** - Audio transcription with Paraformer ASR
 - **Text-to-speech** - Voice cloning with GPT-SoVITS
 - **Image generation** - Text-to-image with FLUX.2-klein and Z-Image-Turbo
+- **Dynamic model loading** - Switch models at runtime without server restart
+- **Memory efficient** - One model per category, automatic unloading when switching
 - **Pure Rust** - No Python dependencies at runtime
 
 ## Prerequisites
@@ -55,6 +57,8 @@ cargo run --release
 | `ASR_MODEL_DIR` | (empty) | Path to Paraformer model directory |
 | `TTS_REF_AUDIO` | (empty) | Path to reference audio for voice cloning |
 | `IMAGE_MODEL` | (empty) | Image model: `zimage` or `flux` |
+| `FLUX_MODEL_DIR` | (auto-download) | Custom path to FLUX.2-klein model |
+| `ZIMAGE_MODEL_DIR` | (auto-download) | Custom path to Z-Image-Turbo model |
 
 ## Endpoints
 
@@ -62,7 +66,9 @@ cargo run --release
 |----------|--------|-------------|
 | `/health` | GET | Health check |
 | `/v1/models` | GET | List loaded models |
-| `/v1/models/load` | POST | Load model dynamically |
+| `/v1/models/status` | GET | Get current model status for each category |
+| `/v1/models/load` | POST | Load/switch model dynamically |
+| `/v1/models/unload` | POST | Unload model to free memory |
 | `/v1/chat/completions` | POST | Chat completions (LLM) |
 | `/v1/audio/transcriptions` | POST | Speech-to-text (ASR) |
 | `/v1/audio/speech` | POST | Text-to-speech (TTS) |
@@ -200,10 +206,94 @@ curl http://localhost:8080/v1/images/generations \
   }"
 ```
 
-### Load Model Dynamically
+### Dynamic Model Management
+
+The server supports **one model per category** (LLM, ASR, TTS, Image). Models can be loaded, switched, and unloaded at runtime without restarting the server.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Model Slots                            │
+├─────────────┬─────────────┬─────────────┬───────────────┤
+│     LLM     │     ASR     │     TTS     │    Image      │
+│  (1 slot)   │  (1 slot)   │  (1 slot)   │   (1 slot)    │
+├─────────────┼─────────────┼─────────────┼───────────────┤
+│ Qwen/Mistral│  Paraformer │  GPT-SoVITS │  FLUX/Z-Image │
+└─────────────┴─────────────┴─────────────┴───────────────┘
+```
+
+#### Check Model Status
 
 ```bash
-# Switch image model at runtime
+curl http://localhost:8080/v1/models/status
+```
+
+**Response:**
+```json
+{
+  "status": "success",
+  "models": {
+    "llm": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+    "asr": null,
+    "tts": null,
+    "image": "zimage"
+  }
+}
+```
+
+#### Load/Switch LLM Model
+
+```bash
+# Load Qwen model
+curl http://localhost:8080/v1/models/load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+    "model_type": "llm"
+  }'
+
+# Switch to Mistral (Qwen is automatically unloaded first)
+curl http://localhost:8080/v1/models/load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+    "model_type": "llm"
+  }'
+```
+
+#### Load ASR Model
+
+```bash
+curl http://localhost:8080/v1/models/load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/path/to/paraformer/model",
+    "model_type": "asr"
+  }'
+```
+
+#### Load TTS Model
+
+```bash
+curl http://localhost:8080/v1/models/load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/path/to/reference/audio.wav",
+    "model_type": "tts"
+  }'
+```
+
+#### Load/Switch Image Model
+
+```bash
+# Load Z-Image (faster, 9 steps)
+curl http://localhost:8080/v1/models/load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zimage",
+    "model_type": "image"
+  }'
+
+# Switch to FLUX (higher quality, 4 steps)
 curl http://localhost:8080/v1/models/load \
   -H "Content-Type: application/json" \
   -d '{
@@ -211,6 +301,29 @@ curl http://localhost:8080/v1/models/load \
     "model_type": "image"
   }'
 ```
+
+#### Unload Model (Free Memory)
+
+```bash
+# Unload LLM to free GPU memory
+curl http://localhost:8080/v1/models/unload \
+  -H "Content-Type: application/json" \
+  -d '{"model_type": "llm"}'
+
+# Unload all models
+curl http://localhost:8080/v1/models/unload \
+  -H "Content-Type: application/json" \
+  -d '{"model_type": "all"}'
+```
+
+#### Model Type Reference
+
+| Type | Load Parameter | Description |
+|------|----------------|-------------|
+| `llm` | HuggingFace model ID | e.g., `mlx-community/Qwen2.5-7B-Instruct-4bit` |
+| `asr` | Path to model directory | Directory with `paraformer.safetensors` |
+| `tts` | Path to reference audio | WAV file for voice cloning |
+| `image` | `zimage` or `flux` | Image generation model |
 
 ---
 
@@ -256,40 +369,144 @@ TTS_REF_AUDIO=./audio/reference.wav cargo run --release
 
 ### Image Models
 
-Image models download automatically. Choose between:
+Image models download automatically from HuggingFace. Choose between:
 
 | Model | ID | Steps | Memory | Speed |
 |-------|----|-------|--------|-------|
 | Z-Image-Turbo | `zimage` | 9 | ~12 GB | ~3s |
 | FLUX.2-klein | `flux` | 4 | ~13 GB | ~5s |
 
+#### Model Download URLs
+
+**FLUX.2-klein (MLX format):**
+| Source | URL |
+|--------|-----|
+| HuggingFace | https://huggingface.co/black-forest-labs/FLUX.2-klein-4B |
+| ModelScope | https://modelscope.cn/models/black-forest-labs/FLUX.2-klein-4B |
+
+**Z-Image-Turbo (MLX format):**
+| Source | URL |
+|--------|-----|
+| HuggingFace | https://huggingface.co/uqer1244/MLX-z-image |
+
+**Original Models (for reference):**
+| Model | Original Source |
+|-------|-----------------|
+| FLUX.2-klein | https://huggingface.co/black-forest-labs/FLUX.1-schnell |
+| Z-Image-Turbo | https://huggingface.co/Zheng-Peng-Fei/Z-Image |
+
+#### Environment Variables for Image Models
+
+```bash
+# Use specific model (auto-downloads if not present)
+IMAGE_MODEL=flux cargo run --release    # Use FLUX.2-klein
+IMAGE_MODEL=zimage cargo run --release  # Use Z-Image-Turbo
+
+# Use custom local model path (optional)
+FLUX_MODEL_DIR=/path/to/flux-model cargo run --release
+ZIMAGE_MODEL_DIR=/path/to/zimage-model cargo run --release
+```
+
+#### Manual Download
+
+```bash
+# Download FLUX.2-klein
+huggingface-cli download black-forest-labs/FLUX.2-klein-4B --local-dir ./models/flux
+
+# Download Z-Image-Turbo
+huggingface-cli download uqer1244/MLX-z-image --local-dir ./models/zimage
+
+# Or using git lfs
+git lfs install
+git clone https://huggingface.co/black-forest-labs/FLUX.2-klein-4B ./models/flux
+git clone https://huggingface.co/uqer1244/MLX-z-image ./models/zimage
+```
+
+#### Model Directory Structure
+
+```
+models/flux/                          # FLUX.2-klein
+├── transformer/
+│   └── diffusion_pytorch_model.safetensors
+├── text_encoder/
+│   ├── model-00001-of-00002.safetensors
+│   └── model-00002-of-00002.safetensors
+├── vae/
+│   └── diffusion_pytorch_model.safetensors
+└── tokenizer/
+    └── tokenizer.json
+
+models/zimage/                        # Z-Image-Turbo
+├── transformer/
+│   └── model.safetensors
+├── text_encoder/
+│   └── model.safetensors
+├── vae/
+│   └── diffusion_pytorch_model.safetensors
+└── tokenizer/
+    └── tokenizer.json
+```
+
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   HTTP Server (Salvo)               │
-│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐   │
-│  │  /chat  │ │  /asr   │ │  /tts   │ │ /images │   │
-│  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘   │
-│       └───────────┴───────────┴───────────┘         │
-│                       │                             │
-│              mpsc::channel                          │
-│                       │                             │
-└───────────────────────┼─────────────────────────────┘
-                        ▼
-┌─────────────────────────────────────────────────────┐
-│            Inference Thread (owns models)           │
-│                                                     │
-│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐   │
-│  │  Qwen3  │ │Paraform-│ │GPT-SoV- │ │FLUX/Z-  │   │
-│  │   LLM   │ │   er    │ │  ITS    │ │ Image   │   │
-│  └─────────┘ └─────────┘ └─────────┘ └─────────┘   │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                   HTTP Server (Salvo)                    │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────────┐    │
+│  │  /chat  │ │  /asr   │ │  /tts   │ │   /images   │    │
+│  └────┬────┘ └────┬────┘ └────┬────┘ └──────┬──────┘    │
+│       │           │           │             │            │
+│  ┌────┴───────────┴───────────┴─────────────┴────┐      │
+│  │          /v1/models/load & /unload            │      │
+│  └───────────────────────┬───────────────────────┘      │
+│                          │                               │
+│              mpsc::channel (bounded: 32)                 │
+│                          │                               │
+└──────────────────────────┼───────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│              Inference Thread (owns models)              │
+│                                                          │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐     │
+│  │  LLM Slot    │ │  ASR Slot    │ │  TTS Slot    │     │
+│  │ ┌──────────┐ │ │ ┌──────────┐ │ │ ┌──────────┐ │     │
+│  │ │  Qwen3   │ │ │ │Paraformer│ │ │ │GPT-SoVITS│ │     │
+│  │ │    OR    │ │ │ │    OR    │ │ │ │    OR    │ │     │
+│  │ │ Mistral  │ │ │ │  (empty) │ │ │ │  (empty) │ │     │
+│  │ │    OR    │ │ │ └──────────┘ │ │ └──────────┘ │     │
+│  │ │  (empty) │ │ └──────────────┘ └──────────────┘     │
+│  │ └──────────┘ │                                       │
+│  └──────────────┘ ┌──────────────┐                      │
+│                   │ Image Slot   │                      │
+│                   │ ┌──────────┐ │                      │
+│                   │ │  Z-Image │ │                      │
+│                   │ │    OR    │ │                      │
+│                   │ │   FLUX   │ │                      │
+│                   │ │    OR    │ │                      │
+│                   │ │  (empty) │ │                      │
+│                   │ └──────────┘ │                      │
+│                   └──────────────┘                      │
+└─────────────────────────────────────────────────────────┘
 ```
 
-MLX models don't implement `Send`/`Sync`, so all models run on a dedicated inference thread. HTTP handlers communicate via async channels.
+**Key Design Points:**
+
+- **Actor Model**: MLX models don't implement `Send`/`Sync`, so all models run on a dedicated inference thread. HTTP handlers communicate via bounded async channels.
+
+- **One Model Per Slot**: Each category has exactly one model slot. Loading a new model automatically unloads the previous one to free GPU memory.
+
+- **Dynamic Loading**: Models can be loaded, switched, and unloaded at runtime via `/v1/models/load` and `/v1/models/unload` endpoints.
+
+- **Memory Efficient**: Unused model slots remain empty. Unload models you're not using to free GPU memory for other tasks.
+
+- **Request Timeouts**: All inference operations have configurable timeouts to prevent hanging:
+  - Chat: 5 minutes
+  - Transcription: 2 minutes
+  - TTS: 1 minute
+  - Image: 10 minutes
+  - Model loading: 5 minutes
 
 ## Performance
 

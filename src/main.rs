@@ -9,10 +9,23 @@
 //! Note: MLX models don't implement Send/Sync, so we use channels to
 //! communicate with a dedicated inference thread.
 
+use std::time::Duration;
 use eyre::Context;
 use salvo::cors::*;
 use salvo::prelude::*;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
+
+/// Timeout for LLM chat completions (can be long for large responses)
+const CHAT_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+/// Timeout for audio transcription
+const TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes
+/// Timeout for text-to-speech
+const TTS_TIMEOUT: Duration = Duration::from_secs(60); // 1 minute
+/// Timeout for image generation (can be slow depending on model)
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
+/// Timeout for model loading
+const MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
 mod types;
 mod llm;
@@ -40,11 +53,44 @@ enum InferenceRequest {
         request: ImageGenerationRequest,
         response_tx: oneshot::Sender<eyre::Result<ImageGenerationResponse>>,
     },
+    /// Load/switch LLM model dynamically
+    LoadLlmModel {
+        model_id: String,
+        response_tx: oneshot::Sender<eyre::Result<String>>,
+    },
+    /// Load/switch ASR model dynamically
+    LoadAsrModel {
+        model_dir: String,
+        response_tx: oneshot::Sender<eyre::Result<String>>,
+    },
+    /// Load/switch TTS model dynamically
+    LoadTtsModel {
+        ref_audio: String,
+        response_tx: oneshot::Sender<eyre::Result<String>>,
+    },
     /// Load/switch image generation model dynamically
     LoadImageModel {
         model_id: String,
         response_tx: oneshot::Sender<eyre::Result<String>>,
     },
+    /// Unload a model to free memory
+    UnloadModel {
+        model_type: String,
+        response_tx: oneshot::Sender<eyre::Result<String>>,
+    },
+    /// Get current model status
+    GetModelStatus {
+        response_tx: oneshot::Sender<ModelStatus>,
+    },
+}
+
+/// Current status of all models
+#[derive(Clone, serde::Serialize)]
+struct ModelStatus {
+    llm: Option<String>,
+    asr: Option<String>,
+    tts: Option<String>,
+    image: Option<String>,
 }
 
 /// Application state shared across HTTP handlers
@@ -99,12 +145,19 @@ fn inference_thread(
 ) {
     let mut models = Vec::new();
 
-    // Load LLM
-    let llm = if !config.llm_model.is_empty() {
+    // Track current model IDs for status reporting
+    let mut current_llm_model: Option<String> = None;
+    let mut current_asr_model: Option<String> = None;
+    let mut current_tts_model: Option<String> = None;
+    let mut current_image_model: Option<String> = None;
+
+    // Load LLM (mutable so it can be swapped)
+    let mut llm: Option<llm::LlmEngine> = if !config.llm_model.is_empty() {
         tracing::info!("Loading LLM model: {}", config.llm_model);
         match llm::LlmEngine::new(&config.llm_model) {
             Ok(engine) => {
                 tracing::info!("LLM model loaded successfully");
+                current_llm_model = Some(config.llm_model.clone());
                 models.push(ModelInfo {
                     id: config.llm_model.clone(),
                     model_type: "llm".to_string(),
@@ -120,12 +173,13 @@ fn inference_thread(
         None
     };
 
-    // Load ASR
-    let asr = if !config.asr_model_dir.is_empty() {
+    // Load ASR (mutable so it can be swapped)
+    let mut asr: Option<asr::AsrEngine> = if !config.asr_model_dir.is_empty() {
         tracing::info!("Loading ASR model from: {}", config.asr_model_dir);
         match asr::AsrEngine::new(&config.asr_model_dir) {
             Ok(engine) => {
                 tracing::info!("ASR model loaded successfully");
+                current_asr_model = Some(config.asr_model_dir.clone());
                 models.push(ModelInfo {
                     id: "paraformer".to_string(),
                     model_type: "asr".to_string(),
@@ -141,12 +195,13 @@ fn inference_thread(
         None
     };
 
-    // Load TTS
-    let mut tts = if !config.tts_ref_audio.is_empty() {
+    // Load TTS (mutable so it can be swapped)
+    let mut tts: Option<tts::TtsEngine> = if !config.tts_ref_audio.is_empty() {
         tracing::info!("Loading TTS model with ref audio: {}", config.tts_ref_audio);
         match tts::TtsEngine::new(&config.tts_ref_audio) {
             Ok(engine) => {
                 tracing::info!("TTS model loaded successfully");
+                current_tts_model = Some(config.tts_ref_audio.clone());
                 models.push(ModelInfo {
                     id: "gpt-sovits".to_string(),
                     model_type: "tts".to_string(),
@@ -162,27 +217,28 @@ fn inference_thread(
         None
     };
 
-    // Load Image model (can be changed dynamically)
-    let mut image_engine: Option<image::ImageEngine> = None;
-    let mut current_image_model: String = String::new();
-
-    if !config.image_model.is_empty() {
+    // Load Image model (mutable so it can be swapped)
+    let mut image_engine: Option<image::ImageEngine> = if !config.image_model.is_empty() {
         tracing::info!("Loading image model: {}", config.image_model);
         match image::ImageEngine::new(&config.image_model) {
             Ok(engine) => {
                 tracing::info!("Image model loaded successfully");
-                current_image_model = config.image_model.clone();
+                let normalized = normalize_image_model(&config.image_model);
+                current_image_model = Some(normalized.to_string());
                 models.push(ModelInfo {
-                    id: current_image_model.clone(),
+                    id: normalized.to_string(),
                     model_type: "image".to_string(),
                 });
-                image_engine = Some(engine);
+                Some(engine)
             }
             Err(e) => {
                 tracing::warn!("Failed to load image model: {}", e);
+                None
             }
         }
-    }
+    } else {
+        None
+    };
 
     // Helper to determine canonical model ID from user input
     fn normalize_image_model(model: &str) -> &'static str {
@@ -203,6 +259,7 @@ fn inference_thread(
     let _ = models_tx.send(models);
 
     tracing::info!("Inference thread ready, processing requests...");
+    tracing::info!("Dynamic model loading enabled - use POST /v1/models/load to switch models");
 
     // Process requests
     while let Some(request) = rx.blocking_recv() {
@@ -236,17 +293,17 @@ fn inference_thread(
                 let requested_model = request.model.as_deref().unwrap_or("");
                 if !requested_model.is_empty() {
                     let normalized = normalize_image_model(requested_model);
-                    let current_normalized = normalize_image_model(&current_image_model);
+                    let current_normalized = current_image_model.as_deref().unwrap_or("");
 
                     if normalized != current_normalized || image_engine.is_none() {
-                        tracing::info!("Switching image model: {} -> {}", current_image_model, normalized);
+                        tracing::info!("Switching image model: {:?} -> {}", current_image_model, normalized);
                         // Drop old engine to free memory
                         image_engine = None;
 
                         match image::ImageEngine::new(normalized) {
                             Ok(engine) => {
                                 tracing::info!("Image model {} loaded successfully", normalized);
-                                current_image_model = normalized.to_string();
+                                current_image_model = Some(normalized.to_string());
                                 image_engine = Some(engine);
                             }
                             Err(e) => {
@@ -263,17 +320,87 @@ fn inference_thread(
                 };
                 let _ = response_tx.send(result);
             }
+
+            // === Dynamic Model Loading ===
+
+            InferenceRequest::LoadLlmModel { model_id, response_tx } => {
+                tracing::info!("Loading LLM model: {}", model_id);
+
+                // Drop old engine to free memory before loading new one
+                llm = None;
+                current_llm_model = None;
+
+                let result = match llm::LlmEngine::new(&model_id) {
+                    Ok(engine) => {
+                        tracing::info!("LLM model {} loaded successfully", model_id);
+                        current_llm_model = Some(model_id.clone());
+                        llm = Some(engine);
+                        Ok(model_id)
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to load LLM model {}: {}", model_id, e);
+                        Err(e)
+                    }
+                };
+                let _ = response_tx.send(result);
+            }
+
+            InferenceRequest::LoadAsrModel { model_dir, response_tx } => {
+                tracing::info!("Loading ASR model from: {}", model_dir);
+
+                // Drop old engine to free memory
+                asr = None;
+                current_asr_model = None;
+
+                let result = match asr::AsrEngine::new(&model_dir) {
+                    Ok(engine) => {
+                        tracing::info!("ASR model loaded successfully from {}", model_dir);
+                        current_asr_model = Some(model_dir.clone());
+                        asr = Some(engine);
+                        Ok(model_dir)
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to load ASR model from {}: {}", model_dir, e);
+                        Err(e)
+                    }
+                };
+                let _ = response_tx.send(result);
+            }
+
+            InferenceRequest::LoadTtsModel { ref_audio, response_tx } => {
+                tracing::info!("Loading TTS model with ref audio: {}", ref_audio);
+
+                // Drop old engine to free memory
+                tts = None;
+                current_tts_model = None;
+
+                let result = match tts::TtsEngine::new(&ref_audio) {
+                    Ok(engine) => {
+                        tracing::info!("TTS model loaded successfully with ref: {}", ref_audio);
+                        current_tts_model = Some(ref_audio.clone());
+                        tts = Some(engine);
+                        Ok(ref_audio)
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to load TTS model with {}: {}", ref_audio, e);
+                        Err(e)
+                    }
+                };
+                let _ = response_tx.send(result);
+            }
+
             InferenceRequest::LoadImageModel { model_id, response_tx } => {
                 let normalized = normalize_image_model(&model_id);
                 tracing::info!("Loading image model: {} (normalized: {})", model_id, normalized);
 
                 // Drop old engine to free memory
                 image_engine = None;
+                current_image_model = None;
 
                 let result = match image::ImageEngine::new(normalized) {
                     Ok(engine) => {
                         tracing::info!("Image model {} loaded successfully", normalized);
-                        current_image_model = normalized.to_string();
+                        current_image_model = Some(normalized.to_string());
                         image_engine = Some(engine);
                         Ok(normalized.to_string())
                     }
@@ -283,6 +410,56 @@ fn inference_thread(
                     }
                 };
                 let _ = response_tx.send(result);
+            }
+
+            InferenceRequest::UnloadModel { model_type, response_tx } => {
+                tracing::info!("Unloading model type: {}", model_type);
+
+                let result = match model_type.as_str() {
+                    "llm" => {
+                        llm = None;
+                        let prev = current_llm_model.take();
+                        Ok(format!("Unloaded LLM model: {:?}", prev))
+                    }
+                    "asr" => {
+                        asr = None;
+                        let prev = current_asr_model.take();
+                        Ok(format!("Unloaded ASR model: {:?}", prev))
+                    }
+                    "tts" => {
+                        tts = None;
+                        let prev = current_tts_model.take();
+                        Ok(format!("Unloaded TTS model: {:?}", prev))
+                    }
+                    "image" => {
+                        image_engine = None;
+                        let prev = current_image_model.take();
+                        Ok(format!("Unloaded image model: {:?}", prev))
+                    }
+                    "all" => {
+                        llm = None;
+                        asr = None;
+                        tts = None;
+                        image_engine = None;
+                        current_llm_model = None;
+                        current_asr_model = None;
+                        current_tts_model = None;
+                        current_image_model = None;
+                        Ok("Unloaded all models".to_string())
+                    }
+                    _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, image, or all", model_type)),
+                };
+                let _ = response_tx.send(result);
+            }
+
+            InferenceRequest::GetModelStatus { response_tx } => {
+                let status = ModelStatus {
+                    llm: current_llm_model.clone(),
+                    asr: current_asr_model.clone(),
+                    tts: current_tts_model.clone(),
+                    image: current_image_model.clone(),
+                };
+                let _ = response_tx.send(status);
             }
         }
     }
@@ -335,7 +512,9 @@ async fn main() -> eyre::Result<()> {
         // Health & Models
         .push(Router::with_path("health").get(health))
         .push(Router::with_path("v1/models").get(list_models))
+        .push(Router::with_path("v1/models/status").get(model_status))
         .push(Router::with_path("v1/models/load").post(load_model))
+        .push(Router::with_path("v1/models/unload").post(unload_model))
         // Chat completions
         .push(Router::with_path("v1/chat/completions").post(chat_completions))
         // Audio endpoints
@@ -351,11 +530,17 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("Endpoints:");
     tracing::info!("  GET  /health");
     tracing::info!("  GET  /v1/models");
+    tracing::info!("  GET  /v1/models/status       - Get current model status");
     tracing::info!("  POST /v1/models/load         - Load model dynamically");
+    tracing::info!("  POST /v1/models/unload       - Unload model to free memory");
     tracing::info!("  POST /v1/chat/completions");
     tracing::info!("  POST /v1/audio/transcriptions");
     tracing::info!("  POST /v1/audio/speech");
-    tracing::info!("  POST /v1/images/generations  - Supports 'model': 'zimage' or 'flux'");
+    tracing::info!("  POST /v1/images/generations");
+    tracing::info!("");
+    tracing::info!("Dynamic model loading examples:");
+    tracing::info!("  curl -X POST http://localhost:{}/v1/models/load -H 'Content-Type: application/json' -d '{{\"model\": \"mlx-community/Qwen2.5-7B-Instruct-4bit\", \"model_type\": \"llm\"}}'", config.port);
+    tracing::info!("  curl -X POST http://localhost:{}/v1/models/unload -H 'Content-Type: application/json' -d '{{\"model_type\": \"llm\"}}'", config.port);
 
     Server::new(acceptor).serve(router).await;
 
@@ -396,7 +581,41 @@ async fn list_models(depot: &mut Depot, res: &mut Response) -> Result<(), Status
     Ok(())
 }
 
+/// GET /v1/models/status - Get current model status
+#[handler]
+async fn model_status(
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = depot
+        .obtain::<AppState>()
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    let (response_tx, response_rx) = oneshot::channel();
+    state.inference_tx.send(InferenceRequest::GetModelStatus {
+        response_tx,
+    }).await.map_err(|_| StatusError::internal_server_error())?;
+
+    let status = response_rx.await
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    res.render(Json(serde_json::json!({
+        "status": "success",
+        "models": status
+    })));
+    Ok(())
+}
+
 /// POST /v1/models/load - Load a model dynamically
+///
+/// Request body:
+/// - model: Model ID or path (required)
+/// - model_type: "llm", "asr", "tts", or "image" (default: "llm")
+///
+/// For LLM: model is a HuggingFace model ID (e.g., "mlx-community/Qwen2.5-7B-Instruct-4bit")
+/// For ASR: model is a path to the model directory
+/// For TTS: model is a path to the reference audio file
+/// For Image: model is "zimage" or "flux"
 #[handler]
 async fn load_model(
     req: &mut Request,
@@ -410,8 +629,12 @@ async fn load_model(
     #[derive(serde::Deserialize)]
     struct LoadModelRequest {
         model: String,
-        #[serde(default)]
-        model_type: Option<String>,
+        #[serde(default = "default_model_type")]
+        model_type: String,
+    }
+
+    fn default_model_type() -> String {
+        "llm".to_string()
     }
 
     let request: LoadModelRequest = req.parse_json().await.map_err(|e| {
@@ -419,39 +642,127 @@ async fn load_model(
         StatusError::bad_request()
     })?;
 
-    let model_type = request.model_type.as_deref().unwrap_or("image");
+    let model_type = request.model_type.as_str();
+    tracing::info!("Loading model: {} (type: {})", request.model, model_type);
 
-    match model_type {
+    let inference_request = match model_type {
+        "llm" => {
+            let (response_tx, response_rx) = oneshot::channel();
+            state.inference_tx.send(InferenceRequest::LoadLlmModel {
+                model_id: request.model.clone(),
+                response_tx,
+            }).await.map_err(|_| StatusError::internal_server_error())?;
+            response_rx
+        }
+        "asr" => {
+            let (response_tx, response_rx) = oneshot::channel();
+            state.inference_tx.send(InferenceRequest::LoadAsrModel {
+                model_dir: request.model.clone(),
+                response_tx,
+            }).await.map_err(|_| StatusError::internal_server_error())?;
+            response_rx
+        }
+        "tts" => {
+            let (response_tx, response_rx) = oneshot::channel();
+            state.inference_tx.send(InferenceRequest::LoadTtsModel {
+                ref_audio: request.model.clone(),
+                response_tx,
+            }).await.map_err(|_| StatusError::internal_server_error())?;
+            response_rx
+        }
         "image" => {
             let (response_tx, response_rx) = oneshot::channel();
             state.inference_tx.send(InferenceRequest::LoadImageModel {
                 model_id: request.model.clone(),
                 response_tx,
             }).await.map_err(|_| StatusError::internal_server_error())?;
-
-            let result = response_rx.await
-                .map_err(|_| StatusError::internal_server_error())?;
-
-            match result {
-                Ok(loaded_model) => {
-                    res.render(Json(serde_json::json!({
-                        "status": "success",
-                        "model": loaded_model,
-                        "model_type": "image"
-                    })));
-                }
-                Err(e) => {
-                    res.render(Json(serde_json::json!({
-                        "status": "error",
-                        "error": e.to_string()
-                    })));
-                }
-            }
+            response_rx
         }
         _ => {
             res.render(Json(serde_json::json!({
                 "status": "error",
-                "error": format!("Dynamic loading not supported for model_type: {}", model_type)
+                "error": format!("Unknown model_type: {}. Use: llm, asr, tts, or image", model_type)
+            })));
+            return Ok(());
+        }
+    };
+
+    let result = timeout(MODEL_LOAD_TIMEOUT, inference_request).await
+        .map_err(|_| {
+            tracing::error!("Model loading timed out after {:?}", MODEL_LOAD_TIMEOUT);
+            StatusError::gateway_timeout()
+        })?
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    match result {
+        Ok(loaded_model) => {
+            res.render(Json(serde_json::json!({
+                "status": "success",
+                "model": loaded_model,
+                "model_type": model_type
+            })));
+        }
+        Err(e) => {
+            res.render(Json(serde_json::json!({
+                "status": "error",
+                "error": e.to_string()
+            })));
+        }
+    }
+
+    Ok(())
+}
+
+/// POST /v1/models/unload - Unload a model to free memory
+///
+/// Request body:
+/// - model_type: "llm", "asr", "tts", "image", or "all"
+#[handler]
+async fn unload_model(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = depot
+        .obtain::<AppState>()
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    #[derive(serde::Deserialize)]
+    struct UnloadModelRequest {
+        model_type: String,
+    }
+
+    let request: UnloadModelRequest = req.parse_json().await.map_err(|e| {
+        tracing::error!("Failed to parse request: {}", e);
+        StatusError::bad_request()
+    })?;
+
+    tracing::info!("Unloading model type: {}", request.model_type);
+
+    let (response_tx, response_rx) = oneshot::channel();
+    state.inference_tx.send(InferenceRequest::UnloadModel {
+        model_type: request.model_type.clone(),
+        response_tx,
+    }).await.map_err(|_| StatusError::internal_server_error())?;
+
+    let result = timeout(Duration::from_secs(30), response_rx).await
+        .map_err(|_| {
+            tracing::error!("Model unloading timed out");
+            StatusError::gateway_timeout()
+        })?
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    match result {
+        Ok(message) => {
+            res.render(Json(serde_json::json!({
+                "status": "success",
+                "message": message
+            })));
+        }
+        Err(e) => {
+            res.render(Json(serde_json::json!({
+                "status": "error",
+                "error": e.to_string()
             })));
         }
     }
@@ -487,8 +798,12 @@ async fn chat_completions(
         response_tx,
     }).await.map_err(|_| StatusError::internal_server_error())?;
 
-    // Wait for response
-    let response = response_rx.await
+    // Wait for response with timeout
+    let response = timeout(CHAT_TIMEOUT, response_rx).await
+        .map_err(|_| {
+            tracing::error!("Chat completion timed out after {:?}", CHAT_TIMEOUT);
+            StatusError::gateway_timeout()
+        })?
         .map_err(|_| StatusError::internal_server_error())?
         .map_err(|e| {
             tracing::error!("Generation error: {}", e);
@@ -522,7 +837,11 @@ async fn audio_transcriptions(
         response_tx,
     }).await.map_err(|_| StatusError::internal_server_error())?;
 
-    let response = response_rx.await
+    let response = timeout(TRANSCRIPTION_TIMEOUT, response_rx).await
+        .map_err(|_| {
+            tracing::error!("Transcription timed out after {:?}", TRANSCRIPTION_TIMEOUT);
+            StatusError::gateway_timeout()
+        })?
         .map_err(|_| StatusError::internal_server_error())?
         .map_err(|e| {
             tracing::error!("Transcription error: {}", e);
@@ -555,7 +874,11 @@ async fn audio_speech(
         response_tx,
     }).await.map_err(|_| StatusError::internal_server_error())?;
 
-    let audio_data = response_rx.await
+    let audio_data = timeout(TTS_TIMEOUT, response_rx).await
+        .map_err(|_| {
+            tracing::error!("TTS timed out after {:?}", TTS_TIMEOUT);
+            StatusError::gateway_timeout()
+        })?
         .map_err(|_| StatusError::internal_server_error())?
         .map_err(|e| {
             tracing::error!("TTS error: {}", e);
@@ -591,7 +914,11 @@ async fn images_generations(
         response_tx,
     }).await.map_err(|_| StatusError::internal_server_error())?;
 
-    let response = response_rx.await
+    let response = timeout(IMAGE_TIMEOUT, response_rx).await
+        .map_err(|_| {
+            tracing::error!("Image generation timed out after {:?}", IMAGE_TIMEOUT);
+            StatusError::gateway_timeout()
+        })?
         .map_err(|_| StatusError::internal_server_error())?
         .map_err(|e| {
             tracing::error!("Image generation error: {}", e);

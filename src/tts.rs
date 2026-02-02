@@ -1,9 +1,66 @@
 //! TTS (Text-to-Speech) engine using GPT-SoVITS
 
+use std::path::Path;
 use eyre::{Context, Result};
 use gpt_sovits_mlx::{VoiceCloner, VoiceClonerConfig};
 
 use crate::types::SpeechRequest;
+
+/// Allowed directory for voice reference files (configurable via env)
+fn allowed_voices_dir() -> Option<String> {
+    std::env::var("TTS_VOICES_DIR").ok()
+}
+
+/// Validate that a voice path is safe (no path traversal)
+fn is_safe_voice_path(voice: &str) -> bool {
+    let path = Path::new(voice);
+
+    // Reject absolute paths unless they're in the allowed directory
+    if path.is_absolute() {
+        if let Some(allowed_dir) = allowed_voices_dir() {
+            // Canonicalize both paths to resolve any symlinks/.. sequences
+            if let (Ok(voice_canonical), Ok(allowed_canonical)) = (
+                path.canonicalize(),
+                Path::new(&allowed_dir).canonicalize()
+            ) {
+                return voice_canonical.starts_with(&allowed_canonical);
+            }
+        }
+        return false;
+    }
+
+    // Reject paths with traversal sequences
+    let voice_str = voice.to_lowercase();
+    if voice_str.contains("..") || voice_str.contains("./") || voice_str.contains("/.") {
+        return false;
+    }
+
+    // Reject paths that look like they're trying to escape
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => return false,
+            std::path::Component::CurDir => return false,
+            _ => {}
+        }
+    }
+
+    // If we have an allowed directory, construct the full path and validate
+    if let Some(allowed_dir) = allowed_voices_dir() {
+        let full_path = Path::new(&allowed_dir).join(voice);
+        if let Ok(canonical) = full_path.canonicalize() {
+            if let Ok(allowed_canonical) = Path::new(&allowed_dir).canonicalize() {
+                return canonical.starts_with(&allowed_canonical);
+            }
+        }
+        return false;
+    }
+
+    // Without an allowed directory configured, only accept simple filenames
+    // (no directory components at all)
+    path.file_name()
+        .map(|f| f.to_string_lossy() == voice)
+        .unwrap_or(false)
+}
 
 /// TTS inference engine using GPT-SoVITS
 pub struct TtsEngine {
@@ -40,8 +97,26 @@ impl TtsEngine {
     pub fn synthesize(&mut self, request: &SpeechRequest) -> Result<Vec<u8>> {
         // If a different voice is requested, try to use it as reference
         if let Some(ref voice) = request.voice {
-            if voice != &self.ref_audio_path && std::path::Path::new(voice).exists() {
-                self.cloner.set_reference_audio(voice)
+            // Security: Validate voice path to prevent path traversal attacks
+            if !is_safe_voice_path(voice) {
+                return Err(eyre::eyre!(
+                    "Invalid voice path: must be a simple filename or within TTS_VOICES_DIR"
+                ));
+            }
+
+            // Resolve the full path if using allowed directory
+            let voice_path = if let Some(allowed_dir) = allowed_voices_dir() {
+                if Path::new(voice).is_absolute() {
+                    voice.to_string()
+                } else {
+                    Path::new(&allowed_dir).join(voice).to_string_lossy().to_string()
+                }
+            } else {
+                voice.to_string()
+            };
+
+            if voice_path != self.ref_audio_path && Path::new(&voice_path).exists() {
+                self.cloner.set_reference_audio(&voice_path)
                     .context("Failed to set new reference audio")?;
             }
         }
