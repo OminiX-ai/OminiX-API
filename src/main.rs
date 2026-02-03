@@ -565,9 +565,9 @@ async fn main() -> eyre::Result<()> {
         // Voice cloning training
         .push(Router::with_path("v1/voices").get(list_voices))
         .push(Router::with_path("v1/voices/train").post(start_voice_training))
-        .push(Router::with_path("v1/voices/train/<task_id>").get(get_training_status))
-        .push(Router::with_path("v1/voices/train/<task_id>/progress").get(training_progress_sse))
-        .push(Router::with_path("v1/voices/train/<task_id>/cancel").post(cancel_training));
+        .push(Router::with_path("v1/voices/train/status").get(get_training_status))
+        .push(Router::with_path("v1/voices/train/progress").get(training_progress_sse))
+        .push(Router::with_path("v1/voices/train/cancel").post(cancel_training));
 
     let listen_addr = format!("0.0.0.0:{}", config.port);
     let acceptor = TcpListener::new(&listen_addr).bind().await;
@@ -1126,8 +1126,12 @@ async fn get_training_status(
     let state = depot.obtain::<AppState>()
         .map_err(|_| StatusError::internal_server_error())?;
 
-    let task_id: String = req.param("task_id")
-        .ok_or(StatusError::bad_request())?;
+    let task_id: String = req.query::<String>("task_id")
+        .unwrap_or_default();
+    if task_id.is_empty() {
+        res.render(Json(serde_json::json!({"error": "task_id query parameter required"})));
+        return Ok(());
+    }
 
     let (response_tx, response_rx) = oneshot::channel();
     state.training_tx.send(training::TrainingRequest::GetStatus {
@@ -1166,8 +1170,12 @@ async fn training_progress_sse(
     let state = depot.obtain::<AppState>()
         .map_err(|_| StatusError::internal_server_error())?;
 
-    let task_id: String = req.param("task_id")
-        .ok_or(StatusError::bad_request())?;
+    let task_id: String = req.query::<String>("task_id")
+        .unwrap_or_default();
+    if task_id.is_empty() {
+        res.render(Json(serde_json::json!({"error": "task_id query parameter required"})));
+        return Ok(());
+    }
 
     // Subscribe to progress events
     let rx = state.progress_tx.subscribe();
@@ -1200,8 +1208,12 @@ async fn cancel_training(
     let state = depot.obtain::<AppState>()
         .map_err(|_| StatusError::internal_server_error())?;
 
-    let task_id: String = req.param("task_id")
-        .ok_or(StatusError::bad_request())?;
+    let task_id: String = req.query::<String>("task_id")
+        .unwrap_or_default();
+    if task_id.is_empty() {
+        res.render(Json(serde_json::json!({"error": "task_id query parameter required"})));
+        return Ok(());
+    }
 
     let (response_tx, response_rx) = oneshot::channel();
     state.training_tx.send(training::TrainingRequest::CancelTraining {
