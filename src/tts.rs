@@ -41,6 +41,10 @@ struct VoiceConfig {
     #[serde(default)]
     #[allow(dead_code)]
     speed_factor: Option<f32>,
+    /// Finetuned VITS model weights (from voice cloning training)
+    #[serde(default)]
+    #[allow(dead_code)]
+    vits_weights: Option<String>,
 }
 
 fn default_voice() -> String {
@@ -209,6 +213,13 @@ impl TtsEngine {
             voices,
             current_voice: None,
         })
+    }
+
+    /// Reload voice registry (called after training registers a new voice)
+    pub fn reload_voices(&mut self) {
+        self.voices = VoicesConfig::load();
+        self.current_voice = None; // force re-evaluation on next request
+        tracing::info!("Voice registry reloaded");
     }
 
     /// Synthesize speech from text

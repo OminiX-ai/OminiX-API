@@ -6,16 +6,22 @@
 //! - POST /v1/audio/speech - Text-to-speech (TTS)
 //! - POST /v1/images/generations - Image generation
 //! - WS   /ws/v1/tts - WebSocket streaming TTS with per-message voice switching
+//! - POST /v1/voices/train - Voice cloning training (quick mode)
+//! - GET  /v1/voices/train/{id}/progress - SSE training progress stream
+//! - GET  /v1/voices - List registered voices
 //!
 //! Note: MLX models don't implement Send/Sync, so we use channels to
-//! communicate with a dedicated inference thread.
+//! communicate with dedicated inference and training threads.
 
 use std::time::Duration;
 use eyre::Context;
 use salvo::cors::*;
 use salvo::prelude::*;
-use tokio::sync::{mpsc, oneshot};
+use salvo::sse::{SseEvent, SseKeepAlive};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::timeout;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 use salvo::websocket::{Message, WebSocket, WebSocketUpgrade};
 
 /// Timeout for LLM chat completions (can be long for large responses)
@@ -35,6 +41,7 @@ mod asr;
 mod tts;
 mod image;
 mod model_config;
+mod training;
 
 use types::*;
 
@@ -85,6 +92,10 @@ enum InferenceRequest {
     GetModelStatus {
         response_tx: oneshot::Sender<ModelStatus>,
     },
+    /// Reload voices.json after training completes
+    ReloadVoices {
+        response_tx: oneshot::Sender<eyre::Result<()>>,
+    },
 }
 
 /// Current status of all models
@@ -101,6 +112,10 @@ struct ModelStatus {
 pub struct AppState {
     /// Channel to send inference requests
     inference_tx: mpsc::Sender<InferenceRequest>,
+    /// Channel to send training requests
+    training_tx: mpsc::Sender<training::TrainingRequest>,
+    /// Broadcast channel for training progress events (Sender is Clone)
+    progress_tx: broadcast::Sender<TrainingProgressEvent>,
     /// Available models info
     models: Vec<ModelInfo>,
 }
@@ -458,6 +473,16 @@ fn inference_thread(
                 };
                 let _ = response_tx.send(status);
             }
+
+            InferenceRequest::ReloadVoices { response_tx } => {
+                tracing::info!("Reloading voice registry");
+                if let Some(ref mut engine) = tts {
+                    engine.reload_voices();
+                    let _ = response_tx.send(Ok(()));
+                } else {
+                    let _ = response_tx.send(Ok(()));
+                }
+            }
         }
     }
 
@@ -484,10 +509,21 @@ async fn main() -> eyre::Result<()> {
     let (inference_tx, inference_rx) = mpsc::channel::<InferenceRequest>(32);
     let (models_tx, models_rx) = oneshot::channel();
 
+    // Create channels for training
+    let (training_tx, training_rx) = mpsc::channel::<training::TrainingRequest>(8);
+    let (progress_tx, _) = broadcast::channel::<TrainingProgressEvent>(256);
+
     // Spawn inference thread (owns all models)
     let config_clone = config.clone();
     std::thread::spawn(move || {
         inference_thread(config_clone, inference_rx, models_tx);
+    });
+
+    // Spawn training thread (owns training models, separate from inference)
+    let progress_tx_clone = progress_tx.clone();
+    let inference_tx_for_training = inference_tx.clone();
+    std::thread::spawn(move || {
+        training::training_thread(training_rx, progress_tx_clone, inference_tx_for_training);
     });
 
     // Wait for models to load
@@ -496,6 +532,8 @@ async fn main() -> eyre::Result<()> {
 
     let state = AppState {
         inference_tx,
+        training_tx,
+        progress_tx,
         models,
     };
 
@@ -523,7 +561,13 @@ async fn main() -> eyre::Result<()> {
         // Image generation
         .push(Router::with_path("v1/images/generations").post(images_generations))
         // WebSocket TTS
-        .push(Router::with_path("ws/v1/tts").get(ws_tts));
+        .push(Router::with_path("ws/v1/tts").get(ws_tts))
+        // Voice cloning training
+        .push(Router::with_path("v1/voices").get(list_voices))
+        .push(Router::with_path("v1/voices/train").post(start_voice_training))
+        .push(Router::with_path("v1/voices/train/<task_id>").get(get_training_status))
+        .push(Router::with_path("v1/voices/train/<task_id>/progress").get(training_progress_sse))
+        .push(Router::with_path("v1/voices/train/<task_id>/cancel").post(cancel_training));
 
     let listen_addr = format!("0.0.0.0:{}", config.port);
     let acceptor = TcpListener::new(&listen_addr).bind().await;
@@ -540,6 +584,10 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("  POST /v1/audio/speech");
     tracing::info!("  POST /v1/images/generations");
     tracing::info!("  WS   /ws/v1/tts              - WebSocket streaming TTS");
+    tracing::info!("  GET  /v1/voices              - List registered voices");
+    tracing::info!("  POST /v1/voices/train        - Start voice cloning training");
+    tracing::info!("  GET  /v1/voices/train/{{id}}    - Get training task status");
+    tracing::info!("  GET  /v1/voices/train/{{id}}/progress - SSE training progress");
     tracing::info!("");
     tracing::info!("Dynamic model loading examples:");
     tracing::info!("  curl -X POST http://localhost:{}/v1/models/load -H 'Content-Type: application/json' -d '{{\"model\": \"mlx-community/Qwen2.5-7B-Instruct-4bit\", \"model_type\": \"llm\"}}'", config.port);
@@ -931,6 +979,273 @@ async fn images_generations(
     res.render(Json(response));
     Ok(())
 }
+
+// ============================================================================
+// Voice Cloning Training Endpoints
+// ============================================================================
+
+/// GET /v1/voices - List all registered voices
+#[handler]
+async fn list_voices(res: &mut Response) {
+    // Read voices.json directly
+    let voices_path = expand_main_tilde("~/.dora/models/primespeech/voices.json");
+    let voices = match std::fs::read_to_string(&voices_path) {
+        Ok(content) => {
+            match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(config) => {
+                    let mut voice_list = Vec::new();
+                    if let Some(voices) = config.get("voices").and_then(|v| v.as_object()) {
+                        for (name, voice) in voices {
+                            let aliases = voice.get("aliases")
+                                .and_then(|a| a.as_array())
+                                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                                .unwrap_or_default();
+                            voice_list.push(VoiceInfo {
+                                name: name.clone(),
+                                aliases,
+                            });
+                        }
+                    }
+                    voice_list
+                }
+                Err(_) => Vec::new(),
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    res.render(Json(VoiceListResponse { voices }));
+}
+
+/// POST /v1/voices/train - Start voice cloning training
+#[handler]
+async fn start_voice_training(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = depot.obtain::<AppState>()
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    // Parse request (50MB limit for audio data)
+    let request: VoiceTrainRequest = req.parse_json_with_max_size(50 * 1024 * 1024)
+        .await.map_err(|e| {
+            tracing::error!("Failed to parse training request: {}", e);
+            StatusError::bad_request()
+        })?;
+
+    if request.voice_name.is_empty() {
+        res.render(Json(serde_json::json!({
+            "status": "error",
+            "message": "voice_name is required"
+        })));
+        return Ok(());
+    }
+
+    if request.transcript.is_empty() {
+        res.render(Json(serde_json::json!({
+            "status": "error",
+            "message": "transcript is required"
+        })));
+        return Ok(());
+    }
+
+    // Generate task ID
+    let task_id = format!("train-{}", uuid::Uuid::new_v4().simple());
+
+    // Decode and save audio to a temporary directory
+    let base_dir = std::env::var("TRAINING_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .map(|h| h.join(".dora/training"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/ominix-training"))
+        });
+    let work_dir = base_dir.join(&task_id);
+    std::fs::create_dir_all(&work_dir)
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    let audio_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &request.audio,
+    ).map_err(|e| {
+        tracing::error!("Base64 decode failed: {}", e);
+        StatusError::bad_request()
+    })?;
+
+    let audio_path = work_dir.join("ref_audio.wav");
+    std::fs::write(&audio_path, &audio_bytes)
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    // Send training request to training thread
+    let (response_tx, response_rx) = oneshot::channel();
+    state.training_tx.send(training::TrainingRequest::StartTraining {
+        task_id: task_id.clone(),
+        voice_name: request.voice_name.clone(),
+        audio_path,
+        transcript: request.transcript,
+        quality: request.quality,
+        language: request.language,
+        denoise: request.denoise,
+        response_tx,
+    }).await.map_err(|_| StatusError::internal_server_error())?;
+
+    // Wait for acknowledgement (not completion)
+    match response_rx.await {
+        Ok(Ok(())) => {
+            res.render(Json(VoiceTrainResponse {
+                task_id,
+                status: "accepted".to_string(),
+                message: format!("Training started for voice '{}'", request.voice_name),
+            }));
+        }
+        Ok(Err(e)) => {
+            res.render(Json(serde_json::json!({
+                "status": "error",
+                "message": e.to_string()
+            })));
+        }
+        Err(_) => {
+            res.render(Json(serde_json::json!({
+                "status": "error",
+                "message": "Training thread unavailable"
+            })));
+        }
+    }
+
+    Ok(())
+}
+
+/// GET /v1/voices/train/{task_id} - Get training task status
+#[handler]
+async fn get_training_status(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = depot.obtain::<AppState>()
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    let task_id: String = req.param("task_id")
+        .ok_or(StatusError::bad_request())?;
+
+    let (response_tx, response_rx) = oneshot::channel();
+    state.training_tx.send(training::TrainingRequest::GetStatus {
+        task_id: task_id.clone(),
+        response_tx,
+    }).await.map_err(|_| StatusError::internal_server_error())?;
+
+    match timeout(Duration::from_secs(5), response_rx).await {
+        Ok(Ok(Some(status))) => {
+            res.render(Json(status));
+        }
+        Ok(Ok(None)) => {
+            res.render(Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Task not found: {}", task_id)
+            })));
+        }
+        _ => {
+            res.render(Json(serde_json::json!({
+                "status": "error",
+                "message": "Training thread unavailable"
+            })));
+        }
+    }
+
+    Ok(())
+}
+
+/// GET /v1/voices/train/{task_id}/progress - SSE streaming training progress
+#[handler]
+async fn training_progress_sse(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = depot.obtain::<AppState>()
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    let task_id: String = req.param("task_id")
+        .ok_or(StatusError::bad_request())?;
+
+    // Subscribe to progress events
+    let rx = state.progress_tx.subscribe();
+
+    // Filter for this task's events and convert to SSE
+    let task_id_clone = task_id.clone();
+    let stream = BroadcastStream::new(rx)
+        .filter_map(move |result| {
+            match result {
+                Ok(event) if event.task_id == task_id_clone => {
+                    let data = serde_json::to_string(&event).ok()?;
+                    let sse_event = SseEvent::default().text(data);
+                    Some(Ok::<_, std::convert::Infallible>(sse_event))
+                }
+                _ => None,
+            }
+        });
+
+    SseKeepAlive::new(stream).stream(res);
+    Ok(())
+}
+
+/// POST /v1/voices/train/{task_id}/cancel - Cancel training
+#[handler]
+async fn cancel_training(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = depot.obtain::<AppState>()
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    let task_id: String = req.param("task_id")
+        .ok_or(StatusError::bad_request())?;
+
+    let (response_tx, response_rx) = oneshot::channel();
+    state.training_tx.send(training::TrainingRequest::CancelTraining {
+        task_id: task_id.clone(),
+        response_tx,
+    }).await.map_err(|_| StatusError::internal_server_error())?;
+
+    match timeout(Duration::from_secs(5), response_rx).await {
+        Ok(Ok(Ok(()))) => {
+            res.render(Json(serde_json::json!({
+                "status": "success",
+                "message": format!("Training {} cancelled", task_id)
+            })));
+        }
+        Ok(Ok(Err(e))) => {
+            res.render(Json(serde_json::json!({
+                "status": "error",
+                "message": e.to_string()
+            })));
+        }
+        _ => {
+            res.render(Json(serde_json::json!({
+                "status": "error",
+                "message": "Training thread unavailable"
+            })));
+        }
+    }
+
+    Ok(())
+}
+
+/// Expand ~ in paths (helper for main.rs)
+fn expand_main_tilde(path: &str) -> String {
+    if path.starts_with("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return format!("{}/{}", home.to_string_lossy(), &path[2..]);
+        }
+    }
+    path.to_string()
+}
+
+// ============================================================================
+// WebSocket TTS
+// ============================================================================
 
 /// GET /ws/v1/tts - WebSocket streaming TTS
 ///
