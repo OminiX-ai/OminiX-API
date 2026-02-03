@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # HTTP Server
 salvo = { version = "0.81.0", default-features = false, features = [
-    "affix-state", "cors", "server", "http1", "http2"
+    "affix-state", "cors", "server", "http1", "http2", "websocket"
 ] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -21,6 +21,7 @@ mlx-rs-core = { path = "../OminiX-MLX/mlx-rs-core" }
 
 # Model-specific crates
 qwen3-mlx = { path = "../OminiX-MLX/qwen3-mlx" }
+glm47-flash-mlx = { path = "../OminiX-MLX/glm-4.7-flash-mlx" }
 funasr-mlx = { path = "../OminiX-MLX/funasr-mlx" }
 gpt-sovits-mlx = { path = "../OminiX-MLX/gpt-sovits-mlx" }
 flux-klein-mlx = { path = "../OminiX-MLX/flux-klein-mlx" }

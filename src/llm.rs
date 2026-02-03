@@ -1,6 +1,9 @@
-//! LLM inference engine using qwen3-mlx
+//! LLM inference engine supporting multiple model backends
+//!
+//! Currently supports:
+//! - Qwen3 (via qwen3-mlx) — ChatML format
+//! - GLM-4.7-Flash (via glm47-flash-mlx) — GLM chat format with MLA attention
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use eyre::{Context, Result};
@@ -33,77 +36,46 @@ fn set_wired_limit_max() {
     }
 }
 
-/// LLM inference engine using Qwen3
+/// Which model backend is loaded
+enum ModelBackend {
+    Qwen3 {
+        model: qwen3_mlx::Model,
+        eos_tokens: Vec<u32>,
+    },
+    Glm4Flash {
+        model: glm47_flash_mlx::Model,
+        eos_tokens: Vec<u32>,
+    },
+}
+
+/// LLM inference engine supporting multiple model backends
 pub struct LlmEngine {
     model_id: String,
-    model: qwen3_mlx::Model,
+    model_type: String,
+    backend: ModelBackend,
     tokenizer: Tokenizer,
-    eos_token_id: u32,
 }
 
 impl LlmEngine {
     /// Create a new LLM engine by loading a model
     ///
-    /// First checks ~/.moly/local_models_config.json for model availability.
-    /// If the model is ready locally, uses that path. Otherwise, attempts
-    /// to download from HuggingFace Hub.
+    /// Detects model type from config.json and loads the appropriate backend.
     pub fn new(model_path: &str) -> Result<Self> {
         tracing::info!("Loading LLM model: {}", model_path);
 
         // Set wired memory limit
         set_wired_limit_max();
 
-        // Check model configuration for local availability
-        let model_dir: PathBuf = match model_config::check_model(model_path, ModelCategory::Llm) {
-            ModelAvailability::Ready { local_path, model_name } => {
-                tracing::info!("Found locally available model: {} at {:?}", model_name, local_path);
-                let path = local_path.ok_or_else(|| eyre::eyre!("Model path not available"))?;
-
-                // For HuggingFace cache structure, we need to find the snapshots directory
-                let snapshots_dir = path.join("snapshots");
-                if snapshots_dir.exists() {
-                    // Find the latest snapshot (there's usually only one)
-                    let snapshot = std::fs::read_dir(&snapshots_dir)?
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.path().is_dir())
-                        .next()
-                        .ok_or_else(|| eyre::eyre!("No snapshot found in {:?}", snapshots_dir))?;
-                    snapshot.path()
-                } else {
-                    path
-                }
-            }
-            ModelAvailability::NotDownloaded { model_name, model_id } => {
-                return Err(eyre::eyre!(
-                    "Model '{}' ({}) is not downloaded.\n\
-                     Please download it using OminiX-Studio before starting the API server.",
-                    model_name, model_id
-                ));
-            }
-            ModelAvailability::WrongCategory { expected, found } => {
-                return Err(eyre::eyre!(
-                    "Model '{}' is a {:?} model, not a {:?} model",
-                    model_path, found, expected
-                ));
-            }
-            ModelAvailability::NotInConfig => {
-                return Err(eyre::eyre!(
-                    "Model '{}' not found in local configuration.\n\
-                     Please add this model to OminiX-Studio and download it there first.\n\
-                     Available LLM models can be viewed at: ~/.moly/local_models_config.json",
-                    model_path
-                ));
-            }
-        };
-
+        // Resolve model directory
+        let model_dir = resolve_model_dir(model_path)?;
         tracing::info!("Using model directory: {:?}", model_dir);
 
-        // Load config
+        // Read config.json to determine model type
         let config_path = model_dir.join("config.json");
         let config_content = std::fs::read_to_string(&config_path)
             .context("Failed to read config.json")?;
         let config: serde_json::Value = serde_json::from_str(&config_content)?;
-        let model_type = config["model_type"].as_str().unwrap_or("");
+        let model_type = config["model_type"].as_str().unwrap_or("").to_string();
         tracing::info!("Model type: {}", model_type);
 
         // Load tokenizer
@@ -111,31 +83,41 @@ impl LlmEngine {
         if !tokenizer_path.exists() {
             return Err(eyre::eyre!("tokenizer.json not found at {:?}", tokenizer_path));
         }
-
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| eyre::eyre!("Failed to load tokenizer: {}", e))?;
 
-        // Get EOS token ID from tokenizer config
-        let tokenizer_config_path = model_dir.join("tokenizer_config.json");
-        let eos_token_id = if tokenizer_config_path.exists() {
-            let tc_content = std::fs::read_to_string(&tokenizer_config_path).unwrap_or_default();
-            let tc: serde_json::Value = serde_json::from_str(&tc_content).unwrap_or_default();
-            tc["eos_token_id"].as_u64().unwrap_or(151643) as u32
-        } else {
-            151643 // Qwen3 default
+        // Get EOS token IDs from config.json
+        let eos_tokens = parse_eos_tokens(&config);
+
+        // Load model based on type
+        let backend = match model_type.as_str() {
+            "glm4_moe_lite" => {
+                tracing::info!("Loading GLM-4.7-Flash backend");
+                let model = glm47_flash_mlx::load_model(&model_dir)
+                    .map_err(|e| eyre::eyre!("Failed to load GLM model: {}", e))?;
+                ModelBackend::Glm4Flash {
+                    model,
+                    eos_tokens,
+                }
+            }
+            _ => {
+                tracing::info!("Loading Qwen3 backend (model_type={})", model_type);
+                let model = qwen3_mlx::load_model(&model_dir)
+                    .context("Failed to load Qwen3 model")?;
+                ModelBackend::Qwen3 {
+                    model,
+                    eos_tokens,
+                }
+            }
         };
 
-        // Load model
-        let model = qwen3_mlx::load_model(&model_dir)
-            .context("Failed to load Qwen3 model")?;
-
-        tracing::info!("LLM model loaded successfully (eos_token_id={})", eos_token_id);
+        tracing::info!("LLM model loaded successfully");
 
         Ok(Self {
             model_id: model_path.to_string(),
-            model,
+            model_type,
+            backend,
             tokenizer,
-            eos_token_id,
         })
     }
 
@@ -144,7 +126,15 @@ impl LlmEngine {
         &self.model_id
     }
 
-    /// Format chat messages into a prompt string (ChatML format for Qwen3)
+    /// Format chat messages based on model type
+    fn format_messages(&self, messages: &[ChatMessage]) -> String {
+        match self.model_type.as_str() {
+            "glm4_moe_lite" => self.format_messages_glm(messages),
+            _ => self.format_messages_chatml(messages),
+        }
+    }
+
+    /// Format messages in ChatML format (Qwen3)
     fn format_messages_chatml(&self, messages: &[ChatMessage]) -> String {
         let mut prompt = String::new();
 
@@ -178,15 +168,58 @@ impl LlmEngine {
         prompt
     }
 
+    /// Format messages in GLM-4 chat format
+    ///
+    /// GLM-4 uses: <|system|>...\n<|user|>...\n<|assistant|></think>...
+    /// Thinking is disabled (</think> immediately after <|assistant|>)
+    fn format_messages_glm(&self, messages: &[ChatMessage]) -> String {
+        let mut prompt = String::new();
+
+        // GLM requires [gMASK]<sop> prefix
+        prompt.push_str("[gMASK]<sop>");
+
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => {
+                    prompt.push_str("<|system|>");
+                    prompt.push_str(&msg.content);
+                    prompt.push('\n');
+                }
+                "user" => {
+                    prompt.push_str("<|user|>");
+                    prompt.push_str(&msg.content);
+                    prompt.push('\n');
+                }
+                "assistant" => {
+                    prompt.push_str("<|assistant|></think>");
+                    prompt.push_str(&msg.content);
+                    prompt.push('\n');
+                }
+                "observation" | "tool" => {
+                    prompt.push_str("<|observation|>");
+                    prompt.push_str(&msg.content);
+                    prompt.push('\n');
+                }
+                role => {
+                    prompt.push_str(&format!("<|{}|>", role));
+                    prompt.push_str(&msg.content);
+                    prompt.push('\n');
+                }
+            }
+        }
+
+        // Generation prompt: thinking disabled
+        prompt.push_str("<|assistant|></think>");
+        prompt
+    }
+
     /// Generate a chat completion response
     pub fn generate(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
-        use qwen3_mlx::{Generate, KVCache};
-
         let temperature = request.temperature.unwrap_or(0.7);
         let max_tokens = request.max_tokens.unwrap_or(2048);
 
-        // Format messages
-        let prompt = self.format_messages_chatml(&request.messages);
+        // Format messages using appropriate template
+        let prompt = self.format_messages(&request.messages);
 
         // Tokenize
         let encoding = self.tokenizer.encode(prompt.as_str(), false)
@@ -194,31 +227,53 @@ impl LlmEngine {
         let prompt_tokens = encoding.get_ids().len() as u32;
         let prompt_array = mlx_rs::Array::from(encoding.get_ids()).index(NewAxis);
 
-        // Generate (clone model for thread safety)
-        let mut model = self.model.clone();
-        let mut cache: Vec<Option<KVCache>> = Vec::new();
+        // Generate based on backend
+        let (generated_tokens, eos_tokens) = match &self.backend {
+            ModelBackend::Qwen3 { model, eos_tokens } => {
+                let mut model = model.clone();
+                let mut cache: Vec<Option<qwen3_mlx::KVCache>> = Vec::new();
 
-        let generator = Generate::<KVCache>::new(
-            &mut model,
-            &mut cache,
-            temperature,
-            &prompt_array,
-        );
+                let generator = qwen3_mlx::Generate::<qwen3_mlx::KVCache>::new(
+                    &mut model,
+                    &mut cache,
+                    temperature,
+                    &prompt_array,
+                );
 
-        let mut generated_tokens = Vec::new();
-        // Qwen3 EOS tokens: 151643 (<|im_end|>), 151645 (<|endoftext|>)
-        let eos_tokens: [u32; 2] = [self.eos_token_id, 151645];
-
-        for token in generator.take(max_tokens) {
-            let token = token?;
-            let token_id = token.item::<u32>();
-
-            if eos_tokens.contains(&token_id) {
-                break;
+                let mut tokens = Vec::new();
+                for token in generator.take(max_tokens) {
+                    let token = token?;
+                    let token_id = token.item::<u32>();
+                    if eos_tokens.contains(&token_id) {
+                        break;
+                    }
+                    tokens.push(token);
+                }
+                (tokens, eos_tokens.clone())
             }
+            ModelBackend::Glm4Flash { model, eos_tokens } => {
+                let mut model = model.clone();
+                let mut cache: Vec<glm47_flash_mlx::KVCache> = Vec::new();
 
-            generated_tokens.push(token);
-        }
+                let generator = glm47_flash_mlx::Generate::<glm47_flash_mlx::KVCache>::new(
+                    &mut model,
+                    &mut cache,
+                    temperature,
+                    &prompt_array,
+                );
+
+                let mut tokens = Vec::new();
+                for token in generator.take(max_tokens) {
+                    let token = token?;
+                    let token_id = token.item::<u32>();
+                    if eos_tokens.contains(&token_id) {
+                        break;
+                    }
+                    tokens.push(token);
+                }
+                (tokens, eos_tokens.clone())
+            }
+        };
 
         // Synchronize before decoding
         synchronize(&Stream::default());
@@ -252,5 +307,89 @@ impl LlmEngine {
                 total_tokens: prompt_tokens + completion_tokens,
             },
         })
+    }
+}
+
+/// Resolve a model path/ID to a local directory
+fn resolve_model_dir(model_path: &str) -> Result<PathBuf> {
+    // If it's a direct filesystem path that exists, use it directly
+    let direct_path = PathBuf::from(model_path);
+    if direct_path.exists() && direct_path.join("config.json").exists() {
+        tracing::info!("Using direct model path: {:?}", direct_path);
+        return Ok(direct_path);
+    }
+
+    // Also try expanding ~ prefix
+    if model_path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            let expanded = home.join(&model_path[2..]);
+            if expanded.exists() && expanded.join("config.json").exists() {
+                tracing::info!("Using expanded model path: {:?}", expanded);
+                return Ok(expanded);
+            }
+        }
+    }
+
+    // Check model configuration for local availability
+    match model_config::check_model(model_path, ModelCategory::Llm) {
+        ModelAvailability::Ready { local_path, model_name } => {
+            tracing::info!("Found locally available model: {} at {:?}", model_name, local_path);
+            let path = local_path.ok_or_else(|| eyre::eyre!("Model path not available"))?;
+
+            // For HuggingFace cache structure, we need to find the snapshots directory
+            let snapshots_dir = path.join("snapshots");
+            if snapshots_dir.exists() {
+                let snapshot = std::fs::read_dir(&snapshots_dir)?
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .next()
+                    .ok_or_else(|| eyre::eyre!("No snapshot found in {:?}", snapshots_dir))?;
+                Ok(snapshot.path())
+            } else {
+                Ok(path)
+            }
+        }
+        ModelAvailability::NotDownloaded { model_name, model_id } => {
+            Err(eyre::eyre!(
+                "Model '{}' ({}) is not downloaded.\n\
+                 Please download it using OminiX-Studio before starting the API server.",
+                model_name, model_id
+            ))
+        }
+        ModelAvailability::WrongCategory { expected, found } => {
+            Err(eyre::eyre!(
+                "Model '{}' is a {:?} model, not a {:?} model",
+                model_path, found, expected
+            ))
+        }
+        ModelAvailability::NotInConfig => {
+            Err(eyre::eyre!(
+                "Model '{}' not found in local configuration.\n\
+                 Please add this model to OminiX-Studio and download it there first.\n\
+                 Available LLM models can be viewed at: ~/.moly/local_models_config.json",
+                model_path
+            ))
+        }
+    }
+}
+
+/// Parse EOS token IDs from config.json
+///
+/// Handles both single integer and array formats.
+fn parse_eos_tokens(config: &serde_json::Value) -> Vec<u32> {
+    match &config["eos_token_id"] {
+        serde_json::Value::Number(n) => {
+            vec![n.as_u64().unwrap_or(151643) as u32]
+        }
+        serde_json::Value::Array(arr) => {
+            arr.iter()
+                .filter_map(|v| v.as_u64())
+                .map(|v| v as u32)
+                .collect()
+        }
+        _ => {
+            // Qwen3 default
+            vec![151643, 151645]
+        }
     }
 }
