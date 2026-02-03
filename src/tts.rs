@@ -23,6 +23,7 @@ const DEFAULT_VOICES_CONFIG: &str = "~/.dora/models/primespeech/voices.json";
 #[derive(Debug, Deserialize)]
 struct VoicesConfig {
     #[serde(default = "default_voice")]
+    #[allow(dead_code)]
     default_voice: String,
     #[serde(default = "default_base_path")]
     models_base_path: String,
@@ -38,6 +39,7 @@ struct VoiceConfig {
     #[serde(default)]
     aliases: Vec<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     speed_factor: Option<f32>,
 }
 
@@ -140,17 +142,10 @@ fn is_safe_voice_path(voice: &str) -> bool {
         return false;
     }
 
-    // Reject paths with traversal sequences
-    let voice_str = voice.to_lowercase();
-    if voice_str.contains("..") || voice_str.contains("./") || voice_str.contains("/.") {
-        return false;
-    }
-
-    // Reject paths that look like they're trying to escape
+    // Reject paths with traversal components
     for component in path.components() {
         match component {
-            std::path::Component::ParentDir => return false,
-            std::path::Component::CurDir => return false,
+            std::path::Component::ParentDir | std::path::Component::CurDir => return false,
             _ => {}
         }
     }

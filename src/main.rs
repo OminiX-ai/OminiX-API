@@ -5,6 +5,7 @@
 //! - POST /v1/audio/transcriptions - Speech-to-text (ASR)
 //! - POST /v1/audio/speech - Text-to-speech (TTS)
 //! - POST /v1/images/generations - Image generation
+//! - WS   /ws/v1/tts - WebSocket streaming TTS with per-message voice switching
 //!
 //! Note: MLX models don't implement Send/Sync, so we use channels to
 //! communicate with a dedicated inference thread.
@@ -242,17 +243,11 @@ fn inference_thread(
         None
     };
 
-    // Helper to determine canonical model ID from user input
     fn normalize_image_model(model: &str) -> &'static str {
         let lower = model.to_lowercase();
-        if lower.contains("zimage") || lower.contains("z-image") {
-            "zimage"
-        } else if lower.contains("flux") {
+        if lower.contains("flux") {
             "flux"
-        } else if lower == "zimage" || lower == "z-image-turbo" {
-            "zimage"
         } else {
-            // Default to zimage for unknown models
             "zimage"
         }
     }
@@ -973,7 +968,7 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
     let mut voice: Option<String> = None;
     let mut speed: f32 = 1.0;
     let mut audio_format = "wav".to_string();
-    let chunk_size: usize = 8192;
+    const CHUNK_SIZE: usize = 8192;
 
     while let Some(msg) = ws.recv().await {
         let msg = match msg {
@@ -1069,7 +1064,7 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
                             let total = audio_data.len();
                             let mut sent = 0;
 
-                            for chunk in audio_data.chunks(chunk_size) {
+                            for chunk in audio_data.chunks(CHUNK_SIZE) {
                                 sent += chunk.len();
                                 let is_final = sent >= total;
                                 let hex_audio = hex::encode(chunk);

@@ -1,4 +1,9 @@
 //! OpenAI-compatible request/response types
+//!
+//! Some fields are deserialized for API compatibility but not yet used by
+//! the inference backends (e.g., `top_p`, `response_format`, `speed`).
+
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 

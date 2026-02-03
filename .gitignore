@@ -1,1 +1,5 @@
 /target/
+*.wav
+*.png
+ws_chunks/
+ws_multi_voice/

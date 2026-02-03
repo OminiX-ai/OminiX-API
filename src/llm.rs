@@ -50,7 +50,6 @@ enum ModelBackend {
 
 /// LLM inference engine supporting multiple model backends
 pub struct LlmEngine {
-    model_id: String,
     model_type: String,
     backend: ModelBackend,
     tokenizer: Tokenizer,
@@ -114,16 +113,10 @@ impl LlmEngine {
         tracing::info!("LLM model loaded successfully");
 
         Ok(Self {
-            model_id: model_path.to_string(),
             model_type,
             backend,
             tokenizer,
         })
-    }
-
-    /// Get the model ID
-    pub fn model_id(&self) -> &str {
-        &self.model_id
     }
 
     /// Format chat messages based on model type
@@ -228,7 +221,7 @@ impl LlmEngine {
         let prompt_array = mlx_rs::Array::from(encoding.get_ids()).index(NewAxis);
 
         // Generate based on backend
-        let (generated_tokens, eos_tokens) = match &self.backend {
+        let generated_tokens = match &self.backend {
             ModelBackend::Qwen3 { model, eos_tokens } => {
                 let mut model = model.clone();
                 let mut cache: Vec<Option<qwen3_mlx::KVCache>> = Vec::new();
@@ -249,7 +242,7 @@ impl LlmEngine {
                     }
                     tokens.push(token);
                 }
-                (tokens, eos_tokens.clone())
+                tokens
             }
             ModelBackend::Glm4Flash { model, eos_tokens } => {
                 let mut model = model.clone();
@@ -271,7 +264,7 @@ impl LlmEngine {
                     }
                     tokens.push(token);
                 }
-                (tokens, eos_tokens.clone())
+                tokens
             }
         };
 

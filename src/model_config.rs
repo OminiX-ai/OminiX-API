@@ -3,6 +3,8 @@
 //! This module reads the model configuration from OminiX-Studio to check
 //! which models are available locally without downloading.
 
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use serde::Deserialize;
 
