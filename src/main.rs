@@ -36,6 +36,7 @@ const IMAGE_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 const MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
 mod types;
+mod utils;
 mod llm;
 mod asr;
 mod tts;
@@ -44,6 +45,18 @@ mod model_config;
 mod training;
 
 use types::*;
+
+/// Render a standardized error response with proper HTTP status code
+fn render_error(res: &mut Response, status: salvo::http::StatusCode, message: &str, error_type: &str) {
+    res.status_code(status);
+    res.render(Json(ApiError {
+        error: ApiErrorDetail {
+            message: message.to_string(),
+            r#type: error_type.to_string(),
+            code: None,
+        },
+    }));
+}
 
 /// Request sent to the inference thread
 enum InferenceRequest {
@@ -116,14 +129,8 @@ pub struct AppState {
     training_tx: mpsc::Sender<training::TrainingRequest>,
     /// Broadcast channel for training progress events (Sender is Clone)
     progress_tx: broadcast::Sender<TrainingProgressEvent>,
-    /// Available models info
-    models: Vec<ModelInfo>,
-}
-
-#[derive(Clone)]
-struct ModelInfo {
-    id: String,
-    model_type: String,
+    /// Shared cancel flag for the active training task
+    cancel_flag: training::CancelFlag,
 }
 
 /// Configuration from environment
@@ -159,10 +166,8 @@ impl Config {
 fn inference_thread(
     config: Config,
     mut rx: mpsc::Receiver<InferenceRequest>,
-    models_tx: oneshot::Sender<Vec<ModelInfo>>,
+    ready_tx: oneshot::Sender<()>,
 ) {
-    let mut models = Vec::new();
-
     // Track current model IDs for status reporting
     let mut current_llm_model: Option<String> = None;
     let mut current_asr_model: Option<String> = None;
@@ -176,10 +181,6 @@ fn inference_thread(
             Ok(engine) => {
                 tracing::info!("LLM model loaded successfully");
                 current_llm_model = Some(config.llm_model.clone());
-                models.push(ModelInfo {
-                    id: config.llm_model.clone(),
-                    model_type: "llm".to_string(),
-                });
                 Some(engine)
             }
             Err(e) => {
@@ -198,10 +199,6 @@ fn inference_thread(
             Ok(engine) => {
                 tracing::info!("ASR model loaded successfully");
                 current_asr_model = Some(config.asr_model_dir.clone());
-                models.push(ModelInfo {
-                    id: "paraformer".to_string(),
-                    model_type: "asr".to_string(),
-                });
                 Some(engine)
             }
             Err(e) => {
@@ -220,10 +217,6 @@ fn inference_thread(
             Ok(engine) => {
                 tracing::info!("TTS model loaded successfully");
                 current_tts_model = Some(config.tts_ref_audio.clone());
-                models.push(ModelInfo {
-                    id: "gpt-sovits".to_string(),
-                    model_type: "tts".to_string(),
-                });
                 Some(engine)
             }
             Err(e) => {
@@ -243,10 +236,6 @@ fn inference_thread(
                 tracing::info!("Image model loaded successfully");
                 let normalized = normalize_image_model(&config.image_model);
                 current_image_model = Some(normalized.to_string());
-                models.push(ModelInfo {
-                    id: normalized.to_string(),
-                    model_type: "image".to_string(),
-                });
                 Some(engine)
             }
             Err(e) => {
@@ -267,8 +256,8 @@ fn inference_thread(
         }
     }
 
-    // Send models info back to main thread
-    let _ = models_tx.send(models);
+    // Signal that models are loaded
+    let _ = ready_tx.send(());
 
     tracing::info!("Inference thread ready, processing requests...");
     tracing::info!("Dynamic model loading enabled - use POST /v1/models/load to switch models");
@@ -507,7 +496,7 @@ async fn main() -> eyre::Result<()> {
 
     // Create channel for inference requests
     let (inference_tx, inference_rx) = mpsc::channel::<InferenceRequest>(32);
-    let (models_tx, models_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
 
     // Create channels for training
     let (training_tx, training_rx) = mpsc::channel::<training::TrainingRequest>(8);
@@ -516,25 +505,27 @@ async fn main() -> eyre::Result<()> {
     // Spawn inference thread (owns all models)
     let config_clone = config.clone();
     std::thread::spawn(move || {
-        inference_thread(config_clone, inference_rx, models_tx);
+        inference_thread(config_clone, inference_rx, ready_tx);
     });
 
     // Spawn training thread (owns training models, separate from inference)
     let progress_tx_clone = progress_tx.clone();
     let inference_tx_for_training = inference_tx.clone();
+    let cancel_flag: training::CancelFlag = Default::default();
+    let cancel_flag_clone = cancel_flag.clone();
     std::thread::spawn(move || {
-        training::training_thread(training_rx, progress_tx_clone, inference_tx_for_training);
+        training::training_thread(training_rx, progress_tx_clone, inference_tx_for_training, cancel_flag_clone);
     });
 
     // Wait for models to load
-    let models = models_rx.await.context("Failed to receive models info")?;
-    tracing::info!("Loaded {} models", models.len());
+    ready_rx.await.context("Failed to receive ready signal from inference thread")?;
+    tracing::info!("Inference thread ready");
 
     let state = AppState {
         inference_tx,
         training_tx,
         progress_tx,
-        models,
+        cancel_flag,
     };
 
     // Build Salvo router
@@ -607,23 +598,49 @@ async fn health(res: &mut Response) {
     })));
 }
 
-/// GET /v1/models - List available models
+/// GET /v1/models - List available models (queries live status)
 #[handler]
 async fn list_models(depot: &mut Depot, res: &mut Response) -> Result<(), StatusError> {
     let state = depot
         .obtain::<AppState>()
         .map_err(|_| StatusError::internal_server_error())?;
 
+    let (response_tx, response_rx) = oneshot::channel();
+    state.inference_tx.send(InferenceRequest::GetModelStatus {
+        response_tx,
+    }).await.map_err(|_| StatusError::internal_server_error())?;
+
+    let status = response_rx.await
+        .map_err(|_| StatusError::internal_server_error())?;
+
     let now = chrono::Utc::now().timestamp();
-    let data: Vec<_> = state.models.iter().map(|m| {
-        serde_json::json!({
-            "id": m.id,
-            "object": "model",
-            "created": now,
-            "owned_by": "local",
-            "type": m.model_type
-        })
-    }).collect();
+    let mut data = Vec::new();
+
+    if let Some(ref id) = status.llm {
+        data.push(serde_json::json!({
+            "id": id, "object": "model", "created": now,
+            "owned_by": "local", "type": "llm"
+        }));
+    }
+    if let Some(ref id) = status.asr {
+        data.push(serde_json::json!({
+            "id": "paraformer", "object": "model", "created": now,
+            "owned_by": "local", "type": "asr"
+        }));
+        let _ = id; // asr stores path, not display name
+    }
+    if let Some(ref _id) = status.tts {
+        data.push(serde_json::json!({
+            "id": "gpt-sovits", "object": "model", "created": now,
+            "owned_by": "local", "type": "tts"
+        }));
+    }
+    if let Some(ref id) = status.image {
+        data.push(serde_json::json!({
+            "id": id, "object": "model", "created": now,
+            "owned_by": "local", "type": "image"
+        }));
+    }
 
     res.render(Json(serde_json::json!({
         "object": "list",
@@ -696,6 +713,13 @@ async fn load_model(
     let model_type = request.model_type.as_str();
     tracing::info!("Loading model: {} (type: {})", request.model, model_type);
 
+    // Validate model paths to prevent directory traversal
+    if !utils::is_safe_path(&request.model) {
+        render_error(res, salvo::http::StatusCode::BAD_REQUEST,
+            "Model path contains invalid directory traversal", "invalid_request_error");
+        return Ok(());
+    }
+
     let inference_request = match model_type {
         "llm" => {
             let (response_tx, response_rx) = oneshot::channel();
@@ -730,10 +754,9 @@ async fn load_model(
             response_rx
         }
         _ => {
-            res.render(Json(serde_json::json!({
-                "status": "error",
-                "error": format!("Unknown model_type: {}. Use: llm, asr, tts, or image", model_type)
-            })));
+            render_error(res, salvo::http::StatusCode::BAD_REQUEST,
+                &format!("Unknown model_type: {}. Use: llm, asr, tts, or image", model_type),
+                "invalid_request_error");
             return Ok(());
         }
     };
@@ -754,10 +777,8 @@ async fn load_model(
             })));
         }
         Err(e) => {
-            res.render(Json(serde_json::json!({
-                "status": "error",
-                "error": e.to_string()
-            })));
+            render_error(res, salvo::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(), "server_error");
         }
     }
 
@@ -811,10 +832,8 @@ async fn unload_model(
             })));
         }
         Err(e) => {
-            res.render(Json(serde_json::json!({
-                "status": "error",
-                "error": e.to_string()
-            })));
+            render_error(res, salvo::http::StatusCode::BAD_REQUEST,
+                &e.to_string(), "invalid_request_error");
         }
     }
 
@@ -988,7 +1007,7 @@ async fn images_generations(
 #[handler]
 async fn list_voices(res: &mut Response) {
     // Read voices.json directly
-    let voices_path = expand_main_tilde("~/.dora/models/primespeech/voices.json");
+    let voices_path = utils::expand_tilde("~/.dora/models/primespeech/voices.json");
     let voices = match std::fs::read_to_string(&voices_path) {
         Ok(content) => {
             match serde_json::from_str::<serde_json::Value>(&content) {
@@ -1034,19 +1053,19 @@ async fn start_voice_training(
             StatusError::bad_request()
         })?;
 
-    if request.voice_name.is_empty() {
-        res.render(Json(serde_json::json!({
-            "status": "error",
-            "message": "voice_name is required"
-        })));
-        return Ok(());
-    }
+    // Validate and sanitize voice name to prevent path traversal
+    let voice_name = match utils::sanitize_voice_name(&request.voice_name) {
+        Ok(name) => name,
+        Err(e) => {
+            render_error(res, salvo::http::StatusCode::BAD_REQUEST,
+                &e.to_string(), "invalid_request_error");
+            return Ok(());
+        }
+    };
 
     if request.transcript.is_empty() {
-        res.render(Json(serde_json::json!({
-            "status": "error",
-            "message": "transcript is required"
-        })));
+        render_error(res, salvo::http::StatusCode::BAD_REQUEST,
+            "transcript is required", "invalid_request_error");
         return Ok(());
     }
 
@@ -1081,7 +1100,7 @@ async fn start_voice_training(
     let (response_tx, response_rx) = oneshot::channel();
     state.training_tx.send(training::TrainingRequest::StartTraining {
         task_id: task_id.clone(),
-        voice_name: request.voice_name.clone(),
+        voice_name: voice_name.clone(),
         audio_path,
         transcript: request.transcript,
         quality: request.quality,
@@ -1096,20 +1115,16 @@ async fn start_voice_training(
             res.render(Json(VoiceTrainResponse {
                 task_id,
                 status: "accepted".to_string(),
-                message: format!("Training started for voice '{}'", request.voice_name),
+                message: format!("Training started for voice '{}'", voice_name),
             }));
         }
         Ok(Err(e)) => {
-            res.render(Json(serde_json::json!({
-                "status": "error",
-                "message": e.to_string()
-            })));
+            render_error(res, salvo::http::StatusCode::CONFLICT,
+                &e.to_string(), "server_error");
         }
         Err(_) => {
-            res.render(Json(serde_json::json!({
-                "status": "error",
-                "message": "Training thread unavailable"
-            })));
+            render_error(res, salvo::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Training thread unavailable", "server_error");
         }
     }
 
@@ -1129,7 +1144,8 @@ async fn get_training_status(
     let task_id: String = req.query::<String>("task_id")
         .unwrap_or_default();
     if task_id.is_empty() {
-        res.render(Json(serde_json::json!({"error": "task_id query parameter required"})));
+        render_error(res, salvo::http::StatusCode::BAD_REQUEST,
+            "task_id query parameter required", "invalid_request_error");
         return Ok(());
     }
 
@@ -1144,16 +1160,12 @@ async fn get_training_status(
             res.render(Json(status));
         }
         Ok(Ok(None)) => {
-            res.render(Json(serde_json::json!({
-                "status": "error",
-                "message": format!("Task not found: {}", task_id)
-            })));
+            render_error(res, salvo::http::StatusCode::NOT_FOUND,
+                &format!("Task not found: {}", task_id), "not_found_error");
         }
         _ => {
-            res.render(Json(serde_json::json!({
-                "status": "error",
-                "message": "Training thread unavailable"
-            })));
+            render_error(res, salvo::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Training thread unavailable", "server_error");
         }
     }
 
@@ -1173,7 +1185,8 @@ async fn training_progress_sse(
     let task_id: String = req.query::<String>("task_id")
         .unwrap_or_default();
     if task_id.is_empty() {
-        res.render(Json(serde_json::json!({"error": "task_id query parameter required"})));
+        render_error(res, salvo::http::StatusCode::BAD_REQUEST,
+            "task_id query parameter required", "invalid_request_error");
         return Ok(());
     }
 
@@ -1211,49 +1224,27 @@ async fn cancel_training(
     let task_id: String = req.query::<String>("task_id")
         .unwrap_or_default();
     if task_id.is_empty() {
-        res.render(Json(serde_json::json!({"error": "task_id query parameter required"})));
+        render_error(res, salvo::http::StatusCode::BAD_REQUEST,
+            "task_id query parameter required", "invalid_request_error");
         return Ok(());
     }
 
-    let (response_tx, response_rx) = oneshot::channel();
-    state.training_tx.send(training::TrainingRequest::CancelTraining {
-        task_id: task_id.clone(),
-        response_tx,
-    }).await.map_err(|_| StatusError::internal_server_error())?;
-
-    match timeout(Duration::from_secs(5), response_rx).await {
-        Ok(Ok(Ok(()))) => {
+    match training::cancel_training_task(&state.cancel_flag, &task_id) {
+        Ok(()) => {
             res.render(Json(serde_json::json!({
                 "status": "success",
                 "message": format!("Training {} cancelled", task_id)
             })));
         }
-        Ok(Ok(Err(e))) => {
-            res.render(Json(serde_json::json!({
-                "status": "error",
-                "message": e.to_string()
-            })));
-        }
-        _ => {
-            res.render(Json(serde_json::json!({
-                "status": "error",
-                "message": "Training thread unavailable"
-            })));
+        Err(e) => {
+            render_error(res, salvo::http::StatusCode::NOT_FOUND,
+                &e.to_string(), "not_found_error");
         }
     }
 
     Ok(())
 }
 
-/// Expand ~ in paths (helper for main.rs)
-fn expand_main_tilde(path: &str) -> String {
-    if path.starts_with("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}/{}", home.to_string_lossy(), &path[2..]);
-        }
-    }
-    path.to_string()
-}
 
 // ============================================================================
 // WebSocket TTS

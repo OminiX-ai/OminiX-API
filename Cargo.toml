@@ -12,7 +12,6 @@ salvo = { version = "0.81.0", default-features = false, features = [
 ] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-futures = "0.3"
 
 # MLX inference
 mlx-rs = { path = "../OminiX-MLX/mlx-rs", features = ["metal", "accelerate"] }
@@ -27,9 +26,6 @@ gpt-sovits-mlx = { path = "../OminiX-MLX/gpt-sovits-mlx" }
 flux-klein-mlx = { path = "../OminiX-MLX/flux-klein-mlx" }
 zimage-mlx = { path = "../OminiX-MLX/zimage-mlx" }
 
-# Model downloads
-hf-hub = "0.4"
-
 # Tokenization
 tokenizers = "0.22"
 
@@ -43,7 +39,6 @@ chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 eyre = "0.6"
-sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 dirs = "6.0"

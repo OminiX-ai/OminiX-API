@@ -4,6 +4,8 @@
 //! Pipeline: audio slicing → denoising → ASR → feature extraction → VITS training → voice registration
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use eyre::{Context, Result};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -22,6 +24,23 @@ use gpt_sovits_mlx::audio::{
 use mlx_rs::module::Module;
 
 use crate::types::*;
+
+/// Shared cancel flag: holds (task_id, flag) while training is active.
+/// The HTTP handler can set the flag directly without going through the channel.
+pub type CancelFlag = Arc<std::sync::Mutex<Option<(String, Arc<AtomicBool>)>>>;
+
+/// Cancel a training task by task_id. Returns Ok if the flag was set, Err if
+/// no matching task is currently running.
+pub fn cancel_training_task(cancel_state: &CancelFlag, task_id: &str) -> Result<()> {
+    let guard = cancel_state.lock().unwrap();
+    if let Some((ref active_id, ref flag)) = *guard {
+        if active_id == task_id {
+            flag.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+    }
+    Err(eyre::eyre!("No active training task with id: {}", task_id))
+}
 
 // ============================================================================
 // Constants
@@ -64,11 +83,6 @@ pub enum TrainingRequest {
         task_id: String,
         response_tx: oneshot::Sender<Option<TrainingTaskStatus>>,
     },
-    /// Cancel the current training job
-    CancelTraining {
-        task_id: String,
-        response_tx: oneshot::Sender<Result<()>>,
-    },
 }
 
 // ============================================================================
@@ -80,6 +94,7 @@ pub fn training_thread(
     mut rx: mpsc::Receiver<TrainingRequest>,
     progress_tx: broadcast::Sender<TrainingProgressEvent>,
     inference_tx: mpsc::Sender<crate::InferenceRequest>,
+    cancel_state: CancelFlag,
 ) {
     tracing::info!("Training thread started");
 
@@ -123,6 +138,13 @@ pub fn training_thread(
                 // Acknowledge receipt
                 let _ = response_tx.send(Ok(()));
 
+                // Create cancel flag for this task and store in shared state
+                let cancel_flag = Arc::new(AtomicBool::new(false));
+                {
+                    let mut guard = cancel_state.lock().unwrap();
+                    *guard = Some((task_id.clone(), cancel_flag.clone()));
+                }
+
                 // Run the full pipeline
                 let result = run_training_pipeline(
                     &task_id,
@@ -134,7 +156,14 @@ pub fn training_thread(
                     denoise,
                     &progress_tx,
                     &inference_tx,
+                    &cancel_flag,
                 );
+
+                // Clear cancel flag
+                {
+                    let mut guard = cancel_state.lock().unwrap();
+                    *guard = None;
+                }
 
                 match result {
                     Ok(()) => {
@@ -150,16 +179,31 @@ pub fn training_thread(
                     }
                     Err(e) => {
                         let err_msg = format!("{:#}", e);
-                        tracing::error!("Training failed: {}", err_msg);
-                        send_progress(
-                            &progress_tx, &task_id, TrainingStage::Failed,
-                            0.0, 0.0, &format!("Training failed: {}", err_msg),
-                            true, Some(err_msg.clone()), None,
-                        );
-                        if let Some(ref mut task) = current_task {
-                            task.status = TrainingStage::Failed;
-                            task.error = Some(err_msg);
-                            task.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        let is_cancelled = cancel_flag.load(Ordering::Relaxed);
+                        if is_cancelled {
+                            tracing::info!("Training cancelled by user: {}", task_id);
+                            send_progress(
+                                &progress_tx, &task_id, TrainingStage::Failed,
+                                0.0, 0.0, "Training cancelled by user",
+                                true, Some("Cancelled by user".to_string()), None,
+                            );
+                            if let Some(ref mut task) = current_task {
+                                task.status = TrainingStage::Failed;
+                                task.error = Some("Cancelled by user".to_string());
+                                task.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                            }
+                        } else {
+                            tracing::error!("Training failed: {}", err_msg);
+                            send_progress(
+                                &progress_tx, &task_id, TrainingStage::Failed,
+                                0.0, 0.0, &format!("Training failed: {}", err_msg),
+                                true, Some(err_msg.clone()), None,
+                            );
+                            if let Some(ref mut task) = current_task {
+                                task.status = TrainingStage::Failed;
+                                task.error = Some(err_msg);
+                                task.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                            }
                         }
                     }
                 }
@@ -171,17 +215,6 @@ pub fn training_thread(
                     .cloned();
                 let _ = response_tx.send(status);
             }
-            TrainingRequest::CancelTraining { task_id, response_tx } => {
-                if let Some(ref mut task) = current_task {
-                    if task.task_id == task_id {
-                        task.status = TrainingStage::Failed;
-                        task.error = Some("Cancelled by user".to_string());
-                        let _ = response_tx.send(Ok(()));
-                        continue;
-                    }
-                }
-                let _ = response_tx.send(Err(eyre::eyre!("Task not found: {}", task_id)));
-            }
         }
     }
 
@@ -191,6 +224,15 @@ pub fn training_thread(
 // ============================================================================
 // Training Pipeline
 // ============================================================================
+
+/// Check if cancellation was requested, returning Err if so.
+fn check_cancelled(flag: &AtomicBool) -> Result<()> {
+    if flag.load(Ordering::Relaxed) {
+        Err(eyre::eyre!("Cancelled by user"))
+    } else {
+        Ok(())
+    }
+}
 
 fn run_training_pipeline(
     task_id: &str,
@@ -202,6 +244,7 @@ fn run_training_pipeline(
     denoise: bool,
     progress_tx: &broadcast::Sender<TrainingProgressEvent>,
     inference_tx: &mpsc::Sender<crate::InferenceRequest>,
+    cancel_flag: &AtomicBool,
 ) -> Result<()> {
     let base_dir = training_base_dir();
     let work_dir = base_dir.join(task_id);
@@ -220,6 +263,7 @@ fn run_training_pipeline(
     if chunk_paths.is_empty() {
         return Err(eyre::eyre!("No audio chunks produced from slicing. Audio may be too short."));
     }
+    check_cancelled(cancel_flag)?;
 
     // === Stage 2: Denoising (optional) ===
     if denoise {
@@ -228,18 +272,21 @@ fn run_training_pipeline(
             0.10, 0.0, "Denoising audio chunks...", false, None, None,
         );
         stage_denoise(&chunk_paths)?;
+        check_cancelled(cancel_flag)?;
     }
 
     // All chunks share the same transcript from the client
     let transcripts: Vec<String> = vec![transcript.to_string(); chunk_paths.len()];
 
     // === Stage 3: Feature Extraction ===
+    check_cancelled(cancel_flag)?;
     send_progress(
         progress_tx, task_id, TrainingStage::FeatureExtraction,
         0.20, 0.0, "Extracting HuBERT and phoneme features...", false, None, None,
     );
     let num_samples = stage_feature_extraction(&chunk_paths, &transcripts, &dataset_dir, progress_tx, task_id)?;
     tracing::info!("Feature extraction: {} samples prepared", num_samples);
+    check_cancelled(cancel_flag)?;
 
     // === Stage 4: VITS Fewshot Training ===
     send_progress(
@@ -247,8 +294,9 @@ fn run_training_pipeline(
         0.40, 0.0, "Starting VITS fewshot training...", false, None, None,
     );
     let vits_output = work_dir.join("vits_finetuned.safetensors");
-    stage_vits_training(&dataset_dir, &vits_output, quality, progress_tx, task_id)?;
+    stage_vits_training(&dataset_dir, &vits_output, quality, progress_tx, task_id, cancel_flag)?;
     tracing::info!("VITS training complete: {:?}", vits_output);
+    check_cancelled(cancel_flag)?;
 
     // === Stage 5: Register Voice ===
     send_progress(
@@ -446,6 +494,7 @@ fn stage_vits_training(
     quality: &TrainingQuality,
     progress_tx: &broadcast::Sender<TrainingProgressEvent>,
     task_id: &str,
+    cancel_flag: &AtomicBool,
 ) -> Result<()> {
     let epochs = match quality {
         TrainingQuality::Fast => 4,
@@ -496,6 +545,8 @@ fn stage_vits_training(
         dataset.shuffle(Some(epoch as u64 + 42));
 
         for batch_result in dataset.iter_batches(2, segment_size, hop_length) {
+            check_cancelled(cancel_flag)?;
+
             let batch = batch_result
                 .map_err(|e| eyre::eyre!("Batch loading failed: {}", e))?;
 
@@ -603,12 +654,7 @@ fn training_base_dir() -> PathBuf {
 
 /// Expand ~ to home directory
 fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}/{}", home.to_string_lossy(), &path[2..]);
-        }
-    }
-    path.to_string()
+    crate::utils::expand_tilde(path)
 }
 
 

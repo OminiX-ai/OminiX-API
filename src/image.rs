@@ -94,19 +94,7 @@ impl ImageEngine {
             ModelAvailability::Ready { local_path, model_name } => {
                 tracing::info!("Found locally available model: {} at {:?}", model_name, local_path);
                 let path = local_path.ok_or_else(|| eyre::eyre!("Model path not available"))?;
-
-                // For HuggingFace cache structure, we need to find the snapshots directory
-                let snapshots_dir = path.join("snapshots");
-                if snapshots_dir.exists() {
-                    let snapshot = std::fs::read_dir(&snapshots_dir)?
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.path().is_dir())
-                        .next()
-                        .ok_or_else(|| eyre::eyre!("No snapshot found in {:?}", snapshots_dir))?;
-                    snapshot.path()
-                } else {
-                    path
-                }
+                crate::utils::resolve_hf_snapshot(&path)?
             }
             ModelAvailability::NotDownloaded { model_name, model_id } => {
                 return Err(eyre::eyre!(
@@ -426,37 +414,29 @@ impl ImageEngine {
     /// Generate image with img2img (starting from reference latents)
     fn generate_img2img(&mut self, prompt: &str, width: u32, height: u32, ref_latents: &Array, strength: f32) -> Result<Vec<u8>> {
         match self.model_type {
-            ImageModelType::FluxKlein => self.generate_img2img_flux(prompt, width, height, ref_latents, strength),
-            ImageModelType::ZImageTurbo => self.generate_img2img_zimage(prompt, width, height, ref_latents, strength),
+            ImageModelType::FluxKlein => self.generate_flux(prompt, width, height, Some(ref_latents), strength),
+            ImageModelType::ZImageTurbo => self.generate_zimage(prompt, width, height, Some(ref_latents), strength),
         }
     }
 
-    /// FLUX.2-klein img2img generation
-    fn generate_img2img_flux(&mut self, prompt: &str, width: u32, height: u32, ref_latents: &Array, strength: f32) -> Result<Vec<u8>> {
-        use mlx_rs::ops;
+    /// Generate a single image
+    fn generate_single(&mut self, prompt: &str, width: u32, height: u32) -> Result<Vec<u8>> {
+        match self.model_type {
+            ImageModelType::FluxKlein => self.generate_flux(prompt, width, height, None, 1.0),
+            ImageModelType::ZImageTurbo => self.generate_zimage(prompt, width, height, None, 1.0),
+        }
+    }
 
+    /// Tokenize a prompt using Qwen3 chat template
+    fn tokenize_prompt(&self, prompt: &str) -> Result<(Array, Array)> {
         let batch_size = 1i32;
         let max_seq_len = 512i32;
-        let num_steps = 4; // FLUX.2-klein uses 4 steps
 
-        // Get params from transformer variant
-        let (flux_trans, params) = match &mut self.transformer {
-            TransformerVariant::Flux(t, p) => (t, p.clone()),
-            _ => return Err(eyre::eyre!("Expected FLUX transformer")),
-        };
-
-        // Calculate how many steps to skip based on strength
-        let start_step = ((1.0 - strength) * num_steps as f32).round() as usize;
-        let actual_steps = num_steps as usize - start_step;
-        tracing::debug!("img2img: starting from step {} (running {} steps)", start_step, actual_steps);
-
-        // Apply Qwen3 chat template
         let chat_prompt = format!(
             "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
             prompt
         );
 
-        // Tokenize
         let encoding = self.tokenizer.encode(chat_prompt.as_str(), true)
             .map_err(|e| eyre::eyre!("Tokenization failed: {}", e))?;
         let ids: Vec<i32> = encoding.get_ids().iter().map(|&x| x as i32).collect();
@@ -473,88 +453,14 @@ impl ImageEngine {
         let input_ids = Array::from_slice(&padded, &[batch_size, max_seq_len]);
         let attention_mask = Array::from_slice(&mask, &[batch_size, max_seq_len]);
 
-        // Encode text
-        let txt_embed = match &mut self.text_encoder {
-            TextEncoderVariant::Standard(enc) => enc.encode(&input_ids, Some(&attention_mask))?,
-            TextEncoderVariant::Quantized(enc) => enc.encode_flux(&input_ids, Some(&attention_mask))?,
-        };
-        let txt_embed = txt_embed.as_dtype(mlx_rs::Dtype::Float32)?;
-        txt_embed.eval()?;
+        Ok((input_ids, attention_mask))
+    }
 
-        // Setup latent dimensions
-        let img_height = height as i32;
-        let img_width = width as i32;
-        let latent_height = img_height / 8;
-        let latent_width = img_width / 8;
-        let patch_size = 2i32;
-        let patch_h = latent_height / patch_size;
-        let patch_w = latent_width / patch_size;
-        let img_seq_len = patch_h * patch_w;
-        let in_channels = params.in_channels;
-        let z_channels = self.vae_config.z_channels;
+    /// Convert VAE output to PNG bytes with FLUX-style normalization ([-1,1] → [0,255])
+    fn vae_to_png_flux(&self, image: &Array) -> Result<Vec<u8>> {
+        use mlx_rs::ops;
 
-        // Create position IDs
-        let txt_ids = create_txt_ids(batch_size, max_seq_len)?;
-        let img_ids = create_img_ids(batch_size, patch_h, patch_w)?;
-        let (rope_cos, rope_sin) = FluxKlein::compute_rope(&txt_ids, &img_ids)?;
-
-        // Generate timestep schedule
-        let timesteps = flux_official_schedule(img_seq_len, num_steps);
-
-        // Convert reference latents to sequence format
-        // ref_latents shape: [1, latent_h, latent_w, z_channels]
-        // Need to patchify to: [1, seq_len, in_channels]
-        let ref_latents = ref_latents.transpose_axes(&[0, 3, 1, 2])?; // [1, C, H, W]
-        let ref_latents = ref_latents.reshape(&[batch_size, z_channels, patch_h, patch_size, patch_w, patch_size])?;
-        let ref_latents = ref_latents.transpose_axes(&[0, 2, 4, 1, 3, 5])?; // [1, ph, pw, C, 2, 2]
-        let ref_latents = ref_latents.reshape(&[batch_size, img_seq_len, in_channels])?;
-
-        // Add noise to reference latents based on starting timestep
-        let t_start = timesteps[start_step];
-        let noise = mlx_rs::random::normal::<f32>(
-            &[batch_size, img_seq_len, in_channels],
-            None, None, None,
-        )?;
-
-        // Mix reference with noise: latent = ref * (1-t) + noise * t
-        let ref_weight = Array::from_slice(&[1.0 - t_start], &[1]);
-        let noise_weight = Array::from_slice(&[t_start], &[1]);
-        let mut latent = ops::add(
-            &ops::multiply(&ref_latents, &ref_weight)?,
-            &ops::multiply(&noise, &noise_weight)?,
-        )?;
-
-        // Denoising loop (starting from start_step)
-        tracing::debug!("Running FLUX denoising ({} steps from step {})...", actual_steps, start_step);
-        for step in start_step..num_steps as usize {
-            let t_curr = timesteps[step];
-            let t_next = timesteps[step + 1];
-            let t_arr = Array::from_slice(&[t_curr * 1000.0], &[batch_size]);
-
-            let v_pred = flux_trans.forward_with_rope(
-                &latent, &txt_embed, &t_arr, &rope_cos, &rope_sin
-            )?;
-
-            let dt = t_next - t_curr;
-            let scaled_v = ops::multiply(&v_pred, &Array::from_slice(&[dt], &[1]))?;
-            latent = ops::add(&latent, &scaled_v)?;
-            latent.eval()?;
-
-            tracing::debug!("  Step {}/{}: t={:.3}->{:.3}", step + 1, num_steps, t_curr, t_next);
-        }
-
-        // Decode latents to image
-        let latent = latent.reshape(&[batch_size, patch_h, patch_w, z_channels, patch_size, patch_size])?;
-        let latent = latent.transpose_axes(&[0, 1, 4, 2, 5, 3])?;
-        let vae_height = patch_h * patch_size;
-        let vae_width = patch_w * patch_size;
-        let latent_for_vae = latent.reshape(&[batch_size, vae_height, vae_width, z_channels])?;
-
-        let image = self.vae_decoder.forward(&latent_for_vae)?;
-        image.eval()?;
-
-        // Convert to RGB bytes
-        let image = ops::add(&image, &Array::from_slice(&[1.0f32], &[1]))?;
+        let image = ops::add(image, &Array::from_slice(&[1.0f32], &[1]))?;
         let image = ops::multiply(&image, &Array::from_slice(&[127.5f32], &[1]))?;
         let image = ops::maximum(&image, &Array::from_slice(&[0.0f32], &[1]))?;
         let image = ops::minimum(&image, &Array::from_slice(&[255.0f32], &[1]))?;
@@ -568,158 +474,14 @@ impl ImageEngine {
         let image_data: Vec<f32> = image_flat.as_slice().to_vec();
         let rgb_bytes: Vec<u8> = image_data.iter().map(|&v| v.round() as u8).collect();
 
-        // Convert to PNG
         rgb_to_png(&rgb_bytes, out_width as u32, out_height as u32)
     }
 
-    /// Z-Image-Turbo img2img generation
-    fn generate_img2img_zimage(&mut self, prompt: &str, width: u32, height: u32, ref_latents: &Array, strength: f32) -> Result<Vec<u8>> {
+    /// Convert VAE output to PNG bytes with Z-Image-style normalization (/2+0.5 → [0,255])
+    fn vae_to_png_zimage(&self, image: &Array) -> Result<Vec<u8>> {
         use mlx_rs::ops;
 
-        let batch_size = 1i32;
-        let max_seq_len = 512i32;
-        let num_steps = 9; // Z-Image uses 9 steps
-
-        // Get config from transformer variant
-        let zimage_config = match &self.transformer {
-            TransformerVariant::ZImage(_, c) => c.clone(),
-            _ => return Err(eyre::eyre!("Expected Z-Image transformer")),
-        };
-
-        // Calculate how many steps to skip based on strength
-        let start_step = ((1.0 - strength) * num_steps as f32).round() as usize;
-        let actual_steps = num_steps as usize - start_step;
-        tracing::debug!("Z-Image img2img: starting from step {} (running {} steps)", start_step, actual_steps);
-
-        // Apply Qwen3 chat template
-        let chat_prompt = format!(
-            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-            prompt
-        );
-
-        // Tokenize
-        let encoding = self.tokenizer.encode(chat_prompt.as_str(), true)
-            .map_err(|e| eyre::eyre!("Tokenization failed: {}", e))?;
-        let ids: Vec<i32> = encoding.get_ids().iter().map(|&x| x as i32).collect();
-        let num_tokens = ids.len().min(max_seq_len as usize);
-
-        let mut padded = vec![151643i32; max_seq_len as usize];
-        padded[..num_tokens].copy_from_slice(&ids[..num_tokens]);
-
-        let mut mask = vec![0i32; max_seq_len as usize];
-        for i in 0..num_tokens {
-            mask[i] = 1;
-        }
-
-        let input_ids = Array::from_slice(&padded, &[batch_size, max_seq_len]);
-        let attention_mask = Array::from_slice(&mask, &[batch_size, max_seq_len]);
-
-        // Encode text (Z-Image uses layer 34 extraction)
-        let txt_embed = match &mut self.text_encoder {
-            TextEncoderVariant::Standard(enc) => enc.encode_zimage(&input_ids, Some(&attention_mask))?,
-            TextEncoderVariant::Quantized(enc) => enc.encode_zimage(&input_ids, Some(&attention_mask))?,
-        };
-        let txt_embed = txt_embed.as_dtype(mlx_rs::Dtype::Float32)?;
-        txt_embed.eval()?;
-
-        // Pad caption to multiple of 32
-        let cap_len = txt_embed.dim(1) as i32;
-        let pad_to = ((cap_len + 31) / 32) * 32;
-        let txt_embed = if pad_to > cap_len {
-            let last_token = txt_embed.index((.., (cap_len - 1)..));
-            let padding = Array::repeat_axis::<f32>(last_token, pad_to - cap_len, 1)?;
-            ops::concatenate_axis(&[&txt_embed, &padding], 1)?
-        } else {
-            txt_embed
-        };
-        let cap_len = txt_embed.dim(1) as i32;
-
-        // Setup latent dimensions
-        let img_height = height as i32;
-        let img_width = width as i32;
-        let latent_height = img_height / 8;
-        let latent_width = img_width / 8;
-        let patch_size = zimage_config.patch_size;
-        let h_tok = latent_height / patch_size;
-        let w_tok = latent_width / patch_size;
-        let img_seq_len = h_tok * w_tok;
-        let in_channels = zimage_config.in_channels;
-        let _z_channels = self.vae_config.z_channels; // Z-Image: 16, used by VAE decoder
-
-        // Create Z-Image position encodings
-        let img_pos = create_coordinate_grid((1, h_tok, w_tok), (cap_len + 1, 0, 0))?;
-        let img_pos = img_pos.reshape(&[1, img_seq_len, 3])?;
-        let cap_pos = create_coordinate_grid((cap_len, 1, 1), (1, 0, 0))?;
-        let cap_pos = cap_pos.reshape(&[1, cap_len, 3])?;
-
-        // Pre-compute RoPE
-        let (cos, sin) = match &mut self.transformer {
-            TransformerVariant::ZImage(trans, _) => trans.compute_rope(&img_pos, &cap_pos)?,
-            _ => return Err(eyre::eyre!("Expected Z-Image transformer")),
-        };
-
-        // Z-Image's dynamic shift calculation
-        let mu = calculate_shift(img_seq_len, 256, 4096, 0.5, 1.15);
-        let sigmas = generate_sigmas(num_steps as i32, mu);
-
-        // ref_latents is [1, H, W, C] from VAE encoder
-        // Convert to Z-Image format [1, C, H, W]
-        let mut latents = ref_latents.transpose_axes(&[0, 3, 1, 2])?;
-
-        // Add noise based on starting sigma
-        let sigma_start = sigmas[start_step];
-        let noise = mlx_rs::random::normal::<f32>(
-            &[batch_size, in_channels, latent_height, latent_width],
-            None, None, None,
-        )?;
-        // latent = ref * (1-sigma) + noise * sigma
-        let ref_weight = Array::from_slice(&[1.0 - sigma_start], &[1]);
-        let noise_weight = Array::from_slice(&[sigma_start], &[1]);
-        latents = ops::add(
-            &ops::multiply(&latents, &ref_weight)?,
-            &ops::multiply(&noise, &noise_weight)?,
-        )?;
-
-        // Denoising loop
-        tracing::debug!("Running Z-Image denoising ({} steps from step {})...", actual_steps, start_step);
-        for step in start_step..num_steps as usize {
-            let sigma_curr = sigmas[step];
-            let sigma_next = sigmas[step + 1];
-            let t_model = 1.0 - sigma_curr;
-            let t = Array::from_slice(&[t_model], &[1]);
-
-            // Patchify latents
-            let latents_patched = patchify(&latents, h_tok, w_tok, in_channels)?;
-
-            let model_out = match &mut self.transformer {
-                TransformerVariant::ZImage(trans, _) => trans.forward_with_rope(
-                    &latents_patched, &t, &txt_embed, &img_pos, &cap_pos, &cos, &sin, None, None
-                )?,
-                _ => return Err(eyre::eyre!("Expected Z-Image transformer")),
-            };
-
-            // Unpatchify and negate
-            let noise_pred = unpatchify(&model_out, h_tok, w_tok, in_channels)?;
-            let noise_pred = ops::negative(&noise_pred)?;
-
-            // Euler step
-            let dt = sigma_next - sigma_curr;
-            let scaled_noise = ops::multiply(&noise_pred, &Array::from_slice(&[dt], &[1]))?;
-            latents = ops::add(&latents, &scaled_noise)?;
-            latents.eval()?;
-
-            tracing::debug!("  Step {}/{}: sigma={:.3}->{:.3}", step + 1, num_steps, sigma_curr, sigma_next);
-        }
-
-        // Decode latents to image
-        // Latents are [B, C, H, W], VAE expects [B, H, W, C]
-        let latents = latents.transpose_axes(&[0, 2, 3, 1])?;
-
-        let image = self.vae_decoder.forward(&latents)?;
-        image.eval()?;
-
-        // Convert to RGB bytes (Z-Image style normalization)
-        let image = ops::divide(&image, &mlx_rs::array!(2.0f32))?;
+        let image = ops::divide(image, &mlx_rs::array!(2.0f32))?;
         let image = ops::add(&image, &mlx_rs::array!(0.5f32))?;
         let image = ops::clip(&image, (0.0f32, 1.0f32))?;
         let image = ops::multiply(&image, &mlx_rs::array!(255.0f32))?;
@@ -733,56 +495,29 @@ impl ImageEngine {
         let image_data: Vec<f32> = image_flat.as_slice().to_vec();
         let rgb_bytes: Vec<u8> = image_data.iter().map(|&v| v.round() as u8).collect();
 
-        // Convert to PNG
         rgb_to_png(&rgb_bytes, out_width as u32, out_height as u32)
     }
 
-    /// Generate a single image
-    fn generate_single(&mut self, prompt: &str, width: u32, height: u32) -> Result<Vec<u8>> {
-        match self.model_type {
-            ImageModelType::FluxKlein => self.generate_single_flux(prompt, width, height),
-            ImageModelType::ZImageTurbo => self.generate_single_zimage(prompt, width, height),
-        }
-    }
-
-    /// FLUX.2-klein text-to-image generation
-    fn generate_single_flux(&mut self, prompt: &str, width: u32, height: u32) -> Result<Vec<u8>> {
+    /// Unified FLUX.2-klein generation (txt2img and img2img)
+    fn generate_flux(&mut self, prompt: &str, width: u32, height: u32, ref_latents: Option<&Array>, strength: f32) -> Result<Vec<u8>> {
         use mlx_rs::ops;
 
         let batch_size = 1i32;
-        let max_seq_len = 512i32;
-        let num_steps = 4; // FLUX.2-klein uses 4 steps
+        let num_steps = 4;
 
-        // Get params from transformer variant
+        // Tokenize before borrowing transformer (avoids overlapping borrow)
+        let (input_ids, attention_mask) = self.tokenize_prompt(prompt)?;
+
         let (flux_trans, params) = match &mut self.transformer {
             TransformerVariant::Flux(t, p) => (t, p.clone()),
             _ => return Err(eyre::eyre!("Expected FLUX transformer")),
         };
 
-        // Apply Qwen3 chat template
-        let chat_prompt = format!(
-            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-            prompt
-        );
-
-        // Tokenize
-        let encoding = self.tokenizer.encode(chat_prompt.as_str(), true)
-            .map_err(|e| eyre::eyre!("Tokenization failed: {}", e))?;
-        let ids: Vec<i32> = encoding.get_ids().iter().map(|&x| x as i32).collect();
-        let num_tokens = ids.len().min(max_seq_len as usize);
-
-        // Pad tokens
-        let mut padded = vec![151643i32; max_seq_len as usize]; // Qwen3 pad token
-        padded[..num_tokens].copy_from_slice(&ids[..num_tokens]);
-
-        // Create attention mask
-        let mut mask = vec![0i32; max_seq_len as usize];
-        for i in 0..num_tokens {
-            mask[i] = 1;
-        }
-
-        let input_ids = Array::from_slice(&padded, &[batch_size, max_seq_len]);
-        let attention_mask = Array::from_slice(&mask, &[batch_size, max_seq_len]);
+        let start_step = if ref_latents.is_some() {
+            ((1.0 - strength) * num_steps as f32).round() as usize
+        } else {
+            0
+        };
 
         // Encode text
         tracing::debug!("Encoding text prompt...");
@@ -794,45 +529,49 @@ impl ImageEngine {
         txt_embed.eval()?;
 
         // Setup latent dimensions
-        let img_height = height as i32;
-        let img_width = width as i32;
-        let latent_height = img_height / 8;
-        let latent_width = img_width / 8;
+        let latent_height = height as i32 / 8;
+        let latent_width = width as i32 / 8;
         let patch_size = 2i32;
         let patch_h = latent_height / patch_size;
         let patch_w = latent_width / patch_size;
         let img_seq_len = patch_h * patch_w;
         let in_channels = params.in_channels;
         let z_channels = self.vae_config.z_channels;
+        let max_seq_len = 512i32;
 
-        // Create position IDs
+        // Position IDs and RoPE
         let txt_ids = create_txt_ids(batch_size, max_seq_len)?;
         let img_ids = create_img_ids(batch_size, patch_h, patch_w)?;
         let (rope_cos, rope_sin) = FluxKlein::compute_rope(&txt_ids, &img_ids)?;
 
-        // Generate timestep schedule
         let timesteps = flux_official_schedule(img_seq_len, num_steps);
 
-        // Start with random noise
-        let mut latent = mlx_rs::random::normal::<f32>(
-            &[batch_size, img_seq_len, in_channels],
-            None,
-            None,
-            None,
-        )?;
+        // Initialize latent (from noise or noised reference)
+        let mut latent = if let Some(ref_lat) = ref_latents {
+            let ref_lat = ref_lat.transpose_axes(&[0, 3, 1, 2])?;
+            let ref_lat = ref_lat.reshape(&[batch_size, z_channels, patch_h, patch_size, patch_w, patch_size])?;
+            let ref_lat = ref_lat.transpose_axes(&[0, 2, 4, 1, 3, 5])?;
+            let ref_lat = ref_lat.reshape(&[batch_size, img_seq_len, in_channels])?;
+
+            let t_start = timesteps[start_step];
+            let noise = mlx_rs::random::normal::<f32>(&[batch_size, img_seq_len, in_channels], None, None, None)?;
+            ops::add(
+                &ops::multiply(&ref_lat, &Array::from_slice(&[1.0 - t_start], &[1]))?,
+                &ops::multiply(&noise, &Array::from_slice(&[t_start], &[1]))?,
+            )?
+        } else {
+            mlx_rs::random::normal::<f32>(&[batch_size, img_seq_len, in_channels], None, None, None)?
+        };
 
         // Denoising loop
-        tracing::debug!("Running FLUX denoising ({} steps)...", num_steps);
-        for step in 0..num_steps as usize {
+        tracing::debug!("Running FLUX denoising ({} steps from step {})...", num_steps as usize - start_step, start_step);
+        for step in start_step..num_steps as usize {
             let t_curr = timesteps[step];
             let t_next = timesteps[step + 1];
             let t_arr = Array::from_slice(&[t_curr * 1000.0], &[batch_size]);
 
-            let v_pred = flux_trans.forward_with_rope(
-                &latent, &txt_embed, &t_arr, &rope_cos, &rope_sin
-            )?;
+            let v_pred = flux_trans.forward_with_rope(&latent, &txt_embed, &t_arr, &rope_cos, &rope_sin)?;
 
-            // Euler step
             let dt = t_next - t_curr;
             let scaled_v = ops::multiply(&v_pred, &Array::from_slice(&[dt], &[1]))?;
             latent = ops::add(&latent, &scaled_v)?;
@@ -852,63 +591,29 @@ impl ImageEngine {
         let image = self.vae_decoder.forward(&latent_for_vae)?;
         image.eval()?;
 
-        // Convert to RGB bytes
-        let image = ops::add(&image, &Array::from_slice(&[1.0f32], &[1]))?;
-        let image = ops::multiply(&image, &Array::from_slice(&[127.5f32], &[1]))?;
-        let image = ops::maximum(&image, &Array::from_slice(&[0.0f32], &[1]))?;
-        let image = ops::minimum(&image, &Array::from_slice(&[255.0f32], &[1]))?;
-        image.eval()?;
-
-        let shape = image.shape();
-        let out_height = shape[1] as usize;
-        let out_width = shape[2] as usize;
-
-        let image_flat = image.reshape(&[-1])?;
-        let image_data: Vec<f32> = image_flat.as_slice().to_vec();
-        let rgb_bytes: Vec<u8> = image_data.iter().map(|&v| v.round() as u8).collect();
-
-        // Convert to PNG
-        rgb_to_png(&rgb_bytes, out_width as u32, out_height as u32)
+        self.vae_to_png_flux(&image)
     }
 
-    /// Z-Image-Turbo text-to-image generation
-    fn generate_single_zimage(&mut self, prompt: &str, width: u32, height: u32) -> Result<Vec<u8>> {
+    /// Unified Z-Image-Turbo generation (txt2img and img2img)
+    fn generate_zimage(&mut self, prompt: &str, width: u32, height: u32, ref_latents: Option<&Array>, strength: f32) -> Result<Vec<u8>> {
         use mlx_rs::ops;
 
         let batch_size = 1i32;
-        let max_seq_len = 512i32;
-        let num_steps = 9; // Z-Image uses 9 steps
+        let num_steps = 9;
 
-        // Get config from transformer variant
         let zimage_config = match &self.transformer {
             TransformerVariant::ZImage(_, c) => c.clone(),
             _ => return Err(eyre::eyre!("Expected Z-Image transformer")),
         };
 
-        // Apply Qwen3 chat template
-        let chat_prompt = format!(
-            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-            prompt
-        );
+        let start_step = if ref_latents.is_some() {
+            ((1.0 - strength) * num_steps as f32).round() as usize
+        } else {
+            0
+        };
 
-        // Tokenize
-        let encoding = self.tokenizer.encode(chat_prompt.as_str(), true)
-            .map_err(|e| eyre::eyre!("Tokenization failed: {}", e))?;
-        let ids: Vec<i32> = encoding.get_ids().iter().map(|&x| x as i32).collect();
-        let num_tokens = ids.len().min(max_seq_len as usize);
-
-        let mut padded = vec![151643i32; max_seq_len as usize];
-        padded[..num_tokens].copy_from_slice(&ids[..num_tokens]);
-
-        let mut mask = vec![0i32; max_seq_len as usize];
-        for i in 0..num_tokens {
-            mask[i] = 1;
-        }
-
-        let input_ids = Array::from_slice(&padded, &[batch_size, max_seq_len]);
-        let attention_mask = Array::from_slice(&mask, &[batch_size, max_seq_len]);
-
-        // Encode text (Z-Image uses layer 34 extraction)
+        // Tokenize and encode text
+        let (input_ids, attention_mask) = self.tokenize_prompt(prompt)?;
         tracing::debug!("Encoding text prompt (Z-Image style)...");
         let txt_embed = match &mut self.text_encoder {
             TextEncoderVariant::Standard(enc) => enc.encode_zimage(&input_ids, Some(&attention_mask))?,
@@ -930,47 +635,49 @@ impl ImageEngine {
         let cap_len = txt_embed.dim(1) as i32;
 
         // Setup latent dimensions
-        let img_height = height as i32;
-        let img_width = width as i32;
-        let latent_height = img_height / 8;
-        let latent_width = img_width / 8;
+        let latent_height = height as i32 / 8;
+        let latent_width = width as i32 / 8;
         let patch_size = zimage_config.patch_size;
         let h_tok = latent_height / patch_size;
         let w_tok = latent_width / patch_size;
         let img_seq_len = h_tok * w_tok;
         let in_channels = zimage_config.in_channels;
 
-        // Create Z-Image position encodings
+        // Position encodings
         let img_pos = create_coordinate_grid((1, h_tok, w_tok), (cap_len + 1, 0, 0))?;
         let img_pos = img_pos.reshape(&[1, img_seq_len, 3])?;
         let cap_pos = create_coordinate_grid((cap_len, 1, 1), (1, 0, 0))?;
         let cap_pos = cap_pos.reshape(&[1, cap_len, 3])?;
 
-        // Pre-compute RoPE
         let (cos, sin) = match &mut self.transformer {
             TransformerVariant::ZImage(trans, _) => trans.compute_rope(&img_pos, &cap_pos)?,
             _ => return Err(eyre::eyre!("Expected Z-Image transformer")),
         };
 
-        // Z-Image's dynamic shift calculation
         let mu = calculate_shift(img_seq_len, 256, 4096, 0.5, 1.15);
         let sigmas = generate_sigmas(num_steps as i32, mu);
 
-        // Start with random noise in [B, C, H, W] format
-        let mut latents = mlx_rs::random::normal::<f32>(
-            &[batch_size, in_channels, latent_height, latent_width],
-            None, None, None,
-        )?;
+        // Initialize latent (from noise or noised reference)
+        let mut latents = if let Some(ref_lat) = ref_latents {
+            let mut lat = ref_lat.transpose_axes(&[0, 3, 1, 2])?;
+            let sigma_start = sigmas[start_step];
+            let noise = mlx_rs::random::normal::<f32>(&[batch_size, in_channels, latent_height, latent_width], None, None, None)?;
+            lat = ops::add(
+                &ops::multiply(&lat, &Array::from_slice(&[1.0 - sigma_start], &[1]))?,
+                &ops::multiply(&noise, &Array::from_slice(&[sigma_start], &[1]))?,
+            )?;
+            lat
+        } else {
+            mlx_rs::random::normal::<f32>(&[batch_size, in_channels, latent_height, latent_width], None, None, None)?
+        };
 
         // Denoising loop
-        tracing::debug!("Running Z-Image denoising ({} steps)...", num_steps);
-        for step in 0..num_steps as usize {
+        tracing::debug!("Running Z-Image denoising ({} steps from step {})...", num_steps as usize - start_step, start_step);
+        for step in start_step..num_steps as usize {
             let sigma_curr = sigmas[step];
             let sigma_next = sigmas[step + 1];
-            let t_model = 1.0 - sigma_curr;
-            let t = Array::from_slice(&[t_model], &[1]);
+            let t = Array::from_slice(&[1.0 - sigma_curr], &[1]);
 
-            // Patchify latents
             let latents_patched = patchify(&latents, h_tok, w_tok, in_channels)?;
 
             let model_out = match &mut self.transformer {
@@ -980,11 +687,9 @@ impl ImageEngine {
                 _ => return Err(eyre::eyre!("Expected Z-Image transformer")),
             };
 
-            // Unpatchify and negate
             let noise_pred = unpatchify(&model_out, h_tok, w_tok, in_channels)?;
             let noise_pred = ops::negative(&noise_pred)?;
 
-            // Euler step
             let dt = sigma_next - sigma_curr;
             let scaled_noise = ops::multiply(&noise_pred, &Array::from_slice(&[dt], &[1]))?;
             latents = ops::add(&latents, &scaled_noise)?;
@@ -993,31 +698,14 @@ impl ImageEngine {
             tracing::debug!("  Step {}/{}: sigma={:.3}->{:.3}", step + 1, num_steps, sigma_curr, sigma_next);
         }
 
-        // Decode latents to image
-        // Latents are [B, C, H, W], VAE expects [B, H, W, C]
+        // Decode: [B, C, H, W] → [B, H, W, C]
         tracing::debug!("Decoding latents...");
         let latents = latents.transpose_axes(&[0, 2, 3, 1])?;
 
         let image = self.vae_decoder.forward(&latents)?;
         image.eval()?;
 
-        // Convert to RGB bytes (Z-Image style normalization)
-        let image = ops::divide(&image, &mlx_rs::array!(2.0f32))?;
-        let image = ops::add(&image, &mlx_rs::array!(0.5f32))?;
-        let image = ops::clip(&image, (0.0f32, 1.0f32))?;
-        let image = ops::multiply(&image, &mlx_rs::array!(255.0f32))?;
-        image.eval()?;
-
-        let shape = image.shape();
-        let out_height = shape[1] as usize;
-        let out_width = shape[2] as usize;
-
-        let image_flat = image.reshape(&[-1])?;
-        let image_data: Vec<f32> = image_flat.as_slice().to_vec();
-        let rgb_bytes: Vec<u8> = image_data.iter().map(|&v| v.round() as u8).collect();
-
-        // Convert to PNG
-        rgb_to_png(&rgb_bytes, out_width as u32, out_height as u32)
+        self.vae_to_png_zimage(&image)
     }
 }
 

@@ -56,12 +56,7 @@ fn default_base_path() -> String {
 }
 
 fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}/{}", home.to_string_lossy(), &path[2..]);
-        }
-    }
-    path.to_string()
+    crate::utils::expand_tilde(path)
 }
 
 impl VoicesConfig {

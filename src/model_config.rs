@@ -3,8 +3,6 @@
 //! This module reads the model configuration from OminiX-Studio to check
 //! which models are available locally without downloading.
 
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 use serde::Deserialize;
 
@@ -23,7 +21,9 @@ pub enum ModelCategory {
 /// Model source information
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelSource {
+    #[allow(dead_code)]
     pub primary_url: Option<String>,
+    #[allow(dead_code)]
     pub source_type: Option<String>,
     pub repo_id: Option<String>,
 }
@@ -32,7 +32,9 @@ pub struct ModelSource {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelStorage {
     pub local_path: String,
+    #[allow(dead_code)]
     pub total_size_bytes: Option<u64>,
+    #[allow(dead_code)]
     pub total_size_display: Option<String>,
 }
 
@@ -40,7 +42,9 @@ pub struct ModelStorage {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelStatusInfo {
     pub state: String,
+    #[allow(dead_code)]
     pub downloaded_bytes: Option<u64>,
+    #[allow(dead_code)]
     pub downloaded_files: Option<u32>,
 }
 
@@ -49,6 +53,7 @@ pub struct ModelStatusInfo {
 pub struct LocalModel {
     pub id: String,
     pub name: String,
+    #[allow(dead_code)]
     pub description: Option<String>,
     pub category: ModelCategory,
     pub source: ModelSource,
@@ -85,7 +90,9 @@ impl LocalModel {
 /// Local models configuration (V2 format)
 #[derive(Debug, Clone, Deserialize)]
 pub struct LocalModelsConfig {
+    #[allow(dead_code)]
     pub version: String,
+    #[allow(dead_code)]
     pub last_updated: Option<String>,
     pub models: Vec<LocalModel>,
 }
@@ -128,6 +135,7 @@ impl LocalModelsConfig {
     }
 
     /// Get all models that are ready
+    #[allow(dead_code)]
     pub fn get_ready_models(&self) -> Vec<&LocalModel> {
         self.models.iter().filter(|m| m.is_ready()).collect()
     }
@@ -272,13 +280,9 @@ pub enum ModelAvailability {
     NotInConfig,
 }
 
-/// Expand ~ to home directory
+/// Expand ~ to home directory and return as PathBuf
 fn expand_path(path: &str) -> Option<PathBuf> {
-    if path.starts_with("~/") {
-        dirs::home_dir().map(|home| home.join(&path[2..]))
-    } else {
-        Some(PathBuf::from(path))
-    }
+    Some(PathBuf::from(crate::utils::expand_tilde(path)))
 }
 
 /// Global config instance (lazy loaded)

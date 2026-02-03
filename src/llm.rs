@@ -314,12 +314,10 @@ fn resolve_model_dir(model_path: &str) -> Result<PathBuf> {
 
     // Also try expanding ~ prefix
     if model_path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            let expanded = home.join(&model_path[2..]);
-            if expanded.exists() && expanded.join("config.json").exists() {
-                tracing::info!("Using expanded model path: {:?}", expanded);
-                return Ok(expanded);
-            }
+        let expanded = PathBuf::from(crate::utils::expand_tilde(model_path));
+        if expanded.exists() && expanded.join("config.json").exists() {
+            tracing::info!("Using expanded model path: {:?}", expanded);
+            return Ok(expanded);
         }
     }
 
@@ -328,19 +326,7 @@ fn resolve_model_dir(model_path: &str) -> Result<PathBuf> {
         ModelAvailability::Ready { local_path, model_name } => {
             tracing::info!("Found locally available model: {} at {:?}", model_name, local_path);
             let path = local_path.ok_or_else(|| eyre::eyre!("Model path not available"))?;
-
-            // For HuggingFace cache structure, we need to find the snapshots directory
-            let snapshots_dir = path.join("snapshots");
-            if snapshots_dir.exists() {
-                let snapshot = std::fs::read_dir(&snapshots_dir)?
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .next()
-                    .ok_or_else(|| eyre::eyre!("No snapshot found in {:?}", snapshots_dir))?;
-                Ok(snapshot.path())
-            } else {
-                Ok(path)
-            }
+            crate::utils::resolve_hf_snapshot(&path)
         }
         ModelAvailability::NotDownloaded { model_name, model_id } => {
             Err(eyre::eyre!(

@@ -3,8 +3,6 @@
 //! Some fields are deserialized for API compatibility but not yet used by
 //! the inference backends (e.g., `top_p`, `response_format`, `speed`).
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -22,6 +20,7 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub top_p: Option<f32>,
 }
 
@@ -65,12 +64,14 @@ pub struct TranscriptionRequest {
     pub file: String,
     /// Model to use (ignored, we use paraformer)
     #[serde(default)]
+    #[allow(dead_code)]
     pub model: Option<String>,
     /// Language hint (optional)
     #[serde(default)]
     pub language: Option<String>,
     /// Response format: "json", "text", "srt", "verbose_json", "vtt"
     #[serde(default)]
+    #[allow(dead_code)]
     pub response_format: Option<String>,
 }
 
@@ -91,6 +92,7 @@ pub struct TranscriptionResponse {
 pub struct SpeechRequest {
     /// Model to use (ignored, we use GPT-SoVITS)
     #[serde(default)]
+    #[allow(dead_code)]
     pub model: Option<String>,
     /// Text to synthesize
     pub input: String,
@@ -99,9 +101,11 @@ pub struct SpeechRequest {
     pub voice: Option<String>,
     /// Response format: "mp3", "opus", "aac", "flac", "wav", "pcm"
     #[serde(default = "default_audio_format")]
+    #[allow(dead_code)]
     pub response_format: String,
     /// Speaking speed (0.25 to 4.0)
     #[serde(default = "default_speed")]
+    #[allow(dead_code)]
     pub speed: f32,
 }
 
@@ -132,9 +136,11 @@ pub struct ImageGenerationRequest {
     pub size: String,
     /// Response format: "url" or "b64_json"
     #[serde(default = "default_response_format")]
+    #[allow(dead_code)]
     pub response_format: String,
     /// Quality: "standard" or "hd"
     #[serde(default)]
+    #[allow(dead_code)]
     pub quality: Option<String>,
     /// Reference image (base64 encoded PNG/JPEG) for img2img
     #[serde(default)]
@@ -298,4 +304,22 @@ pub struct TrainingTaskStatus {
     pub completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+// ============================================================================
+// Standardized API Error Response
+// ============================================================================
+
+/// OpenAI-compatible error response envelope
+#[derive(Debug, Serialize)]
+pub struct ApiError {
+    pub error: ApiErrorDetail,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiErrorDetail {
+    pub message: String,
+    pub r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
