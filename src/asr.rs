@@ -1,8 +1,11 @@
 //! ASR (Automatic Speech Recognition) engine using funasr-mlx Paraformer
 
+use std::path::PathBuf;
+
 use eyre::{Context, Result};
 use mlx_rs::module::Module;
 
+use crate::model_config::{self, ModelAvailability, ModelCategory};
 use crate::types::{TranscriptionRequest, TranscriptionResponse};
 
 /// ASR inference engine using Paraformer
@@ -18,23 +21,55 @@ impl AsrEngine {
     /// - paraformer.safetensors
     /// - am.mvn (CMVN normalization)
     /// - tokens.txt (vocabulary)
+    ///
+    /// First checks ~/.moly/local_models_config.json for model availability.
     pub fn new(model_dir: &str) -> Result<Self> {
-        let weights_path = format!("{}/paraformer.safetensors", model_dir);
-        let cmvn_path = format!("{}/am.mvn", model_dir);
-        let vocab_path = format!("{}/tokens.txt", model_dir);
+        // Check model configuration for local availability
+        let actual_model_dir: PathBuf = match model_config::check_model("funasr-paraformer", ModelCategory::Asr) {
+            ModelAvailability::Ready { local_path, model_name } => {
+                tracing::info!("Found locally available ASR model: {}", model_name);
+                local_path.unwrap_or_else(|| PathBuf::from(model_dir))
+            }
+            ModelAvailability::NotDownloaded { model_name, model_id } => {
+                return Err(eyre::eyre!(
+                    "ASR model '{}' ({}) is not downloaded.\n\
+                     Please download it using OminiX-Studio before starting the API server.",
+                    model_name, model_id
+                ));
+            }
+            ModelAvailability::WrongCategory { .. } | ModelAvailability::NotInConfig => {
+                // Use the provided path directly
+                PathBuf::from(model_dir)
+            }
+        };
+
+        let weights_path = actual_model_dir.join("paraformer.safetensors");
+        let cmvn_path = actual_model_dir.join("am.mvn");
+        let vocab_path = actual_model_dir.join("tokens.txt");
+
+        // Check required files exist
+        if !weights_path.exists() {
+            return Err(eyre::eyre!("ASR model weights not found at {:?}", weights_path));
+        }
+        if !cmvn_path.exists() {
+            return Err(eyre::eyre!("ASR CMVN file not found at {:?}", cmvn_path));
+        }
+        if !vocab_path.exists() {
+            return Err(eyre::eyre!("ASR vocabulary not found at {:?}", vocab_path));
+        }
 
         // Load model
-        let mut model = funasr_mlx::load_model(&weights_path)
+        let mut model = funasr_mlx::load_model(weights_path.to_str().unwrap())
             .context("Failed to load Paraformer model")?;
         model.training_mode(false);
 
         // Load CMVN
-        let (addshift, rescale) = funasr_mlx::parse_cmvn_file(&cmvn_path)
+        let (addshift, rescale) = funasr_mlx::parse_cmvn_file(cmvn_path.to_str().unwrap())
             .context("Failed to load CMVN file")?;
         model.set_cmvn(addshift, rescale);
 
         // Load vocabulary
-        let vocab = funasr_mlx::Vocabulary::load(&vocab_path)
+        let vocab = funasr_mlx::Vocabulary::load(vocab_path.to_str().unwrap())
             .context("Failed to load vocabulary")?;
 
         tracing::info!("ASR model loaded: {} tokens", vocab.len());

@@ -9,6 +9,7 @@
 //! - Image-to-image generation (img2img) with reference image
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use eyre::{Context, Result};
@@ -16,6 +17,8 @@ use mlx_rs::module::ModuleParameters;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 use tokenizers::Tokenizer;
+
+use crate::model_config::{self, ModelAvailability, ModelCategory};
 
 use flux_klein_mlx::{
     AutoEncoderConfig, Decoder, Encoder, FluxKlein, FluxKleinParams,
@@ -25,7 +28,8 @@ use flux_klein_mlx::{
 };
 
 use zimage_mlx::{
-    ZImageConfig, ZImageTransformer, create_coordinate_grid, sanitize_mlx_weights,
+    ZImageConfig, ZImageTransformerQuantized, create_coordinate_grid,
+    load_quantized_zimage_transformer, load_safetensors as load_zimage_safetensors,
     QuantizedQwen3TextEncoder, sanitize_quantized_qwen3_weights,
 };
 
@@ -41,7 +45,7 @@ pub enum ImageModelType {
 /// Transformer variant (FLUX or Z-Image)
 enum TransformerVariant {
     Flux(FluxKlein, FluxKleinParams),
-    ZImage(ZImageTransformer, ZImageConfig),
+    ZImage(ZImageTransformerQuantized, ZImageConfig),
 }
 
 /// Text encoder variant (quantized or non-quantized)
@@ -63,6 +67,10 @@ pub struct ImageEngine {
 
 impl ImageEngine {
     /// Create a new image generation engine
+    ///
+    /// First checks ~/.moly/local_models_config.json for model availability.
+    /// If the model is ready locally, uses that path. Otherwise, attempts
+    /// to download from HuggingFace Hub.
     pub fn new(model_id: &str) -> Result<Self> {
         tracing::info!("Initializing image generation engine: {}", model_id);
 
@@ -75,55 +83,108 @@ impl ImageEngine {
 
         tracing::info!("Image model type: {:?}", model_type);
 
-        // Download model from HuggingFace based on model type
-        let api = hf_hub::api::sync::Api::new()?;
+        // Determine the config ID to check
+        let config_model_id = match model_type {
+            ImageModelType::FluxKlein => "flux-klein-4b",
+            ImageModelType::ZImageTurbo => "zimage-turbo",
+        };
+
+        // Check model configuration for local availability
+        let model_dir: PathBuf = match model_config::check_model(config_model_id, ModelCategory::Image) {
+            ModelAvailability::Ready { local_path, model_name } => {
+                tracing::info!("Found locally available model: {} at {:?}", model_name, local_path);
+                let path = local_path.ok_or_else(|| eyre::eyre!("Model path not available"))?;
+
+                // For HuggingFace cache structure, we need to find the snapshots directory
+                let snapshots_dir = path.join("snapshots");
+                if snapshots_dir.exists() {
+                    let snapshot = std::fs::read_dir(&snapshots_dir)?
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().is_dir())
+                        .next()
+                        .ok_or_else(|| eyre::eyre!("No snapshot found in {:?}", snapshots_dir))?;
+                    snapshot.path()
+                } else {
+                    path
+                }
+            }
+            ModelAvailability::NotDownloaded { model_name, model_id } => {
+                return Err(eyre::eyre!(
+                    "Image model '{}' ({}) is not downloaded.\n\
+                     Please download it using OminiX-Studio before starting the API server.",
+                    model_name, model_id
+                ));
+            }
+            ModelAvailability::WrongCategory { expected, found } => {
+                return Err(eyre::eyre!(
+                    "Model '{}' is a {:?} model, not a {:?} model",
+                    model_id, found, expected
+                ));
+            }
+            ModelAvailability::NotInConfig => {
+                return Err(eyre::eyre!(
+                    "Image model '{}' not found in local configuration.\n\
+                     Please add this model to OminiX-Studio and download it there first.\n\
+                     Available models can be viewed at: ~/.moly/local_models_config.json",
+                    model_id
+                ));
+            }
+        };
 
         // Get paths and configs based on model type
         let (transformer_path, text_encoder_paths, vae_path, tokenizer_path, vae_config) = match model_type {
             ImageModelType::FluxKlein => {
-                let repo = api.model("black-forest-labs/FLUX.2-klein-4B".to_string());
-                tracing::info!("Downloading FLUX.2-klein model files...");
+                tracing::info!("Loading FLUX.2-klein from local path: {:?}", model_dir);
 
-                let trans = repo.get("transformer/diffusion_pytorch_model.safetensors")
-                    .or_else(|_| repo.get("flux.safetensors"))
-                    .context("Failed to download FLUX transformer")?;
+                let trans = model_dir.join("transformer/diffusion_pytorch_model.safetensors");
+                let trans = if trans.exists() { trans } else { model_dir.join("flux.safetensors") };
+                if !trans.exists() {
+                    return Err(eyre::eyre!("FLUX transformer not found at {:?}", trans));
+                }
 
-                let te1 = repo.get("text_encoder/model-00001-of-00002.safetensors")
-                    .context("Failed to download text encoder part 1")?;
-                let te2 = repo.get("text_encoder/model-00002-of-00002.safetensors")
-                    .context("Failed to download text encoder part 2")?;
+                let te1 = model_dir.join("text_encoder/model-00001-of-00002.safetensors");
+                let te2 = model_dir.join("text_encoder/model-00002-of-00002.safetensors");
+                if !te1.exists() || !te2.exists() {
+                    return Err(eyre::eyre!("Text encoder files not found"));
+                }
 
-                let vae = repo.get("vae/diffusion_pytorch_model.safetensors")
-                    .or_else(|_| repo.get("ae.safetensors"))
-                    .context("Failed to download VAE")?;
+                let vae = model_dir.join("vae/diffusion_pytorch_model.safetensors");
+                let vae = if vae.exists() { vae } else { model_dir.join("ae.safetensors") };
+                if !vae.exists() {
+                    return Err(eyre::eyre!("VAE not found at {:?}", vae));
+                }
 
-                let tok = repo.get("tokenizer/tokenizer.json")
-                    .context("Failed to download tokenizer")?;
+                let tok = model_dir.join("tokenizer/tokenizer.json");
+                if !tok.exists() {
+                    return Err(eyre::eyre!("Tokenizer not found at {:?}", tok));
+                }
 
-                // FLUX.2-klein uses 32 latent channels
                 let config = AutoEncoderConfig::flux2();
-
                 (trans, vec![te1, te2], vae, tok, config)
             }
             ImageModelType::ZImageTurbo => {
-                let repo = api.model("uqer1244/MLX-z-image".to_string());
-                tracing::info!("Downloading Z-Image-Turbo model files...");
+                tracing::info!("Loading Z-Image-Turbo from local path: {:?}", model_dir);
 
-                // Z-Image transformer (dequantized weights)
-                let trans = repo.get("transformer/model.safetensors")
-                    .context("Failed to download Z-Image transformer")?;
+                let trans = model_dir.join("transformer/model.safetensors");
+                if !trans.exists() {
+                    return Err(eyre::eyre!("Z-Image transformer not found at {:?}", trans));
+                }
 
-                // Z-Image quantized text encoder (single file)
-                let te = repo.get("text_encoder/model.safetensors")
-                    .context("Failed to download Z-Image text encoder")?;
+                let te = model_dir.join("text_encoder/model.safetensors");
+                if !te.exists() {
+                    return Err(eyre::eyre!("Text encoder not found at {:?}", te));
+                }
 
-                let vae = repo.get("vae/diffusion_pytorch_model.safetensors")
-                    .context("Failed to download Z-Image VAE")?;
+                let vae = model_dir.join("vae/diffusion_pytorch_model.safetensors");
+                if !vae.exists() {
+                    return Err(eyre::eyre!("VAE not found at {:?}", vae));
+                }
 
-                let tok = repo.get("tokenizer/tokenizer.json")
-                    .context("Failed to download tokenizer")?;
+                let tok = model_dir.join("tokenizer/tokenizer.json");
+                if !tok.exists() {
+                    return Err(eyre::eyre!("Tokenizer not found at {:?}", tok));
+                }
 
-                // Z-Image uses 16 latent channels
                 let config = AutoEncoderConfig {
                     resolution: 1024,
                     in_channels: 3,
@@ -131,12 +192,11 @@ impl ImageEngine {
                     out_ch: 3,
                     ch_mult: vec![1, 2, 4, 4],
                     num_res_blocks: 2,
-                    z_channels: 16,  // Z-Image uses 16 latent channels
+                    z_channels: 16,
                     scale_factor: 0.3611,
                     shift_factor: 0.1159,
                 };
 
-                // Z-Image uses single quantized text encoder
                 (trans, vec![te], vae, tok, config)
             }
         };
@@ -222,28 +282,15 @@ impl ImageEngine {
                 TransformerVariant::Flux(trans, params)
             }
             ImageModelType::ZImageTurbo => {
-                tracing::info!("Loading Z-Image-Turbo transformer...");
+                tracing::info!("Loading Z-Image-Turbo transformer (4-bit quantized)...");
                 let config = ZImageConfig::default();
-                let mut trans = ZImageTransformer::new(config.clone())?;
 
-                // Load single transformer file for Z-Image
-                let raw_weights = load_safetensors(&transformer_path)?;
-                // MLX-z-image repo contains MLX-format weights, not PyTorch format
-                let weights = sanitize_mlx_weights(raw_weights);
-                let weights: HashMap<String, Array> = weights
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let v32 = v.as_type::<f32>().unwrap_or(v);
-                        (k, v32)
-                    })
-                    .collect();
+                // Load quantized transformer weights
+                let raw_weights = load_zimage_safetensors(&transformer_path)?;
+                let trans = load_quantized_zimage_transformer(raw_weights, config.clone())
+                    .map_err(|e| eyre::eyre!("Failed to load quantized Z-Image transformer: {}", e))?;
 
-                let weights_rc: HashMap<Rc<str>, Array> = weights
-                    .into_iter()
-                    .map(|(k, v)| (Rc::from(k.as_str()), v))
-                    .collect();
-                trans.update_flattened(weights_rc);
-                tracing::info!("Z-Image transformer loaded");
+                tracing::info!("Z-Image transformer loaded (quantized)");
                 TransformerVariant::ZImage(trans, config)
             }
         };

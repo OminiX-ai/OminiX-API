@@ -32,6 +32,7 @@ mod llm;
 mod asr;
 mod tts;
 mod image;
+mod model_config;
 
 use types::*;
 
@@ -479,6 +480,9 @@ async fn main() -> eyre::Result<()> {
 
     let config = Config::from_env();
     tracing::info!("Starting OminiX-API server on port {}", config.port);
+
+    // Print model configuration status report
+    model_config::print_startup_report();
 
     // Create channel for inference requests
     let (inference_tx, inference_rx) = mpsc::channel::<InferenceRequest>(32);
