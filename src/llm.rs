@@ -2,7 +2,7 @@
 //!
 //! Currently supports:
 //! - Qwen3 (via qwen3-mlx) — ChatML format
-//! - GLM-4.7-Flash (via glm47-flash-mlx) — GLM chat format with MLA attention
+//! - GLM-4.7-Flash (temporarily disabled)
 
 use std::path::PathBuf;
 
@@ -40,10 +40,6 @@ fn set_wired_limit_max() {
 enum ModelBackend {
     Qwen3 {
         model: qwen3_mlx::Model,
-        eos_tokens: Vec<u32>,
-    },
-    Glm4Flash {
-        model: glm47_flash_mlx::Model,
         eos_tokens: Vec<u32>,
     },
 }
@@ -90,15 +86,6 @@ impl LlmEngine {
 
         // Load model based on type
         let backend = match model_type.as_str() {
-            "glm4_moe_lite" => {
-                tracing::info!("Loading GLM-4.7-Flash backend");
-                let model = glm47_flash_mlx::load_model(&model_dir)
-                    .map_err(|e| eyre::eyre!("Failed to load GLM model: {}", e))?;
-                ModelBackend::Glm4Flash {
-                    model,
-                    eos_tokens,
-                }
-            }
             _ => {
                 tracing::info!("Loading Qwen3 backend (model_type={})", model_type);
                 let model = qwen3_mlx::load_model(&model_dir)
@@ -121,10 +108,7 @@ impl LlmEngine {
 
     /// Format chat messages based on model type
     fn format_messages(&self, messages: &[ChatMessage]) -> String {
-        match self.model_type.as_str() {
-            "glm4_moe_lite" => self.format_messages_glm(messages),
-            _ => self.format_messages_chatml(messages),
-        }
+        self.format_messages_chatml(messages)
     }
 
     /// Format messages in ChatML format (Qwen3)
@@ -161,50 +145,6 @@ impl LlmEngine {
         prompt
     }
 
-    /// Format messages in GLM-4 chat format
-    ///
-    /// GLM-4 uses: <|system|>...\n<|user|>...\n<|assistant|></think>...
-    /// Thinking is disabled (</think> immediately after <|assistant|>)
-    fn format_messages_glm(&self, messages: &[ChatMessage]) -> String {
-        let mut prompt = String::new();
-
-        // GLM requires [gMASK]<sop> prefix
-        prompt.push_str("[gMASK]<sop>");
-
-        for msg in messages {
-            match msg.role.as_str() {
-                "system" => {
-                    prompt.push_str("<|system|>");
-                    prompt.push_str(&msg.content);
-                    prompt.push('\n');
-                }
-                "user" => {
-                    prompt.push_str("<|user|>");
-                    prompt.push_str(&msg.content);
-                    prompt.push('\n');
-                }
-                "assistant" => {
-                    prompt.push_str("<|assistant|></think>");
-                    prompt.push_str(&msg.content);
-                    prompt.push('\n');
-                }
-                "observation" | "tool" => {
-                    prompt.push_str("<|observation|>");
-                    prompt.push_str(&msg.content);
-                    prompt.push('\n');
-                }
-                role => {
-                    prompt.push_str(&format!("<|{}|>", role));
-                    prompt.push_str(&msg.content);
-                    prompt.push('\n');
-                }
-            }
-        }
-
-        // Generation prompt: thinking disabled
-        prompt.push_str("<|assistant|></think>");
-        prompt
-    }
 
     /// Generate a chat completion response
     pub fn generate(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
@@ -227,28 +167,6 @@ impl LlmEngine {
                 let mut cache: Vec<Option<qwen3_mlx::KVCache>> = Vec::new();
 
                 let generator = qwen3_mlx::Generate::<qwen3_mlx::KVCache>::new(
-                    &mut model,
-                    &mut cache,
-                    temperature,
-                    &prompt_array,
-                );
-
-                let mut tokens = Vec::new();
-                for token in generator.take(max_tokens) {
-                    let token = token?;
-                    let token_id = token.item::<u32>();
-                    if eos_tokens.contains(&token_id) {
-                        break;
-                    }
-                    tokens.push(token);
-                }
-                tokens
-            }
-            ModelBackend::Glm4Flash { model, eos_tokens } => {
-                let mut model = model.clone();
-                let mut cache: Vec<glm47_flash_mlx::KVCache> = Vec::new();
-
-                let generator = glm47_flash_mlx::Generate::<glm47_flash_mlx::KVCache>::new(
                     &mut model,
                     &mut cache,
                     temperature,

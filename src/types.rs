@@ -148,6 +148,12 @@ pub struct ImageGenerationRequest {
     /// Strength for img2img (0.0-1.0, higher = more variation from reference)
     #[serde(default = "default_strength")]
     pub strength: f32,
+    /// Number of denoising steps (model-specific default if not set)
+    #[serde(default)]
+    pub steps: Option<u32>,
+    /// Guidance scale for classifier-free guidance
+    #[serde(default)]
+    pub guidance_scale: Option<f32>,
 }
 
 fn default_strength() -> f32 {

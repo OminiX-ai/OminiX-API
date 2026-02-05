@@ -251,6 +251,8 @@ fn inference_thread(
         let lower = model.to_lowercase();
         if lower.contains("flux") {
             "flux"
+        } else if lower.contains("qwen") {
+            "qwen-image"
         } else {
             "zimage"
         }
