@@ -1,12 +1,13 @@
-//! Image generation engine supporting FLUX.2-klein and Z-Image-Turbo
+//! Image generation engine supporting FLUX.2-klein, Z-Image-Turbo, and Qwen-Image
 //!
 //! Supported models:
 //! - FLUX.2-klein-4B: 4-step denoising, ~13GB VRAM (or ~3GB with INT8)
 //! - Z-Image-Turbo: 9-step denoising, ~12GB VRAM (or ~3GB with 4-bit)
+//! - Qwen-Image: Full-precision DiT with 3D VAE, configurable steps
 //!
-//! Both models support:
+//! All models support:
 //! - Text-to-image generation
-//! - Image-to-image generation (img2img) with reference image
+//! - FLUX and Z-Image also support img2img
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,6 +41,7 @@ use crate::types::{ImageGenerationRequest, ImageGenerationResponse, ImageData};
 pub enum ImageModelType {
     FluxKlein,
     ZImageTurbo,
+    QwenImage,
 }
 
 /// Transformer variant (FLUX or Z-Image)
@@ -54,15 +56,26 @@ enum TextEncoderVariant {
     Quantized(QuantizedQwen3TextEncoder),
 }
 
+/// Qwen-Image specific components (8-bit quantized DiT + 3D VAE)
+struct QwenImageComponents {
+    text_encoder: qwen_image_mlx::text_encoder::QwenTextEncoder,
+    transformer: qwen_image_mlx::QwenQuantizedTransformer,
+    vae: qwen_image_mlx::vae::QwenVAE,
+    tokenizer: Tokenizer,
+}
+
 /// Image generation engine
 pub struct ImageEngine {
     model_type: ImageModelType,
-    text_encoder: TextEncoderVariant,
-    transformer: TransformerVariant,
-    vae_decoder: Decoder,
-    vae_encoder: Encoder,
-    tokenizer: Tokenizer,
-    vae_config: AutoEncoderConfig,
+    // FLUX / Z-Image components (used when model_type != QwenImage)
+    text_encoder: Option<TextEncoderVariant>,
+    transformer: Option<TransformerVariant>,
+    vae_decoder: Option<Decoder>,
+    vae_encoder: Option<Encoder>,
+    tokenizer: Option<Tokenizer>,
+    vae_config: Option<AutoEncoderConfig>,
+    // Qwen-Image components (used when model_type == QwenImage)
+    qwen: Option<QwenImageComponents>,
 }
 
 impl ImageEngine {
@@ -75,7 +88,9 @@ impl ImageEngine {
         tracing::info!("Initializing image generation engine: {}", model_id);
 
         // Determine model type
-        let model_type = if model_id.contains("zimage") || model_id.contains("z-image") || model_id.contains("Z-Image") {
+        let model_type = if model_id.contains("qwen") || model_id.contains("Qwen") {
+            ImageModelType::QwenImage
+        } else if model_id.contains("zimage") || model_id.contains("z-image") || model_id.contains("Z-Image") {
             ImageModelType::ZImageTurbo
         } else {
             ImageModelType::FluxKlein
@@ -87,6 +102,7 @@ impl ImageEngine {
         let config_model_id = match model_type {
             ImageModelType::FluxKlein => "flux-klein-4b",
             ImageModelType::ZImageTurbo => "zimage-turbo",
+            ImageModelType::QwenImage => "qwen-image-8bit",
         };
 
         // Check model configuration for local availability
@@ -119,7 +135,12 @@ impl ImageEngine {
             }
         };
 
-        // Get paths and configs based on model type
+        // Qwen-Image uses a completely different architecture; handle separately
+        if model_type == ImageModelType::QwenImage {
+            return Self::load_qwen_image(&model_dir);
+        }
+
+        // Get paths and configs based on model type (FLUX / Z-Image)
         let (transformer_path, text_encoder_paths, vae_path, tokenizer_path, vae_config) = match model_type {
             ImageModelType::FluxKlein => {
                 tracing::info!("Loading FLUX.2-klein from local path: {:?}", model_dir);
@@ -187,6 +208,7 @@ impl ImageEngine {
 
                 (trans, vec![te], vae, tok, config)
             }
+            ImageModelType::QwenImage => unreachable!("QwenImage handled above"),
         };
 
         // Load Qwen3 text encoder (same config for both models)
@@ -241,6 +263,7 @@ impl ImageEngine {
                 encoder.update_flattened(weights_rc);
                 TextEncoderVariant::Quantized(encoder)
             }
+            ImageModelType::QwenImage => unreachable!("QwenImage handled above"),
         };
         tracing::info!("Text encoder loaded");
 
@@ -281,6 +304,7 @@ impl ImageEngine {
                 tracing::info!("Z-Image transformer loaded (quantized)");
                 TransformerVariant::ZImage(trans, config)
             }
+            ImageModelType::QwenImage => unreachable!("QwenImage handled above"),
         };
 
         // Load VAE (decoder and encoder)
@@ -322,18 +346,24 @@ impl ImageEngine {
 
         Ok(Self {
             model_type,
-            text_encoder,
-            transformer,
-            vae_decoder,
-            vae_encoder,
-            tokenizer,
-            vae_config,
+            text_encoder: Some(text_encoder),
+            transformer: Some(transformer),
+            vae_decoder: Some(vae_decoder),
+            vae_encoder: Some(vae_encoder),
+            tokenizer: Some(tokenizer),
+            vae_config: Some(vae_config),
+            qwen: None,
         })
     }
 
     /// Generate images from a text prompt (with optional reference image for img2img)
     pub fn generate(&mut self, request: &ImageGenerationRequest) -> Result<ImageGenerationResponse> {
         let (width, height) = parse_size(&request.size)?;
+
+        // Qwen-Image has its own generation pipeline
+        if self.model_type == ImageModelType::QwenImage {
+            return self.generate_qwen_image_request(request, width, height);
+        }
 
         // Check if we have a reference image for img2img
         let ref_latents = if let Some(ref image_b64) = request.image {
@@ -384,6 +414,9 @@ impl ImageEngine {
     fn encode_reference_image(&mut self, image_b64: &str, width: u32, height: u32) -> Result<Array> {
         use base64::Engine;
 
+        let vae_encoder = self.vae_encoder.as_mut()
+            .ok_or_else(|| eyre::eyre!("VAE encoder not available for this model type"))?;
+
         // Decode base64 image
         let image_bytes = base64::engine::general_purpose::STANDARD
             .decode(image_b64)
@@ -403,7 +436,7 @@ impl ImageEngine {
         let input = Array::from_slice(&pixels, &[1, height as i32, width as i32, 3]);
 
         // Encode through VAE
-        let latents = self.vae_encoder.encode_deterministic(&input)?;
+        let latents = vae_encoder.encode_deterministic(&input)?;
         latents.eval()?;
 
         tracing::debug!("Encoded reference image to latents: {:?}", latents.shape());
@@ -416,6 +449,7 @@ impl ImageEngine {
         match self.model_type {
             ImageModelType::FluxKlein => self.generate_flux(prompt, width, height, Some(ref_latents), strength),
             ImageModelType::ZImageTurbo => self.generate_zimage(prompt, width, height, Some(ref_latents), strength),
+            ImageModelType::QwenImage => Err(eyre::eyre!("img2img not supported for Qwen-Image")),
         }
     }
 
@@ -424,11 +458,14 @@ impl ImageEngine {
         match self.model_type {
             ImageModelType::FluxKlein => self.generate_flux(prompt, width, height, None, 1.0),
             ImageModelType::ZImageTurbo => self.generate_zimage(prompt, width, height, None, 1.0),
+            ImageModelType::QwenImage => Err(eyre::eyre!("Use generate_qwen_image_request for Qwen-Image")),
         }
     }
 
     /// Tokenize a prompt using Qwen3 chat template
     fn tokenize_prompt(&self, prompt: &str) -> Result<(Array, Array)> {
+        let tokenizer = self.tokenizer.as_ref()
+            .ok_or_else(|| eyre::eyre!("Tokenizer not available for this model type"))?;
         let batch_size = 1i32;
         let max_seq_len = 512i32;
 
@@ -437,7 +474,7 @@ impl ImageEngine {
             prompt
         );
 
-        let encoding = self.tokenizer.encode(chat_prompt.as_str(), true)
+        let encoding = tokenizer.encode(chat_prompt.as_str(), true)
             .map_err(|e| eyre::eyre!("Tokenization failed: {}", e))?;
         let ids: Vec<i32> = encoding.get_ids().iter().map(|&x| x as i32).collect();
         let num_tokens = ids.len().min(max_seq_len as usize);
@@ -508,8 +545,8 @@ impl ImageEngine {
         // Tokenize before borrowing transformer (avoids overlapping borrow)
         let (input_ids, attention_mask) = self.tokenize_prompt(prompt)?;
 
-        let (flux_trans, params) = match &mut self.transformer {
-            TransformerVariant::Flux(t, p) => (t, p.clone()),
+        let (flux_trans, params) = match self.transformer.as_mut() {
+            Some(TransformerVariant::Flux(t, p)) => (t, p.clone()),
             _ => return Err(eyre::eyre!("Expected FLUX transformer")),
         };
 
@@ -521,9 +558,10 @@ impl ImageEngine {
 
         // Encode text
         tracing::debug!("Encoding text prompt...");
-        let txt_embed = match &mut self.text_encoder {
-            TextEncoderVariant::Standard(enc) => enc.encode(&input_ids, Some(&attention_mask))?,
-            TextEncoderVariant::Quantized(enc) => enc.encode_flux(&input_ids, Some(&attention_mask))?,
+        let txt_embed = match self.text_encoder.as_mut() {
+            Some(TextEncoderVariant::Standard(enc)) => enc.encode(&input_ids, Some(&attention_mask))?,
+            Some(TextEncoderVariant::Quantized(enc)) => enc.encode_flux(&input_ids, Some(&attention_mask))?,
+            None => return Err(eyre::eyre!("Text encoder not loaded")),
         };
         let txt_embed = txt_embed.as_dtype(mlx_rs::Dtype::Float32)?;
         txt_embed.eval()?;
@@ -536,7 +574,7 @@ impl ImageEngine {
         let patch_w = latent_width / patch_size;
         let img_seq_len = patch_h * patch_w;
         let in_channels = params.in_channels;
-        let z_channels = self.vae_config.z_channels;
+        let z_channels = self.vae_config.as_ref().unwrap().z_channels;
         let max_seq_len = 512i32;
 
         // Position IDs and RoPE
@@ -588,7 +626,7 @@ impl ImageEngine {
         let vae_width = patch_w * patch_size;
         let latent_for_vae = latent.reshape(&[batch_size, vae_height, vae_width, z_channels])?;
 
-        let image = self.vae_decoder.forward(&latent_for_vae)?;
+        let image = self.vae_decoder.as_mut().unwrap().forward(&latent_for_vae)?;
         image.eval()?;
 
         self.vae_to_png_flux(&image)
@@ -601,8 +639,8 @@ impl ImageEngine {
         let batch_size = 1i32;
         let num_steps = 9;
 
-        let zimage_config = match &self.transformer {
-            TransformerVariant::ZImage(_, c) => c.clone(),
+        let zimage_config = match self.transformer.as_ref() {
+            Some(TransformerVariant::ZImage(_, c)) => c.clone(),
             _ => return Err(eyre::eyre!("Expected Z-Image transformer")),
         };
 
@@ -615,9 +653,10 @@ impl ImageEngine {
         // Tokenize and encode text
         let (input_ids, attention_mask) = self.tokenize_prompt(prompt)?;
         tracing::debug!("Encoding text prompt (Z-Image style)...");
-        let txt_embed = match &mut self.text_encoder {
-            TextEncoderVariant::Standard(enc) => enc.encode_zimage(&input_ids, Some(&attention_mask))?,
-            TextEncoderVariant::Quantized(enc) => enc.encode_zimage(&input_ids, Some(&attention_mask))?,
+        let txt_embed = match self.text_encoder.as_mut() {
+            Some(TextEncoderVariant::Standard(enc)) => enc.encode_zimage(&input_ids, Some(&attention_mask))?,
+            Some(TextEncoderVariant::Quantized(enc)) => enc.encode_zimage(&input_ids, Some(&attention_mask))?,
+            None => return Err(eyre::eyre!("Text encoder not loaded")),
         };
         let txt_embed = txt_embed.as_dtype(mlx_rs::Dtype::Float32)?;
         txt_embed.eval()?;
@@ -649,8 +688,8 @@ impl ImageEngine {
         let cap_pos = create_coordinate_grid((cap_len, 1, 1), (1, 0, 0))?;
         let cap_pos = cap_pos.reshape(&[1, cap_len, 3])?;
 
-        let (cos, sin) = match &mut self.transformer {
-            TransformerVariant::ZImage(trans, _) => trans.compute_rope(&img_pos, &cap_pos)?,
+        let (cos, sin) = match self.transformer.as_mut() {
+            Some(TransformerVariant::ZImage(trans, _)) => trans.compute_rope(&img_pos, &cap_pos)?,
             _ => return Err(eyre::eyre!("Expected Z-Image transformer")),
         };
 
@@ -680,8 +719,8 @@ impl ImageEngine {
 
             let latents_patched = patchify(&latents, h_tok, w_tok, in_channels)?;
 
-            let model_out = match &mut self.transformer {
-                TransformerVariant::ZImage(trans, _) => trans.forward_with_rope(
+            let model_out = match self.transformer.as_mut() {
+                Some(TransformerVariant::ZImage(trans, _)) => trans.forward_with_rope(
                     &latents_patched, &t, &txt_embed, &img_pos, &cap_pos, &cos, &sin, None, None
                 )?,
                 _ => return Err(eyre::eyre!("Expected Z-Image transformer")),
@@ -702,10 +741,371 @@ impl ImageEngine {
         tracing::debug!("Decoding latents...");
         let latents = latents.transpose_axes(&[0, 2, 3, 1])?;
 
-        let image = self.vae_decoder.forward(&latents)?;
+        let image = self.vae_decoder.as_mut().unwrap().forward(&latents)?;
         image.eval()?;
 
         self.vae_to_png_zimage(&image)
+    }
+}
+
+// ============================================================================
+// Qwen-Image Support
+// ============================================================================
+
+impl ImageEngine {
+    /// Load Qwen-Image model (full precision DiT + 3D VAE)
+    fn load_qwen_image(model_dir: &PathBuf) -> Result<Self> {
+        tracing::info!("Loading Qwen-Image (8-bit quantized) from {:?}", model_dir);
+
+        // Load tokenizer
+        let tok_path = model_dir.join("tokenizer/tokenizer.json");
+        if !tok_path.exists() {
+            return Err(eyre::eyre!("Qwen-Image tokenizer not found at {:?}", tok_path));
+        }
+        let tokenizer = Tokenizer::from_file(&tok_path)
+            .map_err(|e| eyre::eyre!("Failed to load tokenizer: {}", e))?;
+        tracing::info!("Qwen-Image tokenizer loaded");
+
+        // Load text encoder
+        tracing::info!("Loading Qwen-Image text encoder...");
+        let text_encoder = qwen_image_mlx::load_text_encoder(model_dir)
+            .map_err(|e| eyre::eyre!("Failed to load Qwen-Image text encoder: {}", e))?;
+        tracing::info!("Qwen-Image text encoder loaded (28 layers, 3584 hidden)");
+
+        // Load 8-bit quantized transformer
+        tracing::info!("Loading Qwen-Image transformer (8-bit quantized, 60 layers)...");
+        let config = qwen_image_mlx::QwenConfig::with_8bit();
+
+        // Load numbered shards from transformer directory
+        let trans_dir = model_dir.join("transformer");
+        let mut all_weights = HashMap::new();
+        for i in 0..20 {
+            let path = trans_dir.join(format!("{}.safetensors", i));
+            if path.exists() {
+                tracing::info!("  Loading transformer shard: {}.safetensors", i);
+                let shard = qwen_image_mlx::weights::load_safetensors(&path)
+                    .map_err(|e| eyre::eyre!("Failed to load shard {}: {}", i, e))?;
+                all_weights.extend(shard);
+            }
+        }
+        if all_weights.is_empty() {
+            return Err(eyre::eyre!("No transformer weight shards found in {:?}", trans_dir));
+        }
+        tracing::info!("  Loaded {} transformer weight tensors", all_weights.len());
+
+        let mut transformer = qwen_image_mlx::QwenQuantizedTransformer::new(config)
+            .map_err(|e| eyre::eyre!("Failed to create Qwen-Image transformer: {}", e))?;
+        qwen_image_mlx::load_transformer_weights(&mut transformer, all_weights)
+            .map_err(|e| eyre::eyre!("Failed to load transformer weights: {}", e))?;
+        tracing::info!("Qwen-Image transformer loaded");
+
+        // Load VAE
+        tracing::info!("Loading Qwen-Image 3D VAE...");
+        let vae = qwen_image_mlx::load_vae_from_dir(model_dir)
+            .map_err(|e| eyre::eyre!("Failed to load Qwen-Image VAE: {}", e))?;
+        tracing::info!("Qwen-Image VAE loaded");
+
+        tracing::info!("Qwen-Image engine ready (8-bit quantized)");
+
+        Ok(Self {
+            model_type: ImageModelType::QwenImage,
+            text_encoder: None,
+            transformer: None,
+            vae_decoder: None,
+            vae_encoder: None,
+            tokenizer: None,
+            vae_config: None,
+            qwen: Some(QwenImageComponents {
+                text_encoder,
+                transformer,
+                vae,
+                tokenizer,
+            }),
+        })
+    }
+
+    /// Generate images using Qwen-Image pipeline
+    fn generate_qwen_image_request(&mut self, request: &ImageGenerationRequest, width: u32, height: u32) -> Result<ImageGenerationResponse> {
+        let num_steps = request.steps.unwrap_or(20) as i32;
+        let guidance_scale = request.guidance_scale.unwrap_or(5.0);
+
+        tracing::info!(
+            "Qwen-Image generation: prompt='{}', size={}x{}, steps={}, cfg={}",
+            request.prompt, width, height, num_steps, guidance_scale
+        );
+
+        let mut data = Vec::new();
+        for i in 0..request.n {
+            tracing::info!("Generating image {}/{}", i + 1, request.n);
+            let image_bytes = self.generate_qwen_image_single(&request.prompt, width, height, num_steps, guidance_scale)?;
+
+            let b64 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &image_bytes,
+            );
+            data.push(ImageData {
+                url: None,
+                b64_json: Some(b64),
+                revised_prompt: Some(request.prompt.clone()),
+            });
+        }
+
+        Ok(ImageGenerationResponse {
+            created: chrono::Utc::now().timestamp(),
+            data,
+        })
+    }
+
+    /// Single image generation with Qwen-Image 8-bit quantized pipeline
+    fn generate_qwen_image_single(&mut self, prompt: &str, width: u32, height: u32, num_steps: i32, guidance_scale: f32) -> Result<Vec<u8>> {
+        use mlx_rs::ops;
+        use qwen_image_mlx::vae::QwenVAE;
+
+        let qwen = self.qwen.as_mut()
+            .ok_or_else(|| eyre::eyre!("Qwen-Image components not loaded"))?;
+
+        let patch_size = 2i32;
+
+        // --- Text encoding with template (matching mflux approach) ---
+        let template = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n";
+        let max_input_len = 77 + 34; // 111
+        let drop_idx = 34; // Skip system/user template tokens after encoding
+        let max_output_len = 77;
+
+        // Tokenize conditional prompt
+        let formatted_prompt = template.replace("{}", prompt);
+        let cond_encoding = qwen.tokenizer.encode(formatted_prompt.as_str(), false)
+            .map_err(|e| eyre::eyre!("Tokenization failed: {}", e))?;
+        let cond_ids_raw: Vec<i32> = cond_encoding.get_ids().iter().map(|&x| x as i32).collect();
+        let cond_total = cond_ids_raw.len();
+
+        let mut cond_padded = cond_ids_raw.clone();
+        cond_padded.truncate(max_input_len);
+        while cond_padded.len() < max_input_len { cond_padded.push(0); }
+        let cond_attn: Vec<i32> = (0..max_input_len).map(|i| if i < cond_total { 1 } else { 0 }).collect();
+
+        let cond_input = Array::from_slice(&cond_padded, &[1, max_input_len as i32]);
+        let cond_mask = Array::from_slice(&cond_attn, &[1, max_input_len as i32]);
+
+        // Tokenize unconditional prompt (space)
+        let formatted_uncond = template.replace("{}", " ");
+        let uncond_encoding = qwen.tokenizer.encode(formatted_uncond.as_str(), false)
+            .map_err(|e| eyre::eyre!("Uncond tokenization failed: {}", e))?;
+        let uncond_ids_raw: Vec<i32> = uncond_encoding.get_ids().iter().map(|&x| x as i32).collect();
+        let uncond_total = uncond_ids_raw.len();
+
+        let mut uncond_padded = uncond_ids_raw.clone();
+        uncond_padded.truncate(max_input_len);
+        while uncond_padded.len() < max_input_len { uncond_padded.push(0); }
+        let uncond_attn: Vec<i32> = (0..max_input_len).map(|i| if i < uncond_total { 1 } else { 0 }).collect();
+
+        let uncond_input = Array::from_slice(&uncond_padded, &[1, max_input_len as i32]);
+        let uncond_mask = Array::from_slice(&uncond_attn, &[1, max_input_len as i32]);
+
+        // Encode text with causal attention
+        tracing::info!("Encoding text ({} cond tokens, {} uncond tokens)...", cond_total, uncond_total);
+        let cond_full = qwen.text_encoder.forward_with_mask(&cond_input, &cond_mask)
+            .map_err(|e| eyre::eyre!("Text encoding failed: {}", e))?;
+        let uncond_full = qwen.text_encoder.forward_with_mask(&uncond_input, &uncond_mask)
+            .map_err(|e| eyre::eyre!("Uncond text encoding failed: {}", e))?;
+        mlx_rs::transforms::eval([&cond_full, &uncond_full])?;
+
+        // Drop template tokens and extract valid text embeddings
+        let cond_valid_end = cond_total.min(max_input_len);
+        let cond_txt_len = cond_valid_end.saturating_sub(drop_idx);
+        let cond_embed = cond_full.index((.., drop_idx as i32..cond_valid_end as i32, ..));
+        let cond_embed = cond_embed.as_dtype(mlx_rs::Dtype::Bfloat16)?;
+
+        let uncond_valid_end = uncond_total.min(max_input_len);
+        let uncond_txt_len = uncond_valid_end.saturating_sub(drop_idx);
+        let uncond_embed = uncond_full.index((.., drop_idx as i32..uncond_valid_end as i32, ..));
+        let uncond_embed = uncond_embed.as_dtype(mlx_rs::Dtype::Bfloat16)?;
+        mlx_rs::transforms::eval([&cond_embed, &uncond_embed])?;
+
+        tracing::info!("Text encoded: cond={} tokens, uncond={} tokens", cond_txt_len, uncond_txt_len);
+
+        // --- Setup latent dimensions ---
+        let latent_h = height as i32 / 16;
+        let latent_w = width as i32 / 16;
+        let num_patches = latent_h * latent_w;
+
+        // --- Compute RoPE (matching mflux's QwenEmbedRopeMLX with scale_rope=True) ---
+        let theta = 10000.0f32;
+        let axes_dim = [16i32, 56i32, 56i32];
+
+        fn compute_freqs(dim: i32, theta: f32) -> Vec<f32> {
+            (0..dim/2).map(|i| 1.0 / theta.powf((i as f32 * 2.0) / dim as f32)).collect()
+        }
+
+        let frame_freqs = compute_freqs(axes_dim[0], theta);
+        let height_freqs = compute_freqs(axes_dim[1], theta);
+        let width_freqs = compute_freqs(axes_dim[2], theta);
+
+        let half_h = (latent_h / 2) as usize;
+        let half_w = (latent_w / 2) as usize;
+
+        // Build image RoPE
+        let mut img_cos_data: Vec<f32> = Vec::with_capacity((num_patches * 64) as usize);
+        let mut img_sin_data: Vec<f32> = Vec::with_capacity((num_patches * 64) as usize);
+
+        for h in 0..latent_h as usize {
+            for w in 0..latent_w as usize {
+                // Frame: always position 0, so cos(0)=1, sin(0)=0
+                for _freq in &frame_freqs {
+                    img_cos_data.push(1.0);
+                    img_sin_data.push(0.0);
+                }
+                // Height: centered positions
+                let h_pos = if h < half_h { -((latent_h as isize - half_h as isize) - h as isize) as f32 } else { (h - half_h) as f32 };
+                for &freq in &height_freqs {
+                    img_cos_data.push((h_pos * freq).cos());
+                    img_sin_data.push((h_pos * freq).sin());
+                }
+                // Width: centered positions
+                let w_pos = if w < half_w { -((latent_w as isize - half_w as isize) - w as isize) as f32 } else { (w - half_w) as f32 };
+                for &freq in &width_freqs {
+                    img_cos_data.push((w_pos * freq).cos());
+                    img_sin_data.push((w_pos * freq).sin());
+                }
+            }
+        }
+
+        let img_cos = Array::from_slice(&img_cos_data, &[num_patches, 64]);
+        let img_sin = Array::from_slice(&img_sin_data, &[num_patches, 64]);
+
+        // Text RoPE: positions start after max_vid_index
+        let max_vid_index = half_h.max(half_w) as i32;
+        let max_txt_len = cond_txt_len.max(uncond_txt_len);
+
+        let mut txt_cos_data: Vec<f32> = Vec::with_capacity(max_txt_len * 64);
+        let mut txt_sin_data: Vec<f32> = Vec::with_capacity(max_txt_len * 64);
+
+        for i in 0..max_txt_len {
+            let pos = (max_vid_index as usize + i) as f32;
+            for &freq in &frame_freqs { txt_cos_data.push((pos * freq).cos()); txt_sin_data.push((pos * freq).sin()); }
+            for &freq in &height_freqs { txt_cos_data.push((pos * freq).cos()); txt_sin_data.push((pos * freq).sin()); }
+            for &freq in &width_freqs { txt_cos_data.push((pos * freq).cos()); txt_sin_data.push((pos * freq).sin()); }
+        }
+
+        let txt_cos_full = Array::from_slice(&txt_cos_data, &[max_txt_len as i32, 64]);
+        let txt_sin_full = Array::from_slice(&txt_sin_data, &[max_txt_len as i32, 64]);
+
+        let cond_txt_cos = txt_cos_full.index((..cond_txt_len as i32, ..));
+        let cond_txt_sin = txt_sin_full.index((..cond_txt_len as i32, ..));
+        let uncond_txt_cos = txt_cos_full.index((..uncond_txt_len as i32, ..));
+        let uncond_txt_sin = txt_sin_full.index((..uncond_txt_len as i32, ..));
+
+        // --- Dynamic flow matching schedule ---
+        const BASE_SHIFT: f32 = 0.5;
+        const MAX_SHIFT: f32 = 0.9;
+        const BASE_SEQ: f32 = 256.0;
+        const MAX_SEQ: f32 = 8192.0;
+
+        let mu = {
+            let m = (MAX_SHIFT - BASE_SHIFT) / (MAX_SEQ - BASE_SEQ);
+            let b = BASE_SHIFT - m * BASE_SEQ;
+            num_patches as f32 * m + b
+        };
+
+        let sigmas: Vec<f32> = (0..=num_steps).map(|i| {
+            let t = 1.0 - (i as f32 / num_steps as f32);
+            if t <= 0.0 || t >= 1.0 { t } else {
+                let exp_mu = mu.exp();
+                exp_mu / (exp_mu + (1.0 / t - 1.0))
+            }
+        }).collect();
+
+        // --- Initialize noise in patch space [1, num_patches, 64] ---
+        let key = mlx_rs::random::key(42)?;
+        let mut latents = mlx_rs::random::normal::<f32>(&[1, num_patches, 64], None, None, Some(&key))?;
+
+        // --- Denoising loop ---
+        tracing::info!("Running Qwen-Image denoising ({} steps, cfg={}, mu={:.4})...", num_steps, guidance_scale, mu);
+
+        for step in 0..num_steps {
+            let sigma = sigmas[step as usize];
+            let sigma_next = sigmas[(step + 1) as usize];
+            let timestep = Array::from_slice(&[sigma], &[1]);
+
+            // Conditional forward
+            let v_cond = qwen.transformer.forward(
+                &latents, &cond_embed, &timestep,
+                Some((&img_cos, &img_sin)), Some((&cond_txt_cos, &cond_txt_sin)),
+                None,
+            ).map_err(|e| eyre::eyre!("Transformer forward (cond) failed: {}", e))?;
+
+            // Unconditional forward
+            let v_uncond = qwen.transformer.forward(
+                &latents, &uncond_embed, &timestep,
+                Some((&img_cos, &img_sin)), Some((&uncond_txt_cos, &uncond_txt_sin)),
+                None,
+            ).map_err(|e| eyre::eyre!("Transformer forward (uncond) failed: {}", e))?;
+
+            // Normalized CFG
+            let diff = ops::subtract(&v_cond, &v_uncond)?;
+            let scaled = ops::multiply(&diff, &Array::from_f32(guidance_scale))?;
+            let combined = ops::add(&v_uncond, &scaled)?;
+
+            // Rescale to match cond norm
+            let eps = Array::from_f32(1e-12);
+            let cond_sq = ops::multiply(&v_cond, &v_cond)?;
+            let cond_norm = ops::sqrt(&ops::add(&ops::sum_axis(&cond_sq, -1, true)?, &eps)?)?;
+            let combined_sq = ops::multiply(&combined, &combined)?;
+            let combined_norm = ops::sqrt(&ops::add(&ops::sum_axis(&combined_sq, -1, true)?, &eps)?)?;
+            let velocity = ops::multiply(&combined, &ops::divide(&cond_norm, &combined_norm)?)?;
+
+            // Euler step
+            let dt = Array::from_f32(sigma_next - sigma);
+            let delta = ops::multiply(&velocity, &dt)?;
+            latents = ops::add(&latents, &delta)?;
+
+            if (step + 1) % 2 == 0 || step == 0 {
+                tracing::info!("  Step {}/{} (sigma: {:.3})", step + 1, num_steps, sigma);
+            }
+        }
+
+        mlx_rs::transforms::eval([&latents])?;
+        tracing::info!("Diffusion complete");
+
+        // --- Unpatchify: [1, num_patches, 64] -> [1, 16, vae_h, vae_w] ---
+        let out_channels = 16i32;
+        let vae_h = latent_h * patch_size;
+        let vae_w = latent_w * patch_size;
+
+        let reshaped = latents.reshape(&[1, latent_h, latent_w, out_channels, patch_size, patch_size])?;
+        let permuted = reshaped.transpose_axes(&[0, 3, 1, 4, 2, 5])?;
+        let vae_latents = permuted.reshape(&[1, out_channels, vae_h, vae_w])?;
+        mlx_rs::transforms::eval([&vae_latents])?;
+
+        // --- Denormalize and decode ---
+        tracing::info!("Decoding with Qwen-Image 3D VAE...");
+        let denorm = QwenVAE::denormalize_latent(&vae_latents)
+            .map_err(|e| eyre::eyre!("Denormalize failed: {}", e))?;
+        let image = qwen.vae.decode(&denorm)
+            .map_err(|e| eyre::eyre!("VAE decode failed: {}", e))?;
+        mlx_rs::transforms::eval([&image])?;
+
+        // --- Convert to PNG ---
+        let img = image.index((0, .., .., ..)); // [3, H, W]
+        let img = ops::clip(&img, (-1.0f32, 1.0f32))?;
+        let img = ops::add(&img, &Array::from_f32(1.0))?;
+        let img = ops::multiply(&img, &Array::from_f32(127.5))?;
+        let img = img.as_dtype(mlx_rs::Dtype::Uint8)?;
+        let img = img.transpose_axes(&[1, 2, 0])?; // [H, W, 3]
+        mlx_rs::transforms::eval([&img])?;
+
+        let shape = img.shape();
+        let out_height = shape[0] as u32;
+        let out_width = shape[1] as u32;
+
+        // Force contiguous
+        let numel = out_height as i32 * out_width as i32 * 3;
+        let img = img.reshape(&[numel])?;
+        let img = img.reshape(&[out_height as i32, out_width as i32, 3])?;
+        mlx_rs::transforms::eval([&img])?;
+
+        let img_data: Vec<u8> = img.as_slice().to_vec();
+        rgb_to_png(&img_data, out_width, out_height)
     }
 }
 

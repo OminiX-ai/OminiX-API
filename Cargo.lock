@@ -1181,19 +1181,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glm47-flash-mlx"
-version = "0.1.0"
-dependencies = [
- "mlx-rs",
- "mlx-rs-core",
- "mlx-sys",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokenizers 0.21.4",
-]
-
-[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2439,7 +2426,6 @@ dependencies = [
  "eyre",
  "flux-klein-mlx",
  "funasr-mlx",
- "glm47-flash-mlx",
  "gpt-sovits-mlx",
  "hex",
  "hound",
@@ -2447,6 +2433,7 @@ dependencies = [
  "mlx-rs",
  "mlx-rs-core",
  "mlx-sys",
+ "qwen-image-mlx",
  "qwen3-mlx",
  "salvo",
  "serde",
@@ -2873,6 +2860,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21b2ebcf727b7760c461f091f9f0f539b77b8e87f2fd88131e7f1b433b3cece4"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "qwen-image-mlx"
+version = "0.25.2"
+dependencies = [
+ "bytemuck",
+ "memmap2",
+ "mlx-macros",
+ "mlx-rs",
+ "mlx-rs-core",
+ "mlx-sys",
+ "safetensors 0.6.2",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers 0.21.4",
 ]
 
 [[package]]
