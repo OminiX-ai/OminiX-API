@@ -18,7 +18,7 @@ use crate::types::SpeechRequest;
 // Voice Registry (voices.json)
 // ============================================================================
 
-const DEFAULT_VOICES_CONFIG: &str = "~/.dora/models/primespeech/voices.json";
+const DEFAULT_VOICES_CONFIG: &str = "~/.OminiX/models/voices.json";
 
 #[derive(Debug, Deserialize)]
 struct VoicesConfig {
@@ -52,7 +52,7 @@ fn default_voice() -> String {
 }
 
 fn default_base_path() -> String {
-    "~/.dora/models/primespeech".to_string()
+    "~/.OminiX/models".to_string()
 }
 
 fn expand_tilde(path: &str) -> String {

@@ -491,6 +491,8 @@ async fn main() -> eyre::Result<()> {
     let config = Config::from_env();
     tracing::info!("Starting OminiX-API server on port {}", config.port);
 
+    // Scan hub caches and register discovered models
+    model_config::scan_hub_caches();
     // Print model configuration status report
     model_config::print_startup_report();
 
@@ -542,6 +544,7 @@ async fn main() -> eyre::Result<()> {
         .push(Router::with_path("health").get(health))
         .push(Router::with_path("v1/models").get(list_models))
         .push(Router::with_path("v1/models/status").get(model_status))
+        .push(Router::with_path("v1/models/report").get(models_report))
         .push(Router::with_path("v1/models/load").post(load_model))
         .push(Router::with_path("v1/models/unload").post(unload_model))
         // Chat completions
@@ -568,6 +571,7 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("  GET  /health");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  GET  /v1/models/status       - Get current model status");
+    tracing::info!("  GET  /v1/models/report       - Model availability report");
     tracing::info!("  POST /v1/models/load         - Load model dynamically");
     tracing::info!("  POST /v1/models/unload       - Unload model to free memory");
     tracing::info!("  POST /v1/chat/completions");
@@ -647,6 +651,13 @@ async fn list_models(depot: &mut Depot, res: &mut Response) -> Result<(), Status
         "data": data
     })));
     Ok(())
+}
+
+/// GET /v1/models/report - Model availability report (scanned from config + hub caches)
+#[handler]
+async fn models_report(res: &mut Response) {
+    let report = model_config::get_model_report();
+    res.render(Json(report));
 }
 
 /// GET /v1/models/status - Get current model status
@@ -1007,7 +1018,7 @@ async fn images_generations(
 #[handler]
 async fn list_voices(res: &mut Response) {
     // Read voices.json directly
-    let voices_path = utils::expand_tilde("~/.dora/models/primespeech/voices.json");
+    let voices_path = utils::expand_tilde("~/.OminiX/models/voices.json");
     let voices = match std::fs::read_to_string(&voices_path) {
         Ok(content) => {
             match serde_json::from_str::<serde_json::Value>(&content) {
@@ -1077,7 +1088,7 @@ async fn start_voice_training(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
             dirs::home_dir()
-                .map(|h| h.join(".dora/training"))
+                .map(|h| h.join(".OminiX/training"))
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp/ominix-training"))
         });
     let work_dir = base_dir.join(&task_id);

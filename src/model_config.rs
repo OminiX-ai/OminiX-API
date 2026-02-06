@@ -1,16 +1,17 @@
-//! Model configuration reader for ~/.moly/local_models_config.json
+//! Model configuration for ~/.OminiX/local_models_config.json
 //!
-//! This module reads the model configuration from OminiX-Studio to check
-//! which models are available locally without downloading.
+//! Reads model configuration from OminiX-Studio, scans hub caches
+//! (HuggingFace, ModelScope) on startup, and provides a report API.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Path to the local models config file
-const CONFIG_PATH: &str = "~/.moly/local_models_config.json";
+const CONFIG_PATH: &str = "~/.OminiX/local_models_config.json";
 
 /// Model category
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub enum ModelCategory {
     Image,
     Llm,
@@ -19,7 +20,7 @@ pub enum ModelCategory {
 }
 
 /// Model source information
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelSource {
     #[allow(dead_code)]
     pub primary_url: Option<String>,
@@ -29,7 +30,7 @@ pub struct ModelSource {
 }
 
 /// Model storage information
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelStorage {
     pub local_path: String,
     #[allow(dead_code)]
@@ -39,7 +40,7 @@ pub struct ModelStorage {
 }
 
 /// Model status information
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelStatusInfo {
     pub state: String,
     #[allow(dead_code)]
@@ -49,7 +50,7 @@ pub struct ModelStatusInfo {
 }
 
 /// Individual model configuration
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LocalModel {
     pub id: String,
     pub name: String,
@@ -88,17 +89,24 @@ impl LocalModel {
 }
 
 /// Local models configuration (V2 format)
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LocalModelsConfig {
-    #[allow(dead_code)]
     pub version: String,
-    #[allow(dead_code)]
     pub last_updated: Option<String>,
     pub models: Vec<LocalModel>,
 }
 
 impl LocalModelsConfig {
-    /// Load the configuration from ~/.moly/local_models_config.json
+    /// Create an empty config (for when no file exists yet)
+    pub fn default_empty() -> Self {
+        Self {
+            version: "2".to_string(),
+            last_updated: None,
+            models: Vec::new(),
+        }
+    }
+
+    /// Load the configuration from ~/.OminiX/local_models_config.json
     pub fn load() -> Option<Self> {
         let config_path = expand_path(CONFIG_PATH)?;
 
@@ -115,6 +123,42 @@ impl LocalModelsConfig {
                 None
             }
         }
+    }
+
+    /// Save the configuration to ~/.OminiX/local_models_config.json
+    pub fn save(&self) -> Result<(), String> {
+        let config_path = match expand_path(CONFIG_PATH) {
+            Some(p) => p,
+            None => return Err("Could not determine config path".to_string()),
+        };
+
+        if let Some(parent) = config_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Err(format!("Failed to create config directory: {}", e));
+            }
+        }
+
+        let content = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+
+        std::fs::write(&config_path, content)
+            .map_err(|e| format!("Failed to write config: {}", e))
+    }
+
+    /// Merge a scanned model into the config.
+    /// Only adds if no existing entry has the same repo_id or id.
+    /// Returns true if the model was added.
+    pub fn merge_scanned_model(&mut self, model: LocalModel) -> bool {
+        if let Some(ref repo_id) = model.source.repo_id {
+            if self.models.iter().any(|m| m.source.repo_id.as_deref() == Some(repo_id)) {
+                return false;
+            }
+        }
+        if self.models.iter().any(|m| m.id == model.id) {
+            return false;
+        }
+        self.models.push(model);
+        true
     }
 
     /// Find a model by its ID
@@ -237,11 +281,11 @@ impl LocalModelsConfig {
             tracing::info!("--- {} Models ---", category_name);
             for model in models {
                 let status = if model.is_ready() && model.files_exist() {
-                    "✓ Ready"
+                    "Ready"
                 } else if model.is_ready() {
-                    "⚠ Config says ready but files missing"
+                    "Config says ready but files missing"
                 } else {
-                    "✗ Not downloaded"
+                    "Not downloaded"
                 };
                 tracing::info!("  {} ({}): {}", model.name, model.id, status);
             }
@@ -280,6 +324,412 @@ pub enum ModelAvailability {
     NotInConfig,
 }
 
+// ============================================================================
+// Report API types
+// ============================================================================
+
+/// Model report returned by GET /v1/models/report
+#[derive(Debug, Serialize)]
+pub struct ModelReport {
+    pub total: usize,
+    pub ready: usize,
+    pub by_category: HashMap<String, CategoryCount>,
+    pub models: Vec<ModelSummary>,
+}
+
+/// Per-category count
+#[derive(Debug, Serialize)]
+pub struct CategoryCount {
+    pub total: usize,
+    pub ready: usize,
+}
+
+/// Summary of a single model for the report
+#[derive(Debug, Serialize)]
+pub struct ModelSummary {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub status: String,
+    pub local_path: String,
+    pub source: String,
+}
+
+// ============================================================================
+// Hub cache scanning
+// ============================================================================
+
+/// Scan HuggingFace and ModelScope hub caches for models,
+/// detect their category, and merge into the config.
+/// Returns the number of newly registered models.
+pub fn scan_hub_caches() -> usize {
+    let mut config = LocalModelsConfig::load()
+        .unwrap_or_else(LocalModelsConfig::default_empty);
+
+    let mut added = 0;
+
+    for root in get_hf_cache_roots() {
+        if root.exists() {
+            added += scan_hf_cache(&root, &mut config);
+        }
+    }
+
+    for root in get_ms_cache_roots() {
+        if root.exists() {
+            added += scan_ms_cache(&root, &mut config);
+        }
+    }
+
+    if added > 0 {
+        config.last_updated = Some(chrono::Utc::now().to_rfc3339());
+        if let Err(e) = config.save() {
+            tracing::warn!("Failed to save updated config after scan: {}", e);
+        } else {
+            tracing::info!("Hub cache scan: registered {} new model(s)", added);
+        }
+    } else {
+        tracing::debug!("Hub cache scan: no new models found");
+    }
+
+    added
+}
+
+/// Register a model in the config after discovery or download.
+/// Returns Ok(true) if newly added, Ok(false) if already existed.
+pub fn register_model(repo_id: &str, category: ModelCategory, local_path: &PathBuf) -> Result<bool, String> {
+    let mut config = LocalModelsConfig::load()
+        .unwrap_or_else(LocalModelsConfig::default_empty);
+
+    let display_name = repo_id.split('/').last().unwrap_or(repo_id).to_string();
+
+    let model = LocalModel {
+        id: repo_id.to_string(),
+        name: display_name,
+        description: Some("Auto-registered".to_string()),
+        category,
+        source: ModelSource {
+            primary_url: None,
+            source_type: Some("hub_cache".to_string()),
+            repo_id: Some(repo_id.to_string()),
+        },
+        storage: ModelStorage {
+            local_path: local_path.to_string_lossy().to_string(),
+            total_size_bytes: None,
+            total_size_display: None,
+        },
+        status: ModelStatusInfo {
+            state: "ready".to_string(),
+            downloaded_bytes: None,
+            downloaded_files: None,
+        },
+    };
+
+    let was_added = config.merge_scanned_model(model);
+    if was_added {
+        config.last_updated = Some(chrono::Utc::now().to_rfc3339());
+        config.save()?;
+        tracing::info!("Registered model in config: {}", repo_id);
+    }
+
+    Ok(was_added)
+}
+
+/// Build a model report for the API
+pub fn get_model_report() -> ModelReport {
+    let config = LocalModelsConfig::load()
+        .unwrap_or_else(LocalModelsConfig::default_empty);
+
+    let mut by_category: HashMap<String, CategoryCount> = HashMap::new();
+    let mut models = Vec::new();
+    let mut total_ready = 0;
+
+    for model in &config.models {
+        let cat_name = category_name(&model.category);
+        let is_ready = model.is_ready() && model.files_exist();
+
+        let entry = by_category.entry(cat_name.to_string()).or_insert(CategoryCount {
+            total: 0,
+            ready: 0,
+        });
+        entry.total += 1;
+        if is_ready {
+            entry.ready += 1;
+            total_ready += 1;
+        }
+
+        models.push(ModelSummary {
+            id: model.id.clone(),
+            name: model.name.clone(),
+            category: cat_name.to_string(),
+            status: if is_ready { "ready".to_string() } else { model.status.state.clone() },
+            local_path: model.storage.local_path.clone(),
+            source: model.source.source_type.clone().unwrap_or_default(),
+        });
+    }
+
+    ModelReport {
+        total: config.models.len(),
+        ready: total_ready,
+        by_category,
+        models,
+    }
+}
+
+// ============================================================================
+// Internal scanning helpers
+// ============================================================================
+
+fn get_hf_cache_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(val) = std::env::var("HUGGINGFACE_HUB_CACHE") {
+        roots.push(PathBuf::from(val));
+    }
+    if let Ok(val) = std::env::var("HF_HOME") {
+        roots.push(PathBuf::from(val).join("hub"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".cache/huggingface/hub"));
+    }
+    roots
+}
+
+fn get_ms_cache_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(val) = std::env::var("MODELSCOPE_CACHE") {
+        roots.push(PathBuf::from(val).join("hub"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".cache/modelscope/hub"));
+    }
+    roots
+}
+
+/// Scan a HuggingFace hub cache root for models
+fn scan_hf_cache(cache_root: &PathBuf, config: &mut LocalModelsConfig) -> usize {
+    let entries = match std::fs::read_dir(cache_root) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    let mut added = 0;
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+
+        // Only process model directories (skip datasets--, spaces--, etc.)
+        if !dir_name.starts_with("models--") {
+            continue;
+        }
+
+        // Reconstruct repo_id: "models--org--name" -> "org/name"
+        let repo_id = match dir_name.strip_prefix("models--") {
+            Some(rest) => rest.replacen("--", "/", 1),
+            None => continue,
+        };
+
+        // Resolve to snapshot directory
+        let model_dir = entry.path();
+        let snapshot_dir = match crate::utils::resolve_hf_snapshot(&model_dir) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let category = match detect_model_category(&snapshot_dir) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let display_name = repo_id.split('/').last().unwrap_or(&repo_id).to_string();
+
+        let model = LocalModel {
+            id: repo_id.clone(),
+            name: display_name,
+            description: Some("Scanned from HuggingFace cache".to_string()),
+            category: category.clone(),
+            source: ModelSource {
+                primary_url: Some(format!("https://huggingface.co/{}", repo_id)),
+                source_type: Some("huggingface".to_string()),
+                repo_id: Some(repo_id.clone()),
+            },
+            storage: ModelStorage {
+                local_path: model_dir.to_string_lossy().to_string(),
+                total_size_bytes: dir_size_bytes(&snapshot_dir),
+                total_size_display: None,
+            },
+            status: ModelStatusInfo {
+                state: "ready".to_string(),
+                downloaded_bytes: None,
+                downloaded_files: None,
+            },
+        };
+
+        if config.merge_scanned_model(model) {
+            added += 1;
+            tracing::info!("  Registered from HF cache: {} ({:?})", repo_id, category);
+        }
+    }
+
+    added
+}
+
+/// Scan a ModelScope hub cache root for models
+fn scan_ms_cache(cache_root: &PathBuf, config: &mut LocalModelsConfig) -> usize {
+    let mut added = 0;
+
+    // Scan top-level org directories (e.g., damo/, iic/)
+    let entries = match std::fs::read_dir(cache_root) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    for org_entry in entries.filter_map(|e| e.ok()) {
+        if !org_entry.path().is_dir() {
+            continue;
+        }
+        let org_name = org_entry.file_name().to_string_lossy().to_string();
+
+        let models = match std::fs::read_dir(org_entry.path()) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for model_entry in models.filter_map(|e| e.ok()) {
+            if !model_entry.path().is_dir() {
+                continue;
+            }
+            let model_name = model_entry.file_name().to_string_lossy().to_string();
+            let repo_id = format!("{}/{}", org_name, model_name);
+            let model_dir = model_entry.path();
+
+            let category = match detect_model_category(&model_dir) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            let display_name = model_name.clone();
+
+            let model = LocalModel {
+                id: repo_id.clone(),
+                name: display_name,
+                description: Some("Scanned from ModelScope cache".to_string()),
+                category: category.clone(),
+                source: ModelSource {
+                    primary_url: Some(format!("https://modelscope.cn/models/{}", repo_id)),
+                    source_type: Some("modelscope".to_string()),
+                    repo_id: Some(repo_id.clone()),
+                },
+                storage: ModelStorage {
+                    local_path: model_dir.to_string_lossy().to_string(),
+                    total_size_bytes: dir_size_bytes(&model_dir),
+                    total_size_display: None,
+                },
+                status: ModelStatusInfo {
+                    state: "ready".to_string(),
+                    downloaded_bytes: None,
+                    downloaded_files: None,
+                },
+            };
+
+            if config.merge_scanned_model(model) {
+                added += 1;
+                tracing::info!("  Registered from ModelScope cache: {} ({:?})", repo_id, category);
+            }
+        }
+    }
+
+    added
+}
+
+/// Detect the category of a model by examining its files.
+/// Detection order matters: Image -> ASR -> LLM (most specific first).
+fn detect_model_category(model_dir: &PathBuf) -> Option<ModelCategory> {
+    // Image: transformer/ + vae/ directories with weight files
+    if model_dir.join("transformer").is_dir() && model_dir.join("vae").is_dir() {
+        let has_weights = has_safetensors_in(&model_dir.join("transformer"));
+        if has_weights {
+            return Some(ModelCategory::Image);
+        }
+    }
+
+    // ASR: paraformer.safetensors + tokens.txt + am.mvn
+    if model_dir.join("paraformer.safetensors").exists()
+        && model_dir.join("tokens.txt").exists()
+        && model_dir.join("am.mvn").exists()
+    {
+        return Some(ModelCategory::Asr);
+    }
+
+    // LLM: config.json with model_type + tokenizer.json + weight files
+    let config_path = model_dir.join("config.json");
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    if config_path.exists() && tokenizer_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                if config.get("model_type").and_then(|v| v.as_str()).is_some() {
+                    if has_safetensors_in(model_dir) {
+                        return Some(ModelCategory::Llm);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if a directory contains any .safetensors files
+fn has_safetensors_in(dir: &PathBuf) -> bool {
+    std::fs::read_dir(dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| {
+                    e.path()
+                        .extension()
+                        .map_or(false, |ext| ext == "safetensors")
+                })
+        })
+        .unwrap_or(false)
+}
+
+/// Calculate total size of files in a directory (1 level of subdirs)
+fn dir_size_bytes(dir: &PathBuf) -> Option<u64> {
+    let mut total: u64 = 0;
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                total += meta.len();
+            } else if meta.is_dir() {
+                if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
+                    for sub in sub_entries.filter_map(|e| e.ok()) {
+                        if let Ok(sub_meta) = sub.metadata() {
+                            if sub_meta.is_file() {
+                                total += sub_meta.len();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if total > 0 { Some(total) } else { None }
+}
+
+fn category_name(cat: &ModelCategory) -> &'static str {
+    match cat {
+        ModelCategory::Llm => "llm",
+        ModelCategory::Image => "image",
+        ModelCategory::Asr => "asr",
+        ModelCategory::Tts => "tts",
+    }
+}
+
+// ============================================================================
+// Public API (unchanged from before)
+// ============================================================================
+
 /// Expand ~ to home directory and return as PathBuf
 fn expand_path(path: &str) -> Option<PathBuf> {
     Some(PathBuf::from(crate::utils::expand_tilde(path)))
@@ -304,7 +754,7 @@ pub fn print_startup_report() {
         Some(config) => config.print_status_report(),
         None => {
             tracing::info!("No model configuration found at {}", CONFIG_PATH);
-            tracing::info!("Models will be downloaded from HuggingFace Hub as needed.");
+            tracing::info!("Models will be resolved from hub caches as needed.");
         }
     }
 }

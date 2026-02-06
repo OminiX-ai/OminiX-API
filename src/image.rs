@@ -68,7 +68,7 @@ pub struct ImageEngine {
 impl ImageEngine {
     /// Create a new image generation engine
     ///
-    /// First checks ~/.moly/local_models_config.json for model availability.
+    /// First checks ~/.OminiX/local_models_config.json for model availability.
     /// If the model is ready locally, uses that path. Otherwise, attempts
     /// to download from HuggingFace Hub.
     pub fn new(model_id: &str) -> Result<Self> {
@@ -110,12 +110,19 @@ impl ImageEngine {
                 ));
             }
             ModelAvailability::NotInConfig => {
-                return Err(eyre::eyre!(
-                    "Image model '{}' not found in local configuration.\n\
-                     Please add this model to OminiX-Studio and download it there first.\n\
-                     Available models can be viewed at: ~/.moly/local_models_config.json",
-                    model_id
-                ));
+                // Try standard model hub caches (HuggingFace, ModelScope)
+                if let Some(hub_path) = crate::utils::resolve_from_hub_cache(model_id) {
+                    tracing::info!("Found image model in hub cache: {:?}", hub_path);
+                    let _ = model_config::register_model(model_id, ModelCategory::Image, &hub_path);
+                    hub_path
+                } else {
+                    return Err(eyre::eyre!(
+                        "Image model '{}' not found in local configuration or hub caches.\n\
+                         Please download it via OminiX-Studio or huggingface-cli.\n\
+                         Searched: ~/.OminiX/local_models_config.json, ~/.cache/huggingface/hub/, ~/.cache/modelscope/hub/",
+                        model_id
+                    ));
+                }
             }
         };
 

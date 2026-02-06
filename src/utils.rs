@@ -36,6 +36,59 @@ pub fn resolve_hf_snapshot(model_dir: &PathBuf) -> Result<PathBuf> {
     }
 }
 
+/// Resolve a model ID (e.g. "mlx-community/Qwen3-4B-bf16") by searching
+/// standard model hub cache directories.
+///
+/// Checks the following locations in order:
+/// 1. HuggingFace Hub: `~/.cache/huggingface/hub/models--{org}--{model}/`
+/// 2. ModelScope: `~/.cache/modelscope/hub/{org}/{model}/`
+/// 3. Custom env overrides: `HF_HOME`, `HUGGINGFACE_HUB_CACHE`, `MODELSCOPE_CACHE`
+///
+/// Returns the resolved path with snapshots navigated, or None if not found.
+pub fn resolve_from_hub_cache(model_id: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+
+    // HuggingFace cache: models--{org}--{model} (slashes become --)
+    let hf_dir_name = format!("models--{}", model_id.replace('/', "--"));
+    let hf_cache_roots = [
+        std::env::var("HUGGINGFACE_HUB_CACHE")
+            .map(PathBuf::from)
+            .ok(),
+        std::env::var("HF_HOME")
+            .map(|h| PathBuf::from(h).join("hub"))
+            .ok(),
+        Some(home.join(".cache/huggingface/hub")),
+    ];
+
+    for root in hf_cache_roots.iter().flatten() {
+        let model_dir = root.join(&hf_dir_name);
+        if model_dir.exists() {
+            if let Ok(resolved) = resolve_hf_snapshot(&model_dir) {
+                tracing::info!("Found model in HuggingFace cache: {:?}", resolved);
+                return Some(resolved);
+            }
+        }
+    }
+
+    // ModelScope cache: {org}/{model}
+    let ms_cache_roots = [
+        std::env::var("MODELSCOPE_CACHE")
+            .map(|c| PathBuf::from(c).join("hub"))
+            .ok(),
+        Some(home.join(".cache/modelscope/hub")),
+    ];
+
+    for root in ms_cache_roots.iter().flatten() {
+        let model_dir = root.join(model_id);
+        if model_dir.exists() {
+            tracing::info!("Found model in ModelScope cache: {:?}", model_dir);
+            return Some(model_dir);
+        }
+    }
+
+    None
+}
+
 /// Sanitize a voice name to prevent path traversal attacks.
 ///
 /// Only allows alphanumeric characters, hyphens, and underscores.

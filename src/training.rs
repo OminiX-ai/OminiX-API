@@ -47,13 +47,13 @@ pub fn cancel_training_task(cancel_state: &CancelFlag, task_id: &str) -> Result<
 // ============================================================================
 
 /// Base path for GPT-SoVITS models
-const MODELS_BASE: &str = "~/.dora/models/primespeech/gpt-sovits-mlx";
+const MODELS_BASE: &str = "~/.OminiX/models/gpt-sovits-mlx";
 /// VITS pretrained weights (v2)
 const VITS_PRETRAINED: &str = "vits_pretrained_v2.safetensors";
 /// HuBERT model for SSL feature extraction
 const HUBERT_WEIGHTS: &str = "hubert.safetensors";
 /// Default voices config path
-const VOICES_CONFIG_PATH: &str = "~/.dora/models/primespeech/voices.json";
+const VOICES_CONFIG_PATH: &str = "~/.OminiX/models/voices.json";
 /// Training data sample rate
 const TRAINING_SAMPLE_RATE: u32 = 32000;
 /// HuBERT input sample rate
@@ -596,7 +596,7 @@ fn register_voice(
     transcript: &str,
 ) -> Result<()> {
     // Copy trained weights and reference audio to persistent directory
-    let trained_dir = PathBuf::from(expand_tilde("~/.dora/models/primespeech/trained"));
+    let trained_dir = PathBuf::from(expand_tilde("~/.OminiX/models/trained"));
     let voice_dir = trained_dir.join(voice_name);
     std::fs::create_dir_all(&voice_dir)?;
 
@@ -613,7 +613,7 @@ fn register_voice(
     } else {
         serde_json::json!({
             "default_voice": "doubao",
-            "models_base_path": "~/.dora/models/primespeech",
+            "models_base_path": "~/.OminiX/models",
             "voices": {}
         })
     };
@@ -647,7 +647,7 @@ fn training_base_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             dirs::home_dir()
-                .map(|h| h.join(".dora/training"))
+                .map(|h| h.join(".OminiX/training"))
                 .unwrap_or_else(|| PathBuf::from("/tmp/ominix-training"))
         })
 }

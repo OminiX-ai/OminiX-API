@@ -342,10 +342,18 @@ fn resolve_model_dir(model_path: &str) -> Result<PathBuf> {
             ))
         }
         ModelAvailability::NotInConfig => {
+            // Try standard model hub caches (HuggingFace, ModelScope)
+            if let Some(hub_path) = crate::utils::resolve_from_hub_cache(model_path) {
+                if hub_path.join("config.json").exists() {
+                    tracing::info!("Found model in hub cache: {:?}", hub_path);
+                    let _ = model_config::register_model(model_path, ModelCategory::Llm, &hub_path);
+                    return Ok(hub_path);
+                }
+            }
             Err(eyre::eyre!(
-                "Model '{}' not found in local configuration.\n\
-                 Please add this model to OminiX-Studio and download it there first.\n\
-                 Available LLM models can be viewed at: ~/.moly/local_models_config.json",
+                "Model '{}' not found in local configuration or hub caches.\n\
+                 Please download it via OminiX-Studio or huggingface-cli.\n\
+                 Searched: ~/.OminiX/local_models_config.json, ~/.cache/huggingface/hub/, ~/.cache/modelscope/hub/",
                 model_path
             ))
         }

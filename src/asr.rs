@@ -22,7 +22,7 @@ impl AsrEngine {
     /// - am.mvn (CMVN normalization)
     /// - tokens.txt (vocabulary)
     ///
-    /// First checks ~/.moly/local_models_config.json for model availability.
+    /// First checks ~/.OminiX/local_models_config.json for model availability.
     pub fn new(model_dir: &str) -> Result<Self> {
         // Check model configuration for local availability
         let actual_model_dir: PathBuf = match model_config::check_model("funasr-paraformer", ModelCategory::Asr) {
@@ -37,9 +37,18 @@ impl AsrEngine {
                     model_name, model_id
                 ));
             }
-            ModelAvailability::WrongCategory { .. } | ModelAvailability::NotInConfig => {
-                // Use the provided path directly
+            ModelAvailability::WrongCategory { .. } => {
                 PathBuf::from(model_dir)
+            }
+            ModelAvailability::NotInConfig => {
+                // Try standard model hub caches before falling back to raw path
+                if let Some(hub_path) = crate::utils::resolve_from_hub_cache(model_dir) {
+                    tracing::info!("Found ASR model in hub cache: {:?}", hub_path);
+                    let _ = model_config::register_model(model_dir, ModelCategory::Asr, &hub_path);
+                    hub_path
+                } else {
+                    PathBuf::from(model_dir)
+                }
             }
         };
 
