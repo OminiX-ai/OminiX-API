@@ -867,13 +867,10 @@ pub fn remove_model(model_id: &str) -> Result<String, String> {
     }
 
     // 2. Check config with partial matching (e.g. "funasr-nano" matches "local/funasr-nano")
+    //    Also compare stripped names (part after last '/') so "funasr-paraformer" matches "local/paraformer"
     if let Some(config) = crate::model_config::LocalModelsConfig::load() {
         for model in &config.models {
-            let id_lower = model.id.to_lowercase();
-            if id_lower == model_id_lower
-                || id_lower.contains(&model_id_lower)
-                || model_id_lower.contains(&id_lower)
-            {
+            if model_id_matches(&model.id, &model_id_lower) {
                 let path = crate::utils::expand_tilde(&model.storage.local_path);
                 if !paths_to_remove.contains(&path) {
                     paths_to_remove.push(path);
@@ -907,11 +904,7 @@ pub fn remove_model(model_id: &str) -> Result<String, String> {
     // 4. Update config: mark matching entries as not_downloaded
     if let Some(mut config) = crate::model_config::LocalModelsConfig::load() {
         for model in config.models.iter_mut() {
-            let id_lower = model.id.to_lowercase();
-            if id_lower == model_id_lower
-                || id_lower.contains(&model_id_lower)
-                || model_id_lower.contains(&id_lower)
-            {
+            if model_id_matches(&model.id, &model_id_lower) {
                 model.status.state = "not_downloaded".to_string();
                 model.status.downloaded_bytes = None;
                 model.status.downloaded_files = None;
@@ -926,4 +919,24 @@ pub fn remove_model(model_id: &str) -> Result<String, String> {
         model_id,
         removed.join(", ")
     ))
+}
+
+/// Check if a config model ID matches a query model_id (case-insensitive).
+/// Compares full IDs and also stripped names (part after last '/'),
+/// e.g. "funasr-paraformer" matches "local/paraformer" because
+/// "funasr-paraformer" contains "paraformer".
+fn model_id_matches(config_id: &str, query_lower: &str) -> bool {
+    let id_lower = config_id.to_lowercase();
+    // Exact or substring match on full IDs
+    if id_lower == query_lower
+        || id_lower.contains(query_lower)
+        || query_lower.contains(id_lower.as_str())
+    {
+        return true;
+    }
+    // Also compare bare name (after last '/')
+    let stripped = id_lower.rsplit('/').next().unwrap_or(&id_lower);
+    stripped == query_lower
+        || stripped.contains(query_lower)
+        || query_lower.contains(stripped)
 }
