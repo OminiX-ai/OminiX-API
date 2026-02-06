@@ -274,7 +274,7 @@ fn inference_thread(
                 let _ = response_tx.send(result);
             }
             InferenceRequest::Transcribe { request, response_tx } => {
-                let result = if let Some(ref engine) = asr {
+                let result = if let Some(ref mut engine) = asr {
                     engine.transcribe(&request)
                 } else {
                     Err(eyre::eyre!("ASR model not loaded"))
@@ -547,6 +547,7 @@ async fn main() -> eyre::Result<()> {
         .push(Router::with_path("v1/models/report").get(models_report))
         .push(Router::with_path("v1/models/load").post(load_model))
         .push(Router::with_path("v1/models/unload").post(unload_model))
+        .push(Router::with_path("v1/models/quantize").post(quantize_model))
         // Chat completions
         .push(Router::with_path("v1/chat/completions").post(chat_completions))
         // Audio endpoints
@@ -574,6 +575,7 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("  GET  /v1/models/report       - Model availability report");
     tracing::info!("  POST /v1/models/load         - Load model dynamically");
     tracing::info!("  POST /v1/models/unload       - Unload model to free memory");
+    tracing::info!("  POST /v1/models/quantize     - Quantize FLUX transformer to 8-bit");
     tracing::info!("  POST /v1/chat/completions");
     tracing::info!("  POST /v1/audio/transcriptions");
     tracing::info!("  POST /v1/audio/speech");
@@ -658,6 +660,82 @@ async fn list_models(depot: &mut Depot, res: &mut Response) -> Result<(), Status
 async fn models_report(res: &mut Response) {
     let report = model_config::get_model_report();
     res.render(Json(report));
+}
+
+/// POST /v1/models/quantize - Quantize a FLUX model's transformer weights to 8-bit
+///
+/// Request body: { "model_id": "flux-klein-4b" } or { "model_id": "black-forest-labs/FLUX.2-klein-4B" }
+///
+/// This is a one-time operation. Loads the bf16 transformer, quantizes to INT8,
+/// and saves alongside the original weights as `transformer/quantized_8bit.safetensors`.
+/// Requires enough RAM to hold the full bf16 model (~30GB peak).
+#[handler]
+async fn quantize_model(req: &mut Request, res: &mut Response) {
+    #[derive(serde::Deserialize)]
+    struct QuantizeRequest {
+        model_id: String,
+    }
+
+    let request: QuantizeRequest = match req.parse_json::<QuantizeRequest>().await {
+        Ok(r) => r,
+        Err(e) => {
+            render_error(res, salvo::http::StatusCode::BAD_REQUEST, &format!("Invalid request: {}", e), "invalid_request_error");
+            return;
+        }
+    };
+
+    let model_id = request.model_id.clone();
+    tracing::info!("Quantizing FLUX model: {}", model_id);
+
+    // Run quantization in a blocking thread (it's CPU/memory intensive)
+    let result = tokio::task::spawn_blocking(move || -> eyre::Result<String> {
+        use flux_klein_mlx::quantize_and_save_flux_klein;
+
+        // Find the model directory
+        let config_ids = vec!["flux-klein-4b", model_id.as_str()];
+        let model_dir = 'lookup: {
+            for config_id in &config_ids {
+                match model_config::check_model(config_id, model_config::ModelCategory::Image) {
+                    model_config::ModelAvailability::Ready { local_path, .. } => {
+                        let path = local_path.ok_or_else(|| eyre::eyre!("Model path not available"))?;
+                        break 'lookup crate::utils::resolve_hf_snapshot(&path)?;
+                    }
+                    model_config::ModelAvailability::NotInConfig => continue,
+                    _ => continue,
+                }
+            }
+            // Try hub cache
+            if let Some(hub_path) = crate::utils::resolve_from_hub_cache(&model_id) {
+                hub_path
+            } else {
+                return Err(eyre::eyre!("Model '{}' not found", model_id));
+            }
+        };
+
+        let transformer_path = model_dir.join("transformer/diffusion_pytorch_model.safetensors");
+        let transformer_path = if transformer_path.exists() { transformer_path } else { model_dir.join("flux.safetensors") };
+        if !transformer_path.exists() {
+            return Err(eyre::eyre!("Transformer weights not found at {:?}", transformer_path));
+        }
+
+        let output_path = model_dir.join("transformer/quantized_8bit.safetensors");
+        quantize_and_save_flux_klein(&transformer_path, &output_path, 64, 8)
+            .map_err(|e| eyre::eyre!("Quantization failed: {}", e))?;
+
+        Ok(format!("Quantized weights saved to {:?}", output_path))
+    }).await;
+
+    match result {
+        Ok(Ok(msg)) => {
+            res.render(Json(serde_json::json!({ "status": "success", "message": msg })));
+        }
+        Ok(Err(e)) => {
+            render_error(res, salvo::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "quantization_error");
+        }
+        Err(e) => {
+            render_error(res, salvo::http::StatusCode::INTERNAL_SERVER_ERROR, &format!("Task failed: {}", e), "internal_error");
+        }
+    }
 }
 
 /// GET /v1/models/status - Get current model status

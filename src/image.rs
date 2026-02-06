@@ -22,8 +22,10 @@ use crate::model_config::{self, ModelAvailability, ModelCategory};
 
 use flux_klein_mlx::{
     AutoEncoderConfig, Decoder, Encoder, FluxKlein, FluxKleinParams,
+    QuantizedFluxKlein, load_quantized_flux_klein,
     Qwen3Config, Qwen3TextEncoder,
-    load_safetensors, sanitize_qwen3_weights, sanitize_vae_weights, sanitize_vae_encoder_weights,
+    load_safetensors,
+    sanitize_qwen3_weights, sanitize_vae_weights, sanitize_vae_encoder_weights,
     sanitize_klein_model_weights,
 };
 
@@ -45,6 +47,7 @@ pub enum ImageModelType {
 /// Transformer variant (FLUX or Z-Image)
 enum TransformerVariant {
     Flux(FluxKlein, FluxKleinParams),
+    FluxQuantized(QuantizedFluxKlein, FluxKleinParams),
     ZImage(ZImageTransformerQuantized, ZImageConfig),
 }
 
@@ -260,27 +263,40 @@ impl ImageEngine {
         // Load transformer based on model type
         let transformer = match model_type {
             ImageModelType::FluxKlein => {
-                tracing::info!("Loading FLUX.2-klein transformer...");
-                let params = FluxKleinParams::default();
-                let mut trans = FluxKlein::new(params.clone())?;
+                // Check for pre-quantized 8-bit weights
+                let quantized_path = model_dir.join("transformer/quantized_8bit.safetensors");
+                if quantized_path.exists() {
+                    tracing::info!("Loading FLUX.2-klein transformer (pre-quantized 8-bit)...");
+                    let params = FluxKleinParams::default();
+                    let raw_weights = load_safetensors(&quantized_path)?;
+                    // Pre-quantized weights are already in our internal naming
+                    let trans = load_quantized_flux_klein(raw_weights, 64, 8)
+                        .map_err(|e| eyre::eyre!("Failed to load quantized FLUX transformer: {}", e))?;
+                    tracing::info!("FLUX transformer loaded (8-bit quantized, ~4x memory savings)");
+                    TransformerVariant::FluxQuantized(trans, params)
+                } else {
+                    tracing::info!("Loading FLUX.2-klein transformer (bf16)...");
+                    let params = FluxKleinParams::default();
+                    let mut trans = FluxKlein::new(params.clone())?;
 
-                let raw_weights = load_safetensors(&transformer_path)?;
-                let weights = sanitize_klein_model_weights(raw_weights);
-                let weights: HashMap<String, Array> = weights
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let v32 = v.as_type::<f32>().unwrap_or(v);
-                        (k, v32)
-                    })
-                    .collect();
+                    let raw_weights = load_safetensors(&transformer_path)?;
+                    let weights = sanitize_klein_model_weights(raw_weights);
+                    let weights: HashMap<String, Array> = weights
+                        .into_iter()
+                        .map(|(k, v)| {
+                            let v32 = v.as_type::<f32>().unwrap_or(v);
+                            (k, v32)
+                        })
+                        .collect();
 
-                let weights_rc: HashMap<Rc<str>, Array> = weights
-                    .into_iter()
-                    .map(|(k, v)| (Rc::from(k.as_str()), v))
-                    .collect();
-                trans.update_flattened(weights_rc);
-                tracing::info!("FLUX transformer loaded");
-                TransformerVariant::Flux(trans, params)
+                    let weights_rc: HashMap<Rc<str>, Array> = weights
+                        .into_iter()
+                        .map(|(k, v)| (Rc::from(k.as_str()), v))
+                        .collect();
+                    trans.update_flattened(weights_rc);
+                    tracing::info!("FLUX transformer loaded (bf16)");
+                    TransformerVariant::Flux(trans, params)
+                }
             }
             ImageModelType::ZImageTurbo => {
                 tracing::info!("Loading Z-Image-Turbo transformer (4-bit quantized)...");
@@ -521,8 +537,10 @@ impl ImageEngine {
         // Tokenize before borrowing transformer (avoids overlapping borrow)
         let (input_ids, attention_mask) = self.tokenize_prompt(prompt)?;
 
-        let (flux_trans, params) = match &mut self.transformer {
-            TransformerVariant::Flux(t, p) => (t, p.clone()),
+        // Extract params (same for both quantized and non-quantized)
+        let params = match &self.transformer {
+            TransformerVariant::Flux(_, p) => p.clone(),
+            TransformerVariant::FluxQuantized(_, p) => p.clone(),
             _ => return Err(eyre::eyre!("Expected FLUX transformer")),
         };
 
@@ -583,7 +601,11 @@ impl ImageEngine {
             let t_next = timesteps[step + 1];
             let t_arr = Array::from_slice(&[t_curr * 1000.0], &[batch_size]);
 
-            let v_pred = flux_trans.forward_with_rope(&latent, &txt_embed, &t_arr, &rope_cos, &rope_sin)?;
+            let v_pred = match &mut self.transformer {
+                TransformerVariant::Flux(t, _) => t.forward_with_rope(&latent, &txt_embed, &t_arr, &rope_cos, &rope_sin)?,
+                TransformerVariant::FluxQuantized(t, _) => t.forward_with_rope(&latent, &txt_embed, &t_arr, &rope_cos, &rope_sin)?,
+                _ => return Err(eyre::eyre!("Expected FLUX transformer")),
+            };
 
             let dt = t_next - t_curr;
             let scaled_v = ops::multiply(&v_pred, &Array::from_slice(&[dt], &[1]))?;
