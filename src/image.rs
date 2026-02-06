@@ -83,46 +83,52 @@ impl ImageEngine {
 
         tracing::info!("Image model type: {:?}", model_type);
 
-        // Determine the config ID to check
-        let config_model_id = match model_type {
-            ImageModelType::FluxKlein => "flux-klein-4b",
-            ImageModelType::ZImageTurbo => "zimage-turbo",
+        // Try multiple config IDs: the short name used by Studio, then the original model_id
+        let config_model_ids = match model_type {
+            ImageModelType::FluxKlein => vec!["flux-klein-4b", model_id],
+            ImageModelType::ZImageTurbo => vec!["zimage-turbo", model_id],
         };
 
         // Check model configuration for local availability
-        let model_dir: PathBuf = match model_config::check_model(config_model_id, ModelCategory::Image) {
-            ModelAvailability::Ready { local_path, model_name } => {
-                tracing::info!("Found locally available model: {} at {:?}", model_name, local_path);
-                let path = local_path.ok_or_else(|| eyre::eyre!("Model path not available"))?;
-                crate::utils::resolve_hf_snapshot(&path)?
-            }
-            ModelAvailability::NotDownloaded { model_name, model_id } => {
-                return Err(eyre::eyre!(
-                    "Image model '{}' ({}) is not downloaded.\n\
-                     Please download it using OminiX-Studio before starting the API server.",
-                    model_name, model_id
-                ));
-            }
-            ModelAvailability::WrongCategory { expected, found } => {
-                return Err(eyre::eyre!(
-                    "Model '{}' is a {:?} model, not a {:?} model",
-                    model_id, found, expected
-                ));
-            }
-            ModelAvailability::NotInConfig => {
-                // Try standard model hub caches (HuggingFace, ModelScope)
-                if let Some(hub_path) = crate::utils::resolve_from_hub_cache(model_id) {
-                    tracing::info!("Found image model in hub cache: {:?}", hub_path);
-                    let _ = model_config::register_model(model_id, ModelCategory::Image, &hub_path);
-                    hub_path
-                } else {
-                    return Err(eyre::eyre!(
-                        "Image model '{}' not found in local configuration or hub caches.\n\
-                         Please download it via OminiX-Studio or huggingface-cli.\n\
-                         Searched: ~/.OminiX/local_models_config.json, ~/.cache/huggingface/hub/, ~/.cache/modelscope/hub/",
-                        model_id
-                    ));
+        let model_dir: PathBuf = 'lookup: {
+            for config_model_id in &config_model_ids {
+                match model_config::check_model(config_model_id, ModelCategory::Image) {
+                    ModelAvailability::Ready { local_path, model_name } => {
+                        tracing::info!("Found locally available model: {} at {:?}", model_name, local_path);
+                        let path = local_path.ok_or_else(|| eyre::eyre!("Model path not available"))?;
+                        break 'lookup crate::utils::resolve_hf_snapshot(&path)?;
+                    }
+                    ModelAvailability::NotDownloaded { model_name, model_id } => {
+                        return Err(eyre::eyre!(
+                            "Image model '{}' ({}) is not downloaded.\n\
+                             Please download it using OminiX-Studio before starting the API server.",
+                            model_name, model_id
+                        ));
+                    }
+                    ModelAvailability::WrongCategory { expected, found } => {
+                        return Err(eyre::eyre!(
+                            "Model '{}' is a {:?} model, not a {:?} model",
+                            config_model_id, found, expected
+                        ));
+                    }
+                    ModelAvailability::NotInConfig => {
+                        continue;
+                    }
                 }
+            }
+
+            // Not found in config — try hub caches with the original model_id
+            if let Some(hub_path) = crate::utils::resolve_from_hub_cache(model_id) {
+                tracing::info!("Found image model in hub cache: {:?}", hub_path);
+                let _ = model_config::register_model(model_id, ModelCategory::Image, &hub_path);
+                hub_path
+            } else {
+                return Err(eyre::eyre!(
+                    "Image model '{}' not found in local configuration or hub caches.\n\
+                     Please download it via OminiX-Studio or huggingface-cli.\n\
+                     Searched: ~/.OminiX/local_models_config.json, ~/.cache/huggingface/hub/, ~/.cache/modelscope/hub/",
+                    model_id
+                ));
             }
         };
 

@@ -297,18 +297,18 @@ fn inference_thread(
                     let current_normalized = current_image_model.as_deref().unwrap_or("");
 
                     if normalized != current_normalized || image_engine.is_none() {
-                        tracing::info!("Switching image model: {:?} -> {}", current_image_model, normalized);
+                        tracing::info!("Switching image model: {:?} -> {}", current_image_model, requested_model);
                         // Drop old engine to free memory
                         image_engine = None;
 
-                        match image::ImageEngine::new(normalized) {
+                        match image::ImageEngine::new(requested_model) {
                             Ok(engine) => {
-                                tracing::info!("Image model {} loaded successfully", normalized);
+                                tracing::info!("Image model {} loaded successfully", requested_model);
                                 current_image_model = Some(normalized.to_string());
                                 image_engine = Some(engine);
                             }
                             Err(e) => {
-                                tracing::error!("Failed to load image model {}: {}", normalized, e);
+                                tracing::error!("Failed to load image model {}: {}", requested_model, e);
                             }
                         }
                     }
@@ -398,15 +398,15 @@ fn inference_thread(
                 image_engine = None;
                 current_image_model = None;
 
-                let result = match image::ImageEngine::new(normalized) {
+                let result = match image::ImageEngine::new(&model_id) {
                     Ok(engine) => {
-                        tracing::info!("Image model {} loaded successfully", normalized);
+                        tracing::info!("Image model {} loaded successfully", model_id);
                         current_image_model = Some(normalized.to_string());
                         image_engine = Some(engine);
-                        Ok(normalized.to_string())
+                        Ok(model_id)
                     }
                     Err(e) => {
-                        tracing::error!("Failed to load image model {}: {}", normalized, e);
+                        tracing::error!("Failed to load image model {}: {}", model_id, e);
                         Err(e)
                     }
                 };
