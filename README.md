@@ -71,13 +71,20 @@ cargo run --release
 | `/health` | GET | Health check |
 | `/v1/models` | GET | List loaded models |
 | `/v1/models/status` | GET | Get current model status for each category |
+| `/v1/models/report` | GET | Model availability report (scanned from config + hub caches) |
 | `/v1/models/load` | POST | Load/switch model dynamically |
 | `/v1/models/unload` | POST | Unload model to free memory |
+| `/v1/models/quantize` | POST | Quantize FLUX transformer to 8-bit |
 | `/v1/chat/completions` | POST | Chat completions (LLM) |
 | `/v1/audio/transcriptions` | POST | Speech-to-text (ASR) |
 | `/v1/audio/speech` | POST | Text-to-speech (TTS) |
-| `/v1/images/generations` | POST | Image generation |
+| `/v1/images/generations` | POST | Image generation (txt2img / img2img) |
 | `/ws/v1/tts` | WebSocket | Streaming TTS with per-message voice switching |
+| `/v1/voices` | GET | List registered voices |
+| `/v1/voices/train` | POST | Start voice cloning training |
+| `/v1/voices/train/status` | GET | Get training task status |
+| `/v1/voices/train/progress` | GET | SSE stream of training progress |
+| `/v1/voices/train/cancel` | POST | Cancel active training task |
 
 ---
 
@@ -747,7 +754,7 @@ Models download automatically from HuggingFace. Recommended:
 | Model | HuggingFace ID | Memory |
 |-------|----------------|--------|
 | Qwen3-4B | `mlx-community/Qwen3-4B-bf16` | 8 GB |
-| Qwen3-8B | `mlx-community/Qwen3-8B-bf16` | 16 GB |
+| Qwen3-8B | `mlx-community/Qwen3-8B-8bit` | 8 GB |
 | Mistral-7B | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | 4 GB |
 
 ### ASR Model (Paraformer)
@@ -861,6 +868,60 @@ models/zimage/                        # Z-Image-Turbo
 ```
 
 ---
+
+## Project Structure
+
+```
+src/
+  main.rs              Entry point — tracing, channels, thread spawning, server start
+  config.rs            Config struct (from environment variables)
+  state.rs             AppState (shared across HTTP handlers)
+  error.rs             render_error() helper for OpenAI-compatible error responses
+  router.rs            Builds the Salvo Router with all endpoint routes
+
+  inference/
+    request.rs         InferenceRequest enum — the message protocol between handlers and inference thread
+    thread.rs          inference_thread() — owns all models, processes requests via channel
+
+  handlers/
+    helpers.rs         get_state(), send_and_wait() — dedup boilerplate across handlers
+    health.rs          GET /health, /v1/models, /v1/models/status, /v1/models/report
+    chat.rs            POST /v1/chat/completions
+    audio.rs           POST /v1/audio/transcriptions, /v1/audio/speech
+    image.rs           POST /v1/images/generations, /v1/models/quantize
+    models.rs          POST /v1/models/load, /v1/models/unload
+    training.rs        Voice training endpoints + GET /v1/voices
+    ws_tts.rs          WebSocket streaming TTS (MiniMax T2A protocol)
+
+  engines/
+    llm.rs             LLM inference — Qwen3, GLM-4.7-Flash backends
+    asr.rs             ASR inference — Paraformer, SenseVoice+Qwen backends
+    tts.rs             TTS synthesis — GPT-SoVITS with voice registry
+    image.rs           Image generation — FLUX.2-klein, Z-Image-Turbo
+
+  types/
+    chat.rs            ChatCompletionRequest/Response, ChatMessage, ChatUsage
+    audio.rs           TranscriptionRequest/Response, SpeechRequest
+    image.rs           ImageGenerationRequest/Response, ImageData
+    training.rs        VoiceTrainRequest, TrainingStage, TrainingProgressEvent
+    error.rs           ApiError, ApiErrorDetail
+    voice.rs           VoiceInfo, VoiceListResponse
+
+  model_config.rs      Model registry, hub cache scanning, availability checking
+  training.rs          Voice cloning pipeline (5 stages on dedicated thread)
+  utils.rs             Path utilities and security helpers
+```
+
+### Adding a New Model Type
+
+To add a new capability (e.g., video generation):
+
+1. **`engines/video.rs`** — Engine struct with `new()` and `generate()`
+2. **`types/video.rs`** — Request/response types (add `pub use` in `types/mod.rs`)
+3. **`inference/request.rs`** — Add `Video` + `LoadVideoModel` variants to the enum
+4. **`inference/thread.rs`** — Add model slot + match arms (3 lines each with `load_model_slot` helper)
+5. **`handlers/video.rs`** — Handler function (~15 lines using `send_and_wait`)
+6. **`router.rs`** — Add one `.push()` line
 
 ## Architecture
 

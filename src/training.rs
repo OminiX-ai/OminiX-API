@@ -93,7 +93,7 @@ pub enum TrainingRequest {
 pub fn training_thread(
     mut rx: mpsc::Receiver<TrainingRequest>,
     progress_tx: broadcast::Sender<TrainingProgressEvent>,
-    inference_tx: mpsc::Sender<crate::InferenceRequest>,
+    inference_tx: mpsc::Sender<crate::inference::InferenceRequest>,
     cancel_state: CancelFlag,
 ) {
     tracing::info!("Training thread started");
@@ -243,7 +243,7 @@ fn run_training_pipeline(
     _language: &str,
     denoise: bool,
     progress_tx: &broadcast::Sender<TrainingProgressEvent>,
-    inference_tx: &mpsc::Sender<crate::InferenceRequest>,
+    inference_tx: &mpsc::Sender<crate::inference::InferenceRequest>,
     cancel_flag: &AtomicBool,
 ) -> Result<()> {
     let base_dir = training_base_dir();
@@ -307,7 +307,7 @@ fn run_training_pipeline(
 
     // Tell inference thread to reload voices
     let (reload_tx, reload_rx) = oneshot::channel();
-    if inference_tx.blocking_send(crate::InferenceRequest::ReloadVoices { response_tx: reload_tx }).is_ok() {
+    if inference_tx.blocking_send(crate::inference::InferenceRequest::ReloadVoices { response_tx: reload_tx }).is_ok() {
         let _ = reload_rx.blocking_recv();
     }
     tracing::info!("Voice '{}' registered and inference reloaded", voice_name);
