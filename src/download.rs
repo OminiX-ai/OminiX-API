@@ -852,40 +852,78 @@ pub fn cancel_download(cancel_flags: &DownloadCancelFlags, model_id: &str) -> Re
     }
 }
 
-/// Remove a downloaded model from disk and update config
+/// Remove a downloaded model from disk and update config.
+///
+/// Collects paths from both the default registry and on-disk config
+/// (using partial ID matching), removes all found directories, and
+/// marks matching config entries as not_downloaded.
 pub fn remove_model(model_id: &str) -> Result<String, String> {
-    // Look up the model in registry or config
-    let dest_path = if let Some(spec) = crate::model_registry::get_download_spec(model_id) {
-        crate::utils::expand_tilde(&spec.storage.local_path)
-    } else {
-        // Try to find in config
-        let config = crate::model_config::LocalModelsConfig::load()
-            .ok_or_else(|| format!("Model '{}' not found in catalog or config", model_id))?;
-        let model = config
-            .find_by_id(model_id)
-            .ok_or_else(|| format!("Model '{}' not found", model_id))?;
-        crate::utils::expand_tilde(&model.storage.local_path)
-    };
+    let model_id_lower = model_id.to_lowercase();
+    let mut paths_to_remove: Vec<String> = Vec::new();
 
-    let path = std::path::PathBuf::from(&dest_path);
-    if !path.exists() {
-        return Err(format!("Model directory does not exist: {}", dest_path));
+    // 1. Check default registry
+    if let Some(spec) = crate::model_registry::get_download_spec(model_id) {
+        paths_to_remove.push(crate::utils::expand_tilde(&spec.storage.local_path));
     }
 
-    // Remove the directory
-    std::fs::remove_dir_all(&path)
-        .map_err(|e| format!("Failed to remove model directory: {}", e))?;
+    // 2. Check config with partial matching (e.g. "funasr-nano" matches "local/funasr-nano")
+    if let Some(config) = crate::model_config::LocalModelsConfig::load() {
+        for model in &config.models {
+            let id_lower = model.id.to_lowercase();
+            if id_lower == model_id_lower
+                || id_lower.contains(&model_id_lower)
+                || model_id_lower.contains(&id_lower)
+            {
+                let path = crate::utils::expand_tilde(&model.storage.local_path);
+                if !paths_to_remove.contains(&path) {
+                    paths_to_remove.push(path);
+                }
+            }
+        }
+    }
 
-    // Update config: set status to not_downloaded
+    if paths_to_remove.is_empty() {
+        return Err(format!("Model '{}' not found in catalog or config", model_id));
+    }
+
+    // 3. Remove all found directories
+    let mut removed = Vec::new();
+    for dest_path in &paths_to_remove {
+        let path = std::path::PathBuf::from(dest_path);
+        if path.exists() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|e| format!("Failed to remove {}: {}", dest_path, e))?;
+            removed.push(dest_path.as_str());
+        }
+    }
+
+    if removed.is_empty() {
+        return Err(format!(
+            "Model '{}' directories do not exist on disk",
+            model_id
+        ));
+    }
+
+    // 4. Update config: mark matching entries as not_downloaded
     if let Some(mut config) = crate::model_config::LocalModelsConfig::load() {
-        if let Some(model) = config.models.iter_mut().find(|m| m.id == model_id) {
-            model.status.state = "not_downloaded".to_string();
-            model.status.downloaded_bytes = None;
-            model.status.downloaded_files = None;
+        for model in config.models.iter_mut() {
+            let id_lower = model.id.to_lowercase();
+            if id_lower == model_id_lower
+                || id_lower.contains(&model_id_lower)
+                || model_id_lower.contains(&id_lower)
+            {
+                model.status.state = "not_downloaded".to_string();
+                model.status.downloaded_bytes = None;
+                model.status.downloaded_files = None;
+            }
         }
         config.last_updated = Some(chrono::Utc::now().to_rfc3339());
         let _ = config.save();
     }
 
-    Ok(format!("Removed model '{}' from {}", model_id, dest_path))
+    Ok(format!(
+        "Removed model '{}' from: {}",
+        model_id,
+        removed.join(", ")
+    ))
 }
