@@ -22,6 +22,7 @@ mlx-rs-core = { path = "../OminiX-MLX/mlx-rs-core" }
 qwen3-mlx = { path = "../OminiX-MLX/qwen3-mlx" }
 glm47-flash-mlx = { path = "../OminiX-MLX/glm-4.7-flash-mlx" }
 funasr-mlx = { path = "../OminiX-MLX/funasr-mlx" }
+funasr-qwen4b-mlx = { path = "../OminiX-MLX/funasr-qwen4b-mlx" }
 gpt-sovits-mlx = { path = "../OminiX-MLX/gpt-sovits-mlx" }
 flux-klein-mlx = { path = "../OminiX-MLX/flux-klein-mlx" }
 zimage-mlx = { path = "../OminiX-MLX/zimage-mlx" }
