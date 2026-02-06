@@ -359,7 +359,7 @@ pub struct ModelSummary {
 // Hub cache scanning
 // ============================================================================
 
-/// Scan HuggingFace and ModelScope hub caches for models,
+/// Scan HuggingFace and ModelScope hub caches, plus ~/.OminiX/models/,
 /// detect their category, and merge into the config.
 /// Returns the number of newly registered models.
 pub fn scan_hub_caches() -> usize {
@@ -367,6 +367,14 @@ pub fn scan_hub_caches() -> usize {
         .unwrap_or_else(LocalModelsConfig::default_empty);
 
     let mut added = 0;
+
+    // Scan ~/.OminiX/models/ (locally placed models)
+    if let Some(home) = dirs::home_dir() {
+        let local_models_dir = home.join(".OminiX/models");
+        if local_models_dir.exists() {
+            added += scan_local_models(&local_models_dir, &mut config);
+        }
+    }
 
     for root in get_hf_cache_roots() {
         if root.exists() {
@@ -385,10 +393,10 @@ pub fn scan_hub_caches() -> usize {
         if let Err(e) = config.save() {
             tracing::warn!("Failed to save updated config after scan: {}", e);
         } else {
-            tracing::info!("Hub cache scan: registered {} new model(s)", added);
+            tracing::info!("Model scan: registered {} new model(s)", added);
         }
     } else {
-        tracing::debug!("Hub cache scan: no new models found");
+        tracing::debug!("Model scan: no new models found");
     }
 
     added
@@ -640,6 +648,61 @@ fn scan_ms_cache(cache_root: &PathBuf, config: &mut LocalModelsConfig) -> usize 
     added
 }
 
+/// Scan ~/.OminiX/models/ for locally placed models
+fn scan_local_models(models_dir: &PathBuf, config: &mut LocalModelsConfig) -> usize {
+    let entries = match std::fs::read_dir(models_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    let mut added = 0;
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        if !entry.path().is_dir() {
+            continue;
+        }
+
+        let model_name = entry.file_name().to_string_lossy().to_string();
+        let model_dir = entry.path();
+
+        let category = match detect_model_category(&model_dir) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let model_id = format!("local/{}", model_name);
+
+        let model = LocalModel {
+            id: model_id.clone(),
+            name: model_name,
+            description: Some("Scanned from ~/.OminiX/models/".to_string()),
+            category: category.clone(),
+            source: ModelSource {
+                primary_url: None,
+                source_type: Some("local".to_string()),
+                repo_id: None,
+            },
+            storage: ModelStorage {
+                local_path: model_dir.to_string_lossy().to_string(),
+                total_size_bytes: dir_size_bytes(&model_dir),
+                total_size_display: None,
+            },
+            status: ModelStatusInfo {
+                state: "ready".to_string(),
+                downloaded_bytes: None,
+                downloaded_files: None,
+            },
+        };
+
+        if config.merge_scanned_model(model) {
+            added += 1;
+            tracing::info!("  Registered from local models: {} ({:?})", model_id, category);
+        }
+    }
+
+    added
+}
+
 /// Detect the category of a model by examining its files.
 /// Detection order matters: Image -> ASR -> LLM (most specific first).
 fn detect_model_category(model_dir: &PathBuf) -> Option<ModelCategory> {
@@ -651,16 +714,30 @@ fn detect_model_category(model_dir: &PathBuf) -> Option<ModelCategory> {
         }
     }
 
-    // ASR: paraformer.safetensors + tokens.txt + am.mvn
+    // ASR variant 1: classic paraformer (paraformer.safetensors + am.mvn)
     if model_dir.join("paraformer.safetensors").exists()
-        && model_dir.join("tokens.txt").exists()
         && model_dir.join("am.mvn").exists()
     {
         return Some(ModelCategory::Asr);
     }
 
-    // LLM: config.json with model_type + tokenizer.json + weight files
+    // ASR variant 2: funasr-style (config.json with model_type="funasr" + weight files)
     let config_path = model_dir.join("config.json");
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(model_type) = config.get("model_type").and_then(|v| v.as_str()) {
+                    if model_type.starts_with("funasr") || model_type == "paraformer" {
+                        if has_safetensors_in(model_dir) {
+                            return Some(ModelCategory::Asr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // LLM: config.json with model_type + tokenizer.json + weight files
     let tokenizer_path = model_dir.join("tokenizer.json");
     if config_path.exists() && tokenizer_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
