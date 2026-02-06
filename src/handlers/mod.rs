@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod chat;
+pub mod download;
 pub mod health;
 pub mod helpers;
 pub mod image;

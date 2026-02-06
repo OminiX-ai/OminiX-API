@@ -44,6 +44,35 @@ pub enum ImageModelType {
     ZImageTurbo,
 }
 
+impl ImageModelType {
+    /// Known config aliases for each model type (short names used by Studio)
+    pub fn config_aliases(&self) -> &'static [&'static str] {
+        match self {
+            ImageModelType::FluxKlein => &["flux-klein-4b"],
+            ImageModelType::ZImageTurbo => &["zimage-turbo"],
+        }
+    }
+
+    /// Detect model type from a user-provided model ID string
+    pub fn from_model_id(model_id: &str) -> Self {
+        let lower = model_id.to_lowercase();
+        if lower.contains("zimage") || lower.contains("z-image") {
+            ImageModelType::ZImageTurbo
+        } else {
+            // Default to FLUX for anything else (including "flux", "flux-klein-4b", etc.)
+            ImageModelType::FluxKlein
+        }
+    }
+
+    /// Normalized short name for tracking the current model
+    pub fn normalized_name(&self) -> &'static str {
+        match self {
+            ImageModelType::FluxKlein => "flux",
+            ImageModelType::ZImageTurbo => "zimage",
+        }
+    }
+}
+
 /// Transformer variant (FLUX or Z-Image)
 enum TransformerVariant {
     Flux(FluxKlein, FluxKleinParams),
@@ -77,20 +106,16 @@ impl ImageEngine {
     pub fn new(model_id: &str) -> Result<Self> {
         tracing::info!("Initializing image generation engine: {}", model_id);
 
-        // Determine model type
-        let model_type = if model_id.contains("zimage") || model_id.contains("z-image") || model_id.contains("Z-Image") {
-            ImageModelType::ZImageTurbo
-        } else {
-            ImageModelType::FluxKlein
-        };
-
+        // Determine model type from the user-provided model ID
+        let model_type = ImageModelType::from_model_id(model_id);
         tracing::info!("Image model type: {:?}", model_type);
 
-        // Try multiple config IDs: the short name used by Studio, then the original model_id
-        let config_model_ids = match model_type {
-            ImageModelType::FluxKlein => vec!["flux-klein-4b", model_id],
-            ImageModelType::ZImageTurbo => vec!["zimage-turbo", model_id],
-        };
+        // Build config lookup IDs: known aliases first, then the original model_id
+        let config_model_ids: Vec<&str> = model_type.config_aliases()
+            .iter()
+            .copied()
+            .chain(std::iter::once(model_id))
+            .collect();
 
         // Check model configuration for local availability
         let model_dir: PathBuf = 'lookup: {

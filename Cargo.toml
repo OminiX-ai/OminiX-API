@@ -16,7 +16,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # MLX inference
 mlx-rs = { path = "../OminiX-MLX/mlx-rs", features = ["metal", "accelerate"] }
 mlx-sys = { path = "../OminiX-MLX/mlx-rs/mlx-sys" }
-mlx-rs-core = { path = "../OminiX-MLX/mlx-rs-core" }
+mlx-rs-core = { path = "../OminiX-MLX/mlx-rs-core", features = ["convert"] }
 
 # Model-specific crates
 qwen3-mlx = { path = "../OminiX-MLX/qwen3-mlx" }
@@ -49,6 +49,9 @@ hound = "3.5"
 
 # Image processing
 image = "0.25"
+
+# HTTP client (for model downloads)
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 
 [[bin]]
 name = "ominix-api"

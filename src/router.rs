@@ -31,6 +31,13 @@ pub fn build_router(state: AppState) -> Router {
         .push(Router::with_path("v1/images/generations").post(handlers::image::images_generations))
         // WebSocket TTS
         .push(Router::with_path("ws/v1/tts").get(handlers::ws_tts::ws_tts))
+        // Model management
+        .push(Router::with_path("v1/models/catalog").get(handlers::download::model_catalog))
+        .push(Router::with_path("v1/models/download").post(handlers::download::download_model))
+        .push(Router::with_path("v1/models/download/progress").get(handlers::download::download_progress_sse))
+        .push(Router::with_path("v1/models/download/cancel").post(handlers::download::cancel_download))
+        .push(Router::with_path("v1/models/remove").post(handlers::download::remove_model))
+        .push(Router::with_path("v1/models/scan").post(handlers::download::scan_models))
         // Voice cloning training
         .push(Router::with_path("v1/voices").get(handlers::training::list_voices))
         .push(Router::with_path("v1/voices/train").post(handlers::training::start_voice_training))

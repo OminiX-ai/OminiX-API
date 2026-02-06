@@ -21,9 +21,11 @@ mod config;
 mod error;
 mod state;
 
+mod download;
 mod engines;
 mod handlers;
 mod inference;
+mod model_registry;
 mod router;
 
 mod model_config;
@@ -34,7 +36,7 @@ mod utils;
 use config::Config;
 use inference::InferenceRequest;
 use state::AppState;
-use types::TrainingProgressEvent;
+use types::{DownloadProgressEvent, TrainingProgressEvent};
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -79,6 +81,16 @@ async fn main() -> eyre::Result<()> {
         );
     });
 
+    // Create download channels and thread
+    let (download_tx, download_rx) = mpsc::channel::<download::DownloadRequest>(16);
+    let (download_progress_tx, _) = broadcast::channel::<DownloadProgressEvent>(256);
+    let download_cancel_flags: download::DownloadCancelFlags = Default::default();
+    let download_progress_tx_clone = download_progress_tx.clone();
+    let download_cancel_flags_clone = download_cancel_flags.clone();
+    std::thread::spawn(move || {
+        download::download_thread(download_rx, download_progress_tx_clone, download_cancel_flags_clone);
+    });
+
     // Wait for models to load
     ready_rx
         .await
@@ -90,6 +102,9 @@ async fn main() -> eyre::Result<()> {
         training_tx,
         progress_tx,
         cancel_flag,
+        download_tx,
+        download_progress_tx,
+        download_cancel_flags,
     };
 
     let router = router::build_router(state);
@@ -106,6 +121,12 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("  POST /v1/models/load");
     tracing::info!("  POST /v1/models/unload");
     tracing::info!("  POST /v1/models/quantize");
+    tracing::info!("  GET  /v1/models/catalog");
+    tracing::info!("  POST /v1/models/download");
+    tracing::info!("  GET  /v1/models/download/progress");
+    tracing::info!("  POST /v1/models/download/cancel");
+    tracing::info!("  POST /v1/models/remove");
+    tracing::info!("  POST /v1/models/scan");
     tracing::info!("  POST /v1/chat/completions");
     tracing::info!("  POST /v1/audio/transcriptions");
     tracing::info!("  POST /v1/audio/speech");

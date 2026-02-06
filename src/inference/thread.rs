@@ -27,12 +27,7 @@ where
 }
 
 fn normalize_image_model(model: &str) -> &'static str {
-    let lower = model.to_lowercase();
-    if lower.contains("flux") {
-        "flux"
-    } else {
-        "zimage"
-    }
+    image::ImageModelType::from_model_id(model).normalized_name()
 }
 
 /// Inference thread that owns all models (models are not Send/Sync)

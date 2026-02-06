@@ -5,6 +5,7 @@
 
 mod audio;
 mod chat;
+mod download;
 mod error;
 mod image;
 mod training;
@@ -12,6 +13,7 @@ mod voice;
 
 pub use audio::*;
 pub use chat::*;
+pub use download::*;
 pub use error::*;
 pub use image::*;
 pub use training::*;

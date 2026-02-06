@@ -42,7 +42,7 @@ pub async fn images_generations(
 
 /// POST /v1/models/quantize - Quantize a FLUX model's transformer weights to 8-bit
 ///
-/// Request body: { "model_id": "flux-klein-4b" } or { "model_id": "black-forest-labs/FLUX.2-klein-4B" }
+/// Request body: { "model_id": "flux" } or any model ID containing "flux"
 ///
 /// This is a one-time operation. Loads the bf16 transformer, quantizes to INT8,
 /// and saves alongside the original weights as `transformer/quantized_8bit.safetensors`.
@@ -74,8 +74,13 @@ pub async fn quantize_model(req: &mut Request, res: &mut Response) {
     let result = tokio::task::spawn_blocking(move || -> eyre::Result<String> {
         use flux_klein_mlx::quantize_and_save_flux_klein;
 
-        // Find the model directory
-        let config_ids = vec!["flux-klein-4b", model_id.as_str()];
+        // Find the model directory using known aliases + the original model_id
+        let model_type = crate::engines::image::ImageModelType::from_model_id(&model_id);
+        let config_ids: Vec<&str> = model_type.config_aliases()
+            .iter()
+            .copied()
+            .chain(std::iter::once(model_id.as_str()))
+            .collect();
         let model_dir = 'lookup: {
             for config_id in &config_ids {
                 match crate::model_config::check_model(
