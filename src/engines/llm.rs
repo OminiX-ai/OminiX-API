@@ -397,15 +397,43 @@ fn parse_tool_calls(content: &str) -> (String, Vec<ToolCall>, String) {
         };
 
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&inner) {
-            // Accept both "name"/"arguments" and "function"/"parameters" key formats
-            let name = parsed["name"].as_str()
-                .or_else(|| parsed["function"].as_str())
-                .unwrap_or("")
-                .to_string();
-            let arguments = parsed.get("arguments")
-                .or_else(|| parsed.get("parameters"))
-                .map(|a| serde_json::to_string(a).unwrap_or_default())
-                .unwrap_or_else(|| "{}".to_string());
+            // Accept multiple key formats from Qwen3 output variants:
+            // Standard: {"name": "fn", "arguments": {...}}
+            // Variant1: {"function": "fn", "parameters": {...}}
+            // Variant2: {"tool": "fn", "params": {...}}
+            // OpenAI-wrapped: {"type": "function", "function": {"name": "fn", "arguments": ...}}
+            let (name, arguments) = if let Some(n) = parsed["name"].as_str() {
+                // Standard format
+                let args = parsed.get("arguments")
+                    .or_else(|| parsed.get("parameters"))
+                    .map(|a| if a.is_string() { a.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(a).unwrap_or_default() })
+                    .unwrap_or_else(|| "{}".to_string());
+                (n.to_string(), args)
+            } else if let Some(n) = parsed["function"].as_str() {
+                // "function"/"parameters" variant (common with 8-bit models)
+                let args = parsed.get("parameters")
+                    .or_else(|| parsed.get("arguments"))
+                    .map(|a| if a.is_string() { a.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(a).unwrap_or_default() })
+                    .unwrap_or_else(|| "{}".to_string());
+                (n.to_string(), args)
+            } else if let Some(n) = parsed["tool"].as_str() {
+                // "tool"/"params" variant
+                let args = parsed.get("params")
+                    .or_else(|| parsed.get("parameters"))
+                    .or_else(|| parsed.get("arguments"))
+                    .map(|a| if a.is_string() { a.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(a).unwrap_or_default() })
+                    .unwrap_or_else(|| "{}".to_string());
+                (n.to_string(), args)
+            } else if let Some(func_obj) = parsed.get("function").and_then(|f| f.as_object()) {
+                // OpenAI-wrapped: {"type": "function", "function": {"name": "...", "arguments": ...}}
+                let n = func_obj.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let args = func_obj.get("arguments")
+                    .map(|a| if a.is_string() { a.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(a).unwrap_or_default() })
+                    .unwrap_or_else(|| "{}".to_string());
+                (n, args)
+            } else {
+                (String::new(), String::new())
+            };
 
             if !name.is_empty() {
                 let id = format!("call_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);

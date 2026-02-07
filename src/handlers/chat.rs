@@ -50,7 +50,15 @@ pub async fn chat_completions(
             delta["content"] = serde_json::json!(content);
         }
         if let Some(tc) = &tool_calls {
-            delta["tool_calls"] = serde_json::to_value(tc).unwrap_or_default();
+            // Add index to each tool call for OpenAI streaming compatibility
+            let indexed_tc: Vec<serde_json::Value> = tc.iter().enumerate().map(|(i, call)| {
+                let mut v = serde_json::to_value(call).unwrap_or_default();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("index".to_string(), serde_json::json!(i));
+                }
+                v
+            }).collect();
+            delta["tool_calls"] = serde_json::json!(indexed_tc);
         }
 
         let chunk1 = serde_json::json!({
