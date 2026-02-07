@@ -270,13 +270,6 @@ impl ImageEngine {
                     all_weights.extend(weights);
                 }
                 let weights = sanitize_qwen3_weights(all_weights);
-                let weights: HashMap<String, Array> = weights
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let v32 = v.as_type::<f32>().unwrap_or(v);
-                        (k, v32)
-                    })
-                    .collect();
                 let weights_rc: HashMap<Rc<str>, Array> = weights
                     .into_iter()
                     .map(|(k, v)| (Rc::from(k.as_str()), v))
