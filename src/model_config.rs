@@ -17,6 +17,7 @@ pub enum ModelCategory {
     Llm,
     Asr,
     Tts,
+    Vlm,
 }
 
 /// Model source information
@@ -265,7 +266,7 @@ impl LocalModelsConfig {
     pub fn print_status_report(&self) {
         tracing::info!("=== Model Configuration Status ===");
 
-        for category in [ModelCategory::Llm, ModelCategory::Image, ModelCategory::Asr, ModelCategory::Tts] {
+        for category in [ModelCategory::Llm, ModelCategory::Image, ModelCategory::Asr, ModelCategory::Tts, ModelCategory::Vlm] {
             let models = self.find_by_category(category.clone());
             if models.is_empty() {
                 continue;
@@ -276,6 +277,7 @@ impl LocalModelsConfig {
                 ModelCategory::Image => "Image",
                 ModelCategory::Asr => "ASR",
                 ModelCategory::Tts => "TTS",
+                ModelCategory::Vlm => "VLM",
             };
 
             tracing::info!("--- {} Models ---", category_name);
@@ -737,6 +739,17 @@ fn detect_model_category(model_dir: &PathBuf) -> Option<ModelCategory> {
         }
     }
 
+    // VLM: config.json containing "vision_backbone" or model_type containing "prismatic"/"moxin"
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if content.contains("vision_backbone") || content.contains("prismatic") || content.contains("moxin") {
+                if has_safetensors_in(model_dir) {
+                    return Some(ModelCategory::Vlm);
+                }
+            }
+        }
+    }
+
     // LLM: config.json with model_type + tokenizer.json + weight files
     let tokenizer_path = model_dir.join("tokenizer.json");
     if config_path.exists() && tokenizer_path.exists() {
@@ -800,6 +813,7 @@ fn category_name(cat: &ModelCategory) -> &'static str {
         ModelCategory::Image => "image",
         ModelCategory::Asr => "asr",
         ModelCategory::Tts => "tts",
+        ModelCategory::Vlm => "vlm",
     }
 }
 

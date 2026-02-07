@@ -2604,6 +2604,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "moxin-vlm-mlx"
+version = "0.1.0"
+dependencies = [
+ "mlx-rs",
+ "mlx-rs-core",
+ "mlx-sys",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
 name = "multer"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2868,6 +2881,7 @@ dependencies = [
  "mlx-rs",
  "mlx-rs-core",
  "mlx-sys",
+ "moxin-vlm-mlx",
  "qwen3-mlx",
  "reqwest",
  "salvo",

@@ -58,6 +58,12 @@ pub async fn list_models(depot: &mut Depot, res: &mut Response) -> Result<(), St
             "owned_by": "local", "type": "image"
         }));
     }
+    if let Some(ref id) = status.vlm {
+        data.push(serde_json::json!({
+            "id": id, "object": "model", "created": now,
+            "owned_by": "local", "type": "vlm"
+        }));
+    }
 
     res.render(Json(serde_json::json!({
         "object": "list",

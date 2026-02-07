@@ -6,6 +6,7 @@ pub struct Config {
     pub asr_model_dir: String,
     pub tts_ref_audio: String,
     pub image_model: String,
+    pub vlm_model: String,
 }
 
 impl Config {
@@ -22,6 +23,8 @@ impl Config {
             tts_ref_audio: std::env::var("TTS_REF_AUDIO")
                 .unwrap_or_else(|_| "".to_string()),
             image_model: std::env::var("IMAGE_MODEL")
+                .unwrap_or_else(|_| "".to_string()),
+            vlm_model: std::env::var("VLM_MODEL")
                 .unwrap_or_else(|_| "".to_string()),
         }
     }

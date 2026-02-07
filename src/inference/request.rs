@@ -20,6 +20,10 @@ pub enum InferenceRequest {
         request: ImageGenerationRequest,
         response_tx: oneshot::Sender<eyre::Result<ImageGenerationResponse>>,
     },
+    VlmCompletion {
+        request: VlmCompletionRequest,
+        response_tx: oneshot::Sender<eyre::Result<VlmCompletionResponse>>,
+    },
     /// Load/switch LLM model dynamically
     LoadLlmModel {
         model_id: String,
@@ -37,6 +41,11 @@ pub enum InferenceRequest {
     },
     /// Load/switch image generation model dynamically
     LoadImageModel {
+        model_id: String,
+        response_tx: oneshot::Sender<eyre::Result<String>>,
+    },
+    /// Load/switch VLM model dynamically
+    LoadVlmModel {
         model_id: String,
         response_tx: oneshot::Sender<eyre::Result<String>>,
     },
@@ -62,4 +71,5 @@ pub struct ModelStatus {
     pub asr: Option<String>,
     pub tts: Option<String>,
     pub image: Option<String>,
+    pub vlm: Option<String>,
 }

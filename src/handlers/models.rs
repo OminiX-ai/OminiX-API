@@ -104,12 +104,24 @@ pub async fn load_model(
                 .map_err(|_| StatusError::internal_server_error())?;
             response_rx
         }
+        "vlm" => {
+            let (response_tx, response_rx) = oneshot::channel();
+            state
+                .inference_tx
+                .send(InferenceRequest::LoadVlmModel {
+                    model_id: request.model.clone(),
+                    response_tx,
+                })
+                .await
+                .map_err(|_| StatusError::internal_server_error())?;
+            response_rx
+        }
         _ => {
             render_error(
                 res,
                 salvo::http::StatusCode::BAD_REQUEST,
                 &format!(
-                    "Unknown model_type: {}. Use: llm, asr, tts, or image",
+                    "Unknown model_type: {}. Use: llm, asr, tts, image, or vlm",
                     model_type
                 ),
                 "invalid_request_error",

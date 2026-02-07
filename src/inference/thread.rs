@@ -1,7 +1,7 @@
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
-use crate::engines::{asr, image, llm, tts};
+use crate::engines::{asr, image, llm, tts, vlm};
 
 use super::{InferenceRequest, ModelStatus};
 
@@ -41,12 +41,14 @@ pub fn inference_thread(
     let mut asr_engine: Option<asr::AsrEngine> = None;
     let mut tts_engine: Option<tts::TtsEngine> = None;
     let mut image_engine: Option<image::ImageEngine> = None;
+    let mut vlm_engine: Option<vlm::VlmEngine> = None;
 
     // Name tracking
     let mut current_llm_model: Option<String> = None;
     let mut current_asr_model: Option<String> = None;
     let mut current_tts_model: Option<String> = None;
     let mut current_image_model: Option<String> = None;
+    let mut current_vlm_model: Option<String> = None;
 
     // Startup loading
     if !config.llm_model.is_empty() {
@@ -75,6 +77,12 @@ pub fn inference_thread(
                 current_image_model = Some(normalized.to_string());
             }
             Err(e) => tracing::warn!("Failed to load image model: {}", e),
+        }
+    }
+    if !config.vlm_model.is_empty() {
+        tracing::info!("Loading VLM model: {}", config.vlm_model);
+        if let Err(e) = load_model_slot(&mut vlm_engine, &mut current_vlm_model, &config.vlm_model, vlm::VlmEngine::new) {
+            tracing::warn!("Failed to load VLM model: {}", e);
         }
     }
 
@@ -143,6 +151,15 @@ pub fn inference_thread(
                 let _ = response_tx.send(result);
             }
 
+            InferenceRequest::VlmCompletion { request, response_tx } => {
+                let result = if let Some(ref mut engine) = vlm_engine {
+                    engine.describe(&request)
+                } else {
+                    Err(eyre::eyre!("VLM model not loaded"))
+                };
+                let _ = response_tx.send(result);
+            }
+
             // === Dynamic Model Loading ===
 
             InferenceRequest::LoadLlmModel { model_id, response_tx } => {
@@ -158,6 +175,11 @@ pub fn inference_thread(
             InferenceRequest::LoadTtsModel { ref_audio, response_tx } => {
                 tracing::info!("Loading TTS model with ref audio: {}", ref_audio);
                 let result = load_model_slot(&mut tts_engine, &mut current_tts_model, &ref_audio, tts::TtsEngine::new);
+                let _ = response_tx.send(result);
+            }
+            InferenceRequest::LoadVlmModel { model_id, response_tx } => {
+                tracing::info!("Loading VLM model: {}", model_id);
+                let result = load_model_slot(&mut vlm_engine, &mut current_vlm_model, &model_id, vlm::VlmEngine::new);
                 let _ = response_tx.send(result);
             }
             InferenceRequest::LoadImageModel { model_id, response_tx } => {
@@ -203,18 +225,25 @@ pub fn inference_thread(
                         let prev = current_image_model.take();
                         Ok(format!("Unloaded image model: {:?}", prev))
                     }
+                    "vlm" => {
+                        vlm_engine = None;
+                        let prev = current_vlm_model.take();
+                        Ok(format!("Unloaded VLM model: {:?}", prev))
+                    }
                     "all" => {
                         llm_engine = None;
                         asr_engine = None;
                         tts_engine = None;
                         image_engine = None;
+                        vlm_engine = None;
                         current_llm_model = None;
                         current_asr_model = None;
                         current_tts_model = None;
                         current_image_model = None;
+                        current_vlm_model = None;
                         Ok("Unloaded all models".to_string())
                     }
-                    _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, image, or all", model_type)),
+                    _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, image, vlm, or all", model_type)),
                 };
                 let _ = response_tx.send(result);
             }
@@ -225,6 +254,7 @@ pub fn inference_thread(
                     asr: current_asr_model.clone(),
                     tts: current_tts_model.clone(),
                     image: current_image_model.clone(),
+                    vlm: current_vlm_model.clone(),
                 };
                 let _ = response_tx.send(status);
             }

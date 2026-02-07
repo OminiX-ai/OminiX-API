@@ -29,6 +29,8 @@ pub fn build_router(state: AppState) -> Router {
         .push(Router::with_path("v1/audio/speech").post(handlers::audio::audio_speech))
         // Image generation
         .push(Router::with_path("v1/images/generations").post(handlers::image::images_generations))
+        // VLM (Vision-Language Model)
+        .push(Router::with_path("v1/vlm/completions").post(handlers::vlm::vlm_completions))
         // WebSocket TTS
         .push(Router::with_path("ws/v1/tts").get(handlers::ws_tts::ws_tts))
         // Model management

@@ -26,6 +26,7 @@ funasr-qwen4b-mlx = { path = "../OminiX-MLX/funasr-qwen4b-mlx" }
 gpt-sovits-mlx = { path = "../OminiX-MLX/gpt-sovits-mlx" }
 flux-klein-mlx = { path = "../OminiX-MLX/flux-klein-mlx" }
 zimage-mlx = { path = "../OminiX-MLX/zimage-mlx" }
+moxin-vlm-mlx = { path = "../OminiX-MLX/moxin-vlm-mlx" }
 
 # Tokenization
 tokenizers = "0.22"
