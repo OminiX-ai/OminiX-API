@@ -460,7 +460,12 @@ fn download_from_huggingface(
             files.len(),
             file_path
         );
-        download_file_streaming(client, &download_url, &local_path, tracker, hf_token.as_deref())?;
+        if let Err(e) = download_file_streaming(client, &download_url, &local_path, tracker, hf_token.as_deref()) {
+            if tracker.is_cancelled() {
+                let _ = std::fs::remove_dir_all(dest_path);
+            }
+            return Err(e);
+        }
     }
 
     tracing::info!("Download complete: {}", dest_path);
