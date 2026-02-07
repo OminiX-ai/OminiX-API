@@ -173,6 +173,10 @@ impl ImageEngine {
             }
         };
 
+        // Check if this is a quantized FLUX model (determines text encoder precision)
+        let is_quantized_flux = model_type == ImageModelType::FluxKlein
+            && model_dir.join("transformer/quantized_8bit.safetensors").exists();
+
         // Get paths and configs based on model type
         let (transformer_path, text_encoder_paths, vae_path, tokenizer_path, vae_config) = match model_type {
             ImageModelType::FluxKlein => {
@@ -270,19 +274,30 @@ impl ImageEngine {
                     all_weights.extend(weights);
                 }
                 let weights = sanitize_qwen3_weights(all_weights);
-                // Cast to f32 for Metal compatibility (bf16 causes runtime crash)
-                let weights: HashMap<String, Array> = weights
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let v32 = v.as_type::<f32>().unwrap_or(v);
-                        (k, v32)
-                    })
-                    .collect();
-                let weights_rc: HashMap<Rc<str>, Array> = weights
-                    .into_iter()
-                    .map(|(k, v)| (Rc::from(k.as_str()), v))
-                    .collect();
-                encoder.update_flattened(weights_rc);
+                if is_quantized_flux {
+                    // Quantized FLUX: keep text encoder in bf16 to save memory
+                    // (~7.5 GB bf16 vs ~15 GB f32)
+                    tracing::info!("Quantized FLUX: keeping text encoder in bf16 to save memory");
+                    let weights_rc: HashMap<Rc<str>, Array> = weights
+                        .into_iter()
+                        .map(|(k, v)| (Rc::from(k.as_str()), v))
+                        .collect();
+                    encoder.update_flattened(weights_rc);
+                } else {
+                    // Standard FLUX: cast to f32 for Metal compatibility
+                    let weights: HashMap<String, Array> = weights
+                        .into_iter()
+                        .map(|(k, v)| {
+                            let v32 = v.as_type::<f32>().unwrap_or(v);
+                            (k, v32)
+                        })
+                        .collect();
+                    let weights_rc: HashMap<Rc<str>, Array> = weights
+                        .into_iter()
+                        .map(|(k, v)| (Rc::from(k.as_str()), v))
+                        .collect();
+                    encoder.update_flattened(weights_rc);
+                }
                 TextEncoderVariant::Standard(encoder)
             }
             ImageModelType::ZImageTurbo => {
