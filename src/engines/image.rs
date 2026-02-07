@@ -48,7 +48,7 @@ impl ImageModelType {
     /// Known config aliases for each model type (short names used by Studio)
     pub fn config_aliases(&self) -> &'static [&'static str] {
         match self {
-            ImageModelType::FluxKlein => &["flux-klein-4b"],
+            ImageModelType::FluxKlein => &["flux-klein-4b", "flux-klein-4b-8bit"],
             ImageModelType::ZImageTurbo => &["zimage-turbo"],
         }
     }
@@ -110,11 +110,15 @@ impl ImageEngine {
         let model_type = ImageModelType::from_model_id(model_id);
         tracing::info!("Image model type: {:?}", model_type);
 
-        // Build config lookup IDs: known aliases first, then the original model_id
+        // Build config lookup IDs: known aliases, then original model_id,
+        // then the registry repo_id (e.g. "moxin-org/FLUX.2-klein-4B-8bit-mlx")
+        let registry_repo_id = crate::model_registry::get_download_spec(model_id)
+            .and_then(|s| s.source.repo_id);
         let config_model_ids: Vec<&str> = model_type.config_aliases()
             .iter()
             .copied()
             .chain(std::iter::once(model_id))
+            .chain(registry_repo_id.as_deref())
             .collect();
 
         // Check model configuration for local availability
@@ -145,18 +149,27 @@ impl ImageEngine {
                 }
             }
 
-            // Not found in config — try hub caches with the original model_id
-            if let Some(hub_path) = crate::utils::resolve_from_hub_cache(model_id) {
-                tracing::info!("Found image model in hub cache: {:?}", hub_path);
-                let _ = model_config::register_model(model_id, ModelCategory::Image, &hub_path);
-                hub_path
-            } else {
-                return Err(eyre::eyre!(
+            // Not found in config — try hub caches with original model_id and repo_id
+            let hub_ids: Vec<&str> = std::iter::once(model_id)
+                .chain(registry_repo_id.as_deref())
+                .collect();
+            let mut found_hub = None;
+            for hub_id in &hub_ids {
+                if let Some(hub_path) = crate::utils::resolve_from_hub_cache(hub_id) {
+                    tracing::info!("Found image model in hub cache: {:?}", hub_path);
+                    let _ = model_config::register_model(hub_id, ModelCategory::Image, &hub_path);
+                    found_hub = Some(hub_path);
+                    break;
+                }
+            }
+            match found_hub {
+                Some(path) => path,
+                None => return Err(eyre::eyre!(
                     "Image model '{}' not found in local configuration or hub caches.\n\
                      Please download it via OminiX-Studio or huggingface-cli.\n\
                      Searched: ~/.OminiX/local_models_config.json, ~/.cache/huggingface/hub/, ~/.cache/modelscope/hub/",
                     model_id
-                ));
+                )),
             }
         };
 
