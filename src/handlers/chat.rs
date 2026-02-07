@@ -36,11 +36,22 @@ pub async fn chat_completions(
     if is_streaming {
         // Convert non-streaming response to SSE format for clients that expect streaming
         let content = response.choices.first()
-            .map(|c| c.message.content.clone())
+            .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
+        let tool_calls = response.choices.first()
+            .and_then(|c| c.message.tool_calls.clone());
         let finish_reason = response.choices.first()
             .map(|c| c.finish_reason.clone())
             .unwrap_or_else(|| "stop".to_string());
+
+        // Build delta with role, optional content, and optional tool_calls
+        let mut delta = serde_json::json!({ "role": "assistant" });
+        if !content.is_empty() {
+            delta["content"] = serde_json::json!(content);
+        }
+        if let Some(tc) = &tool_calls {
+            delta["tool_calls"] = serde_json::to_value(tc).unwrap_or_default();
+        }
 
         let chunk1 = serde_json::json!({
             "id": response.id,
@@ -49,7 +60,7 @@ pub async fn chat_completions(
             "model": response.model,
             "choices": [{
                 "index": 0,
-                "delta": { "role": "assistant", "content": content },
+                "delta": delta,
                 "finish_reason": serde_json::Value::Null
             }]
         });

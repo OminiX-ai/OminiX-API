@@ -12,7 +12,7 @@ use mlx_rs::Stream;
 use tokenizers::Tokenizer;
 
 use crate::model_config::{self, ModelAvailability, ModelCategory};
-use crate::types::{ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage, ChatUsage};
+use crate::types::{ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage, ChatUsage, Tool, ToolCall, FunctionCall};
 
 /// Synchronize the given stream
 fn synchronize(stream: &Stream) {
@@ -120,38 +120,78 @@ impl LlmEngine {
     }
 
     /// Format chat messages based on model type
-    fn format_messages(&self, messages: &[ChatMessage]) -> String {
+    fn format_messages(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> String {
         match self.model_type.as_str() {
             "glm4_moe_lite" => self.format_messages_glm(messages),
-            _ => self.format_messages_chatml(messages),
+            _ => self.format_messages_chatml(messages, tools),
         }
     }
 
     /// Format messages in ChatML format (Qwen3)
-    fn format_messages_chatml(&self, messages: &[ChatMessage]) -> String {
+    fn format_messages_chatml(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> String {
         let mut prompt = String::new();
+        let mut has_system = false;
 
         for msg in messages {
+            let content = msg.content.as_deref().unwrap_or("");
             match msg.role.as_str() {
                 "system" => {
                     prompt.push_str("<|im_start|>system\n");
-                    prompt.push_str(&msg.content);
+                    // Inject tools into the system message
+                    if let Some(tools) = tools {
+                        if !tools.is_empty() {
+                            prompt.push_str("You are a helpful assistant with access to the following tools. Use them when appropriate by outputting <tool_call> blocks.\n\n");
+                            prompt.push_str("<tools>\n");
+                            prompt.push_str(&serde_json::to_string_pretty(tools).unwrap_or_default());
+                            prompt.push_str("\n</tools>\n\n");
+                        }
+                    }
+                    prompt.push_str(content);
                     prompt.push_str("<|im_end|>\n");
+                    has_system = true;
                 }
                 "user" => {
                     prompt.push_str("<|im_start|>user\n");
-                    prompt.push_str(&msg.content);
+                    prompt.push_str(content);
                     prompt.push_str("<|im_end|>\n");
                 }
                 "assistant" => {
                     prompt.push_str("<|im_start|>assistant\n");
-                    prompt.push_str(&msg.content);
+                    // If the message has tool_calls, format them
+                    if let Some(tool_calls) = &msg.tool_calls {
+                        for tc in tool_calls {
+                            let call_json = serde_json::json!({
+                                "name": tc.function.name,
+                                "arguments": serde_json::from_str::<serde_json::Value>(&tc.function.arguments).unwrap_or(serde_json::Value::Object(Default::default()))
+                            });
+                            prompt.push_str(&format!("<tool_call>\n{}\n</tool_call>\n", serde_json::to_string(&call_json).unwrap_or_default()));
+                        }
+                    }
+                    prompt.push_str(content);
+                    prompt.push_str("<|im_end|>\n");
+                }
+                "tool" => {
+                    prompt.push_str("<|im_start|>user\n");
+                    prompt.push_str(&format!("<tool_response>\n{}\n</tool_response>", content));
                     prompt.push_str("<|im_end|>\n");
                 }
                 role => {
                     prompt.push_str(&format!("<|im_start|>{}\n", role));
-                    prompt.push_str(&msg.content);
+                    prompt.push_str(content);
                     prompt.push_str("<|im_end|>\n");
+                }
+            }
+        }
+
+        // If no system message was found but tools are provided, inject one
+        if !has_system {
+            if let Some(tools) = tools {
+                if !tools.is_empty() {
+                    let tools_block = format!(
+                        "<|im_start|>system\nYou are a helpful assistant with access to the following tools. Use them when appropriate by outputting <tool_call> blocks.\n\n<tools>\n{}\n</tools>\n<|im_end|>\n",
+                        serde_json::to_string_pretty(tools).unwrap_or_default()
+                    );
+                    prompt = format!("{}{}", tools_block, prompt);
                 }
             }
         }
@@ -172,30 +212,31 @@ impl LlmEngine {
         prompt.push_str("[gMASK]<sop>");
 
         for msg in messages {
+            let content = msg.content.as_deref().unwrap_or("");
             match msg.role.as_str() {
                 "system" => {
                     prompt.push_str("<|system|>");
-                    prompt.push_str(&msg.content);
+                    prompt.push_str(content);
                     prompt.push('\n');
                 }
                 "user" => {
                     prompt.push_str("<|user|>");
-                    prompt.push_str(&msg.content);
+                    prompt.push_str(content);
                     prompt.push('\n');
                 }
                 "assistant" => {
                     prompt.push_str("<|assistant|></think>");
-                    prompt.push_str(&msg.content);
+                    prompt.push_str(content);
                     prompt.push('\n');
                 }
                 "observation" | "tool" => {
                     prompt.push_str("<|observation|>");
-                    prompt.push_str(&msg.content);
+                    prompt.push_str(content);
                     prompt.push('\n');
                 }
                 role => {
                     prompt.push_str(&format!("<|{}|>", role));
-                    prompt.push_str(&msg.content);
+                    prompt.push_str(content);
                     prompt.push('\n');
                 }
             }
@@ -212,7 +253,7 @@ impl LlmEngine {
         let max_tokens = request.max_tokens.unwrap_or(2048);
 
         // Format messages using appropriate template
-        let prompt = self.format_messages(&request.messages);
+        let prompt = self.format_messages(&request.messages, request.tools.as_deref());
 
         // Tokenize
         let encoding = self.tokenizer.encode(prompt.as_str(), false)
@@ -278,8 +319,16 @@ impl LlmEngine {
             .collect();
         let completion_tokens = token_ids.len() as u32;
 
-        let content = self.tokenizer.decode(&token_ids, true)
+        let raw_content = self.tokenizer.decode(&token_ids, true)
             .map_err(|e| eyre::eyre!("Decoding failed: {}", e))?;
+
+        // Parse tool calls from output (Qwen3 format: <tool_call>...</tool_call>)
+        let has_tools = request.tools.as_ref().map_or(false, |t| !t.is_empty());
+        let (content, tool_calls, finish_reason) = if has_tools {
+            parse_tool_calls(&raw_content)
+        } else {
+            (raw_content, vec![], "stop".to_string())
+        };
 
         Ok(ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -290,9 +339,11 @@ impl LlmEngine {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content,
+                    content: if content.is_empty() { None } else { Some(content) },
+                    tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                    tool_call_id: None,
                 },
-                finish_reason: "stop".to_string(),
+                finish_reason,
             }],
             usage: ChatUsage {
                 prompt_tokens,
@@ -300,6 +351,54 @@ impl LlmEngine {
                 total_tokens: prompt_tokens + completion_tokens,
             },
         })
+    }
+}
+
+/// Parse Qwen3 <tool_call> blocks from model output
+///
+/// Qwen3 outputs tool calls as:
+/// ```text
+/// <tool_call>
+/// {"name": "function_name", "arguments": {"key": "value"}}
+/// </tool_call>
+/// ```
+fn parse_tool_calls(content: &str) -> (String, Vec<ToolCall>, String) {
+    let mut tool_calls = Vec::new();
+    let mut remaining = content.to_string();
+
+    // Find all <tool_call>...</tool_call> blocks
+    while let Some(start) = remaining.find("<tool_call>") {
+        if let Some(end) = remaining[start..].find("</tool_call>") {
+            let end_abs = start + end + "</tool_call>".len();
+            let inner = remaining[start + "<tool_call>".len()..start + end].trim();
+
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(inner) {
+                let name = parsed["name"].as_str().unwrap_or("").to_string();
+                let arguments = parsed.get("arguments")
+                    .map(|a| serde_json::to_string(a).unwrap_or_default())
+                    .unwrap_or_else(|| "{}".to_string());
+
+                let id = format!("call_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);
+                tool_calls.push(ToolCall {
+                    id,
+                    call_type: "function".to_string(),
+                    function: FunctionCall { name, arguments },
+                });
+            }
+
+            // Remove the tool_call block from remaining
+            remaining = format!("{}{}", &remaining[..start], &remaining[end_abs..]);
+        } else {
+            break;
+        }
+    }
+
+    let remaining = remaining.trim().to_string();
+
+    if tool_calls.is_empty() {
+        (content.to_string(), vec![], "stop".to_string())
+    } else {
+        (remaining, tool_calls, "tool_calls".to_string())
     }
 }
 
