@@ -89,12 +89,15 @@ enum TextEncoderVariant {
 /// Image generation engine
 pub struct ImageEngine {
     model_type: ImageModelType,
-    text_encoder: TextEncoderVariant,
+    text_encoder: Option<TextEncoderVariant>,
     transformer: TransformerVariant,
     vae_decoder: Decoder,
     vae_encoder: Encoder,
     tokenizer: Tokenizer,
     vae_config: AutoEncoderConfig,
+    /// Model directory for lazy-reloading text encoder (quantized FLUX only)
+    model_dir: Option<std::path::PathBuf>,
+    is_quantized_flux: bool,
 }
 
 impl ImageEngine {
@@ -413,13 +416,61 @@ impl ImageEngine {
 
         Ok(Self {
             model_type,
-            text_encoder,
+            text_encoder: Some(text_encoder),
             transformer,
             vae_decoder,
             vae_encoder,
             tokenizer,
             vae_config,
+            model_dir: Some(model_dir.to_path_buf()),
+            is_quantized_flux,
         })
+    }
+
+    /// Reload text encoder (called after it was dropped to free memory)
+    fn reload_text_encoder(&mut self) -> Result<()> {
+        let model_dir = self.model_dir.as_ref()
+            .ok_or_else(|| eyre::eyre!("No model_dir stored for text encoder reload"))?;
+
+        tracing::info!("Reloading text encoder from {:?}...", model_dir);
+        let qwen3_config = Qwen3Config {
+            hidden_size: 2560,
+            num_hidden_layers: 36,
+            intermediate_size: 9728,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            rms_norm_eps: 1e-6,
+            vocab_size: 151936,
+            max_position_embeddings: 40960,
+            rope_theta: 1000000.0,
+            head_dim: 128,
+        };
+
+        let mut encoder = Qwen3TextEncoder::new(qwen3_config)?;
+        let te1 = model_dir.join("text_encoder/model-00001-of-00002.safetensors");
+        let te2 = model_dir.join("text_encoder/model-00002-of-00002.safetensors");
+        let mut all_weights = HashMap::new();
+        for path in &[te1, te2] {
+            let weights = load_safetensors(path)?;
+            all_weights.extend(weights);
+        }
+        let weights = sanitize_qwen3_weights(all_weights);
+        // Cast to f16 for memory savings (quantized FLUX path)
+        let weights: HashMap<String, Array> = weights
+            .into_iter()
+            .map(|(k, v)| {
+                let v16 = v.as_dtype(mlx_rs::Dtype::Float16).unwrap_or(v);
+                (k, v16)
+            })
+            .collect();
+        let weights_rc: HashMap<Rc<str>, Array> = weights
+            .into_iter()
+            .map(|(k, v)| (Rc::from(k.as_str()), v))
+            .collect();
+        encoder.update_flattened(weights_rc);
+        self.text_encoder = Some(TextEncoderVariant::Standard(encoder));
+        tracing::info!("Text encoder reloaded");
+        Ok(())
     }
 
     /// Generate images from a text prompt (with optional reference image for img2img)
@@ -612,9 +663,12 @@ impl ImageEngine {
             0
         };
 
-        // Encode text
+        // Encode text (reload text encoder if it was dropped for memory savings)
+        if self.text_encoder.is_none() {
+            self.reload_text_encoder()?;
+        }
         tracing::info!("Encoding text prompt...");
-        let txt_embed = match &mut self.text_encoder {
+        let txt_embed = match self.text_encoder.as_mut().unwrap() {
             TextEncoderVariant::Standard(enc) => enc.encode(&input_ids, Some(&attention_mask))?,
             TextEncoderVariant::Quantized(enc) => enc.encode_flux(&input_ids, Some(&attention_mask))?,
         };
@@ -623,6 +677,13 @@ impl ImageEngine {
         tracing::info!("Evaluating text embeddings...");
         txt_embed.eval()?;
         tracing::info!("Text encoding complete, shape: {:?}", txt_embed.shape());
+
+        // For quantized FLUX: drop text encoder to free ~7.5 GB before denoising
+        if self.is_quantized_flux {
+            tracing::info!("Dropping text encoder to free memory for denoising...");
+            self.text_encoder = None;
+            unsafe { mlx_sys::mlx_clear_cache(); }
+        }
 
         // Setup latent dimensions
         let latent_height = height as i32 / 8;
@@ -738,8 +799,11 @@ impl ImageEngine {
 
         // Tokenize and encode text
         let (input_ids, attention_mask) = self.tokenize_prompt(prompt)?;
+        if self.text_encoder.is_none() {
+            self.reload_text_encoder()?;
+        }
         tracing::debug!("Encoding text prompt (Z-Image style)...");
-        let txt_embed = match &mut self.text_encoder {
+        let txt_embed = match self.text_encoder.as_mut().unwrap() {
             TextEncoderVariant::Standard(enc) => enc.encode_zimage(&input_ids, Some(&attention_mask))?,
             TextEncoderVariant::Quantized(enc) => enc.encode_zimage(&input_ids, Some(&attention_mask))?,
         };
