@@ -275,9 +275,16 @@ impl ImageEngine {
                 }
                 let weights = sanitize_qwen3_weights(all_weights);
                 if is_quantized_flux {
-                    // Quantized FLUX: keep text encoder in bf16 to save memory
-                    // (~7.5 GB bf16 vs ~15 GB f32)
-                    tracing::info!("Quantized FLUX: keeping text encoder in bf16 to save memory");
+                    // Quantized FLUX: cast text encoder to f16 to save memory
+                    // (~7.5 GB f16 vs ~15 GB f32, Metal-compatible unlike bf16)
+                    tracing::info!("Quantized FLUX: casting text encoder to f16 to save memory");
+                    let weights: HashMap<String, Array> = weights
+                        .into_iter()
+                        .map(|(k, v)| {
+                            let v16 = v.as_dtype(mlx_rs::Dtype::Float16).unwrap_or(v);
+                            (k, v16)
+                        })
+                        .collect();
                     let weights_rc: HashMap<Rc<str>, Array> = weights
                         .into_iter()
                         .map(|(k, v)| (Rc::from(k.as_str()), v))
