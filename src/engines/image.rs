@@ -179,6 +179,7 @@ impl ImageEngine {
                 tracing::info!("Loading FLUX.2-klein from local path: {:?}", model_dir);
 
                 let trans = model_dir.join("transformer/diffusion_pytorch_model.safetensors");
+                let trans = if trans.exists() { trans } else { model_dir.join("transformer/quantized_8bit.safetensors") };
                 let trans = if trans.exists() { trans } else { model_dir.join("flux.safetensors") };
                 if !trans.exists() {
                     return Err(eyre::eyre!("FLUX transformer not found at {:?}", trans));
