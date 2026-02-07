@@ -613,13 +613,16 @@ impl ImageEngine {
         };
 
         // Encode text
-        tracing::debug!("Encoding text prompt...");
+        tracing::info!("Encoding text prompt...");
         let txt_embed = match &mut self.text_encoder {
             TextEncoderVariant::Standard(enc) => enc.encode(&input_ids, Some(&attention_mask))?,
             TextEncoderVariant::Quantized(enc) => enc.encode_flux(&input_ids, Some(&attention_mask))?,
         };
+        tracing::info!("Text encoder forward pass done, casting to f32...");
         let txt_embed = txt_embed.as_dtype(mlx_rs::Dtype::Float32)?;
+        tracing::info!("Evaluating text embeddings...");
         txt_embed.eval()?;
+        tracing::info!("Text encoding complete, shape: {:?}", txt_embed.shape());
 
         // Setup latent dimensions
         let latent_height = height as i32 / 8;
