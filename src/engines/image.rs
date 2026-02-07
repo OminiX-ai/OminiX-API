@@ -277,37 +277,20 @@ impl ImageEngine {
                     all_weights.extend(weights);
                 }
                 let weights = sanitize_qwen3_weights(all_weights);
-                if is_quantized_flux {
-                    // Quantized FLUX: cast text encoder to f16 to save memory
-                    // (~7.5 GB f16 vs ~15 GB f32, Metal-compatible unlike bf16)
-                    tracing::info!("Quantized FLUX: casting text encoder to f16 to save memory");
-                    let weights: HashMap<String, Array> = weights
-                        .into_iter()
-                        .map(|(k, v)| {
-                            let v16 = v.as_dtype(mlx_rs::Dtype::Float16).unwrap_or(v);
-                            (k, v16)
-                        })
-                        .collect();
-                    let weights_rc: HashMap<Rc<str>, Array> = weights
-                        .into_iter()
-                        .map(|(k, v)| (Rc::from(k.as_str()), v))
-                        .collect();
-                    encoder.update_flattened(weights_rc);
-                } else {
-                    // Standard FLUX: cast to f32 for Metal compatibility
-                    let weights: HashMap<String, Array> = weights
-                        .into_iter()
-                        .map(|(k, v)| {
-                            let v32 = v.as_type::<f32>().unwrap_or(v);
-                            (k, v32)
-                        })
-                        .collect();
-                    let weights_rc: HashMap<Rc<str>, Array> = weights
-                        .into_iter()
-                        .map(|(k, v)| (Rc::from(k.as_str()), v))
-                        .collect();
-                    encoder.update_flattened(weights_rc);
-                }
+                // Cast weights to f32 — bf16 causes Metal crash, f16 causes NaN
+                // For quantized FLUX, text encoder is dropped after encoding to free ~15 GB
+                let weights: HashMap<String, Array> = weights
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let v32 = v.as_type::<f32>().unwrap_or(v);
+                        (k, v32)
+                    })
+                    .collect();
+                let weights_rc: HashMap<Rc<str>, Array> = weights
+                    .into_iter()
+                    .map(|(k, v)| (Rc::from(k.as_str()), v))
+                    .collect();
+                encoder.update_flattened(weights_rc);
                 TextEncoderVariant::Standard(encoder)
             }
             ImageModelType::ZImageTurbo => {
@@ -455,12 +438,12 @@ impl ImageEngine {
             all_weights.extend(weights);
         }
         let weights = sanitize_qwen3_weights(all_weights);
-        // Cast to f16 for memory savings (quantized FLUX path)
+        // Cast to f32 (bf16 crashes Metal, f16 causes NaN in forward pass)
         let weights: HashMap<String, Array> = weights
             .into_iter()
             .map(|(k, v)| {
-                let v16 = v.as_dtype(mlx_rs::Dtype::Float16).unwrap_or(v);
-                (k, v16)
+                let v32 = v.as_type::<f32>().unwrap_or(v);
+                (k, v32)
             })
             .collect();
         let weights_rc: HashMap<Rc<str>, Array> = weights
