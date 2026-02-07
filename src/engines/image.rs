@@ -662,11 +662,24 @@ impl ImageEngine {
         };
 
         // Denoising loop
+        // Log memory before denoising
+        unsafe {
+            let mut active: usize = 0;
+            let mut cache: usize = 0;
+            mlx_sys::mlx_get_active_memory(&mut active);
+            mlx_sys::mlx_get_cache_memory(&mut cache);
+            tracing::info!("MLX memory before denoising: active={:.1}GB cache={:.1}GB",
+                active as f64 / 1e9, cache as f64 / 1e9);
+        }
+
         tracing::info!("Running FLUX denoising ({} steps from step {})...", num_steps as usize - start_step, start_step);
         for step in start_step..num_steps as usize {
             let t_curr = timesteps[step];
             let t_next = timesteps[step + 1];
             let t_arr = Array::from_slice(&[t_curr * 1000.0], &[batch_size]);
+
+            // Clear MLX cache between steps to free GPU memory
+            unsafe { mlx_sys::mlx_clear_cache(); }
 
             tracing::info!("  Step {}/{}: forward pass...", step + 1, num_steps);
             let v_pred = match &mut self.transformer {
@@ -681,7 +694,14 @@ impl ImageEngine {
             tracing::info!("  Step {}/{}: evaluating...", step + 1, num_steps);
             latent.eval()?;
 
-            tracing::info!("  Step {}/{}: t={:.3}->{:.3} done", step + 1, num_steps, t_curr, t_next);
+            unsafe {
+                let mut active: usize = 0;
+                let mut cache: usize = 0;
+                mlx_sys::mlx_get_active_memory(&mut active);
+                mlx_sys::mlx_get_cache_memory(&mut cache);
+                tracing::info!("  Step {}/{}: t={:.3}->{:.3} done (active={:.1}GB cache={:.1}GB)",
+                    step + 1, num_steps, t_curr, t_next, active as f64 / 1e9, cache as f64 / 1e9);
+            }
         }
 
         // Decode latents to image
