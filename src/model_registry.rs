@@ -59,7 +59,7 @@ pub struct CatalogModel {
     pub status: String,
 }
 
-/// Get the 6 default models (ported from OminiX-Studio)
+/// Get the 7 default models (ported from OminiX-Studio + 8-bit FLUX variant)
 pub fn get_default_models() -> Vec<CatalogModel> {
     vec![
         CatalogModel {
@@ -85,6 +85,31 @@ pub fn get_default_models() -> Vec<CatalogModel> {
             runtime: CatalogRuntime {
                 memory_required_mb: 16384,
                 quantization: Some("bf16".into()),
+                inference_engine: Some("mlx".into()),
+            },
+            status: "not_downloaded".to_string(),
+        },
+        CatalogModel {
+            id: "flux-klein-4b-8bit".to_string(),
+            name: "FLUX.2-klein-4B 8-bit".to_string(),
+            description: "4B parameter FLUX image generation model, 8-bit quantized. Lower memory usage (~12 GB) while maintaining quality.".to_string(),
+            category: ModelCategory::Image,
+            tags: vec!["image-generation".into(), "flux".into(), "quantized".into(), "8bit".into(), "mlx".into()],
+            source: CatalogSource {
+                primary_url: "https://huggingface.co/moxin-org/FLUX.2-klein-4B-8bit-mlx".to_string(),
+                backup_urls: vec![],
+                source_type: SourceType::Huggingface,
+                repo_id: Some("moxin-org/FLUX.2-klein-4B-8bit-mlx".to_string()),
+                revision: "main".to_string(),
+            },
+            storage: CatalogStorage {
+                local_path: "~/.cache/huggingface/hub/models--moxin-org--FLUX.2-klein-4B-8bit-mlx".to_string(),
+                total_size_bytes: 12_584_580_985,
+                total_size_display: "~12 GB".to_string(),
+            },
+            runtime: CatalogRuntime {
+                memory_required_mb: 14336,
+                quantization: Some("8bit".into()),
                 inference_engine: Some("mlx".into()),
             },
             status: "not_downloaded".to_string(),
