@@ -356,28 +356,58 @@ impl LlmEngine {
 
 /// Parse Qwen3 <tool_call> blocks from model output
 ///
-/// Qwen3 outputs tool calls as:
-/// ```text
-/// <tool_call>
-/// {"name": "function_name", "arguments": {"key": "value"}}
-/// </tool_call>
-/// ```
+/// Handles multiple Qwen3 output variations:
+/// - Standard: `<tool_call>{"name": ..., "arguments": ...}</tool_call>`
+/// - 8-bit quirk: `<tool_call>{"function": ..., "parameters": ...}<tool_call>` (missing /)
+/// - Strips `<think>...</think>` blocks from remaining content
 fn parse_tool_calls(content: &str) -> (String, Vec<ToolCall>, String) {
     let mut tool_calls = Vec::new();
     let mut remaining = content.to_string();
 
-    // Find all <tool_call>...</tool_call> blocks
+    // Strip <think>...</think> blocks first
+    while let Some(start) = remaining.find("<think>") {
+        if let Some(end) = remaining.find("</think>") {
+            let end_abs = end + "</think>".len();
+            remaining = format!("{}{}", &remaining[..start], &remaining[end_abs..]);
+        } else {
+            // Unclosed think block — remove from start to end
+            remaining = remaining[..start].to_string();
+            break;
+        }
+    }
+
+    // Find all <tool_call>...</tool_call> or <tool_call>...<tool_call> blocks
     while let Some(start) = remaining.find("<tool_call>") {
-        if let Some(end) = remaining[start..].find("</tool_call>") {
-            let end_abs = start + end + "</tool_call>".len();
-            let inner = remaining[start + "<tool_call>".len()..start + end].trim();
+        let after_open = start + "<tool_call>".len();
 
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(inner) {
-                let name = parsed["name"].as_str().unwrap_or("").to_string();
-                let arguments = parsed.get("arguments")
-                    .map(|a| serde_json::to_string(a).unwrap_or_default())
-                    .unwrap_or_else(|| "{}".to_string());
+        // Try </tool_call> first, then <tool_call> as closing tag (8-bit model quirk)
+        let (end_abs, inner) = if let Some(end) = remaining[after_open..].find("</tool_call>") {
+            let end_abs = after_open + end + "</tool_call>".len();
+            let inner = remaining[after_open..after_open + end].trim();
+            (end_abs, inner.to_string())
+        } else if let Some(end) = remaining[after_open..].find("<tool_call>") {
+            // Model used <tool_call> as closing tag too
+            let end_abs = after_open + end + "<tool_call>".len();
+            let inner = remaining[after_open..after_open + end].trim();
+            (end_abs, inner.to_string())
+        } else {
+            // No closing tag — try to extract JSON from remaining content
+            let inner = remaining[after_open..].trim();
+            (remaining.len(), inner.to_string())
+        };
 
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&inner) {
+            // Accept both "name"/"arguments" and "function"/"parameters" key formats
+            let name = parsed["name"].as_str()
+                .or_else(|| parsed["function"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let arguments = parsed.get("arguments")
+                .or_else(|| parsed.get("parameters"))
+                .map(|a| serde_json::to_string(a).unwrap_or_default())
+                .unwrap_or_else(|| "{}".to_string());
+
+            if !name.is_empty() {
                 let id = format!("call_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);
                 tool_calls.push(ToolCall {
                     id,
@@ -385,12 +415,10 @@ fn parse_tool_calls(content: &str) -> (String, Vec<ToolCall>, String) {
                     function: FunctionCall { name, arguments },
                 });
             }
-
-            // Remove the tool_call block from remaining
-            remaining = format!("{}{}", &remaining[..start], &remaining[end_abs..]);
-        } else {
-            break;
         }
+
+        // Remove the tool_call block from remaining
+        remaining = format!("{}{}", &remaining[..start], &remaining[end_abs..]);
     }
 
     let remaining = remaining.trim().to_string();
