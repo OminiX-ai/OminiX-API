@@ -676,7 +676,16 @@ impl ImageEngine {
         let txt_embed = txt_embed.as_dtype(mlx_rs::Dtype::Float32)?;
         tracing::info!("Evaluating text embeddings...");
         txt_embed.eval()?;
-        tracing::info!("Text encoding complete, shape: {:?}", txt_embed.shape());
+        // Log text embedding statistics
+        let te_mean = txt_embed.mean(None)?;
+        let te_min = txt_embed.min(None)?;
+        let te_max = txt_embed.max(None)?;
+        te_mean.eval()?; te_min.eval()?; te_max.eval()?;
+        tracing::info!("Text encoding complete, shape: {:?}, mean={:.4} min={:.4} max={:.4}",
+            txt_embed.shape(),
+            te_mean.as_slice::<f32>()[0],
+            te_min.as_slice::<f32>()[0],
+            te_max.as_slice::<f32>()[0]);
 
         // For quantized FLUX: drop text encoder to free ~7.5 GB before denoising
         if self.is_quantized_flux {
@@ -755,18 +764,28 @@ impl ImageEngine {
             tracing::info!("  Step {}/{}: evaluating...", step + 1, num_steps);
             latent.eval()?;
 
+            // Log latent statistics
+            let lat_mean = latent.mean(None)?;
+            let lat_min = latent.min(None)?;
+            let lat_max = latent.max(None)?;
+            lat_mean.eval()?; lat_min.eval()?; lat_max.eval()?;
+            let mean_val: f32 = lat_mean.as_slice()[0];
+            let min_val: f32 = lat_min.as_slice()[0];
+            let max_val: f32 = lat_max.as_slice()[0];
+
             unsafe {
                 let mut active: usize = 0;
                 let mut cache: usize = 0;
                 mlx_sys::mlx_get_active_memory(&mut active);
                 mlx_sys::mlx_get_cache_memory(&mut cache);
-                tracing::info!("  Step {}/{}: t={:.3}->{:.3} done (active={:.1}GB cache={:.1}GB)",
-                    step + 1, num_steps, t_curr, t_next, active as f64 / 1e9, cache as f64 / 1e9);
+                tracing::info!("  Step {}/{}: t={:.3}->{:.3} done (latent: mean={:.4} min={:.4} max={:.4}) (active={:.1}GB cache={:.1}GB)",
+                    step + 1, num_steps, t_curr, t_next, mean_val, min_val, max_val,
+                    active as f64 / 1e9, cache as f64 / 1e9);
             }
         }
 
         // Decode latents to image
-        tracing::debug!("Decoding latents...");
+        tracing::info!("Decoding latents...");
         let latent = latent.reshape(&[batch_size, patch_h, patch_w, z_channels, patch_size, patch_size])?;
         let latent = latent.transpose_axes(&[0, 1, 4, 2, 5, 3])?;
         let vae_height = patch_h * patch_size;
@@ -775,6 +794,16 @@ impl ImageEngine {
 
         let image = self.vae_decoder.forward(&latent_for_vae)?;
         image.eval()?;
+
+        // Log VAE output statistics
+        let img_mean = image.mean(None)?;
+        let img_min = image.min(None)?;
+        let img_max = image.max(None)?;
+        img_mean.eval()?; img_min.eval()?; img_max.eval()?;
+        let mean_v: f32 = img_mean.as_slice()[0];
+        let min_v: f32 = img_min.as_slice()[0];
+        let max_v: f32 = img_max.as_slice()[0];
+        tracing::info!("VAE output: shape={:?} mean={:.4} min={:.4} max={:.4}", image.shape(), mean_v, min_v, max_v);
 
         self.vae_to_png_flux(&image)
     }
