@@ -636,9 +636,11 @@ impl ImageEngine {
         let max_seq_len = 512i32;
 
         // Position IDs and RoPE
+        tracing::info!("Computing RoPE...");
         let txt_ids = create_txt_ids(batch_size, max_seq_len)?;
         let img_ids = create_img_ids(batch_size, patch_h, patch_w)?;
         let (rope_cos, rope_sin) = FluxKlein::compute_rope(&txt_ids, &img_ids)?;
+        tracing::info!("RoPE computed");
 
         let timesteps = flux_official_schedule(img_seq_len, num_steps);
 
@@ -660,12 +662,13 @@ impl ImageEngine {
         };
 
         // Denoising loop
-        tracing::debug!("Running FLUX denoising ({} steps from step {})...", num_steps as usize - start_step, start_step);
+        tracing::info!("Running FLUX denoising ({} steps from step {})...", num_steps as usize - start_step, start_step);
         for step in start_step..num_steps as usize {
             let t_curr = timesteps[step];
             let t_next = timesteps[step + 1];
             let t_arr = Array::from_slice(&[t_curr * 1000.0], &[batch_size]);
 
+            tracing::info!("  Step {}/{}: forward pass...", step + 1, num_steps);
             let v_pred = match &mut self.transformer {
                 TransformerVariant::Flux(t, _) => t.forward_with_rope(&latent, &txt_embed, &t_arr, &rope_cos, &rope_sin)?,
                 TransformerVariant::FluxQuantized(t, _) => t.forward_with_rope(&latent, &txt_embed, &t_arr, &rope_cos, &rope_sin)?,
@@ -675,9 +678,10 @@ impl ImageEngine {
             let dt = t_next - t_curr;
             let scaled_v = ops::multiply(&v_pred, &Array::from_slice(&[dt], &[1]))?;
             latent = ops::add(&latent, &scaled_v)?;
+            tracing::info!("  Step {}/{}: evaluating...", step + 1, num_steps);
             latent.eval()?;
 
-            tracing::debug!("  Step {}/{}: t={:.3}->{:.3}", step + 1, num_steps, t_curr, t_next);
+            tracing::info!("  Step {}/{}: t={:.3}->{:.3} done", step + 1, num_steps, t_curr, t_next);
         }
 
         // Decode latents to image
