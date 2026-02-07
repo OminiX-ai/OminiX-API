@@ -396,45 +396,7 @@ fn parse_tool_calls(content: &str) -> (String, Vec<ToolCall>, String) {
             (remaining.len(), inner.to_string())
         };
 
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&inner) {
-            // Accept multiple key formats from Qwen3 output variants:
-            // Standard: {"name": "fn", "arguments": {...}}
-            // Variant1: {"function": "fn", "parameters": {...}}
-            // Variant2: {"tool": "fn", "params": {...}}
-            // OpenAI-wrapped: {"type": "function", "function": {"name": "fn", "arguments": ...}}
-            let (name, arguments) = if let Some(n) = parsed["name"].as_str() {
-                // Standard format
-                let args = parsed.get("arguments")
-                    .or_else(|| parsed.get("parameters"))
-                    .map(|a| if a.is_string() { a.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(a).unwrap_or_default() })
-                    .unwrap_or_else(|| "{}".to_string());
-                (n.to_string(), args)
-            } else if let Some(n) = parsed["function"].as_str() {
-                // "function"/"parameters" variant (common with 8-bit models)
-                let args = parsed.get("parameters")
-                    .or_else(|| parsed.get("arguments"))
-                    .map(|a| if a.is_string() { a.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(a).unwrap_or_default() })
-                    .unwrap_or_else(|| "{}".to_string());
-                (n.to_string(), args)
-            } else if let Some(n) = parsed["tool"].as_str() {
-                // "tool"/"params" variant
-                let args = parsed.get("params")
-                    .or_else(|| parsed.get("parameters"))
-                    .or_else(|| parsed.get("arguments"))
-                    .map(|a| if a.is_string() { a.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(a).unwrap_or_default() })
-                    .unwrap_or_else(|| "{}".to_string());
-                (n.to_string(), args)
-            } else if let Some(func_obj) = parsed.get("function").and_then(|f| f.as_object()) {
-                // OpenAI-wrapped: {"type": "function", "function": {"name": "...", "arguments": ...}}
-                let n = func_obj.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                let args = func_obj.get("arguments")
-                    .map(|a| if a.is_string() { a.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(a).unwrap_or_default() })
-                    .unwrap_or_else(|| "{}".to_string());
-                (n, args)
-            } else {
-                (String::new(), String::new())
-            };
-
+        if let Some((name, arguments)) = parse_tool_call_inner(&inner) {
             if !name.is_empty() {
                 let id = format!("call_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);
                 tool_calls.push(ToolCall {
@@ -455,6 +417,167 @@ fn parse_tool_calls(content: &str) -> (String, Vec<ToolCall>, String) {
         (content.to_string(), vec![], "stop".to_string())
     } else {
         (remaining, tool_calls, "tool_calls".to_string())
+    }
+}
+
+/// Parse the inner content of a <tool_call> block into (name, arguments_json).
+/// Handles multiple formats:
+/// 1. JSON: {"name": "fn", "arguments": {...}} (and variants)
+/// 2. Python-like: function_name(key="value", key2=123, key3=[...])
+fn parse_tool_call_inner(inner: &str) -> Option<(String, String)> {
+    let inner = inner.trim();
+
+    // Try JSON first
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(inner) {
+        // Standard: {"name": "fn", "arguments": {...}}
+        // Variant: {"function": "fn", "parameters": {...}}
+        // Variant: {"tool": "fn", "params": {...}}
+        // OpenAI-wrapped: {"type": "function", "function": {"name": ..., "arguments": ...}}
+        let (name, args) = if let Some(n) = parsed["name"].as_str() {
+            let a = parsed.get("arguments").or_else(|| parsed.get("parameters"))
+                .map(|v| if v.is_string() { v.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(v).unwrap_or_default() })
+                .unwrap_or_else(|| "{}".to_string());
+            (n.to_string(), a)
+        } else if let Some(n) = parsed["function"].as_str() {
+            let a = parsed.get("parameters").or_else(|| parsed.get("arguments"))
+                .map(|v| if v.is_string() { v.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(v).unwrap_or_default() })
+                .unwrap_or_else(|| "{}".to_string());
+            (n.to_string(), a)
+        } else if let Some(n) = parsed["tool"].as_str() {
+            let a = parsed.get("params").or_else(|| parsed.get("parameters")).or_else(|| parsed.get("arguments"))
+                .map(|v| if v.is_string() { v.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(v).unwrap_or_default() })
+                .unwrap_or_else(|| "{}".to_string());
+            (n.to_string(), a)
+        } else if let Some(func_obj) = parsed.get("function").and_then(|f| f.as_object()) {
+            let n = func_obj.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            let a = func_obj.get("arguments")
+                .map(|v| if v.is_string() { v.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(v).unwrap_or_default() })
+                .unwrap_or_else(|| "{}".to_string());
+            (n, a)
+        } else {
+            return None;
+        };
+        if !name.is_empty() { return Some((name, args)); }
+    }
+
+    // Fallback: Python-like function call syntax
+    // Pattern: function_name(key1="value1", key2=123, key3=["a","b"], key4=true)
+    if let Some(paren_pos) = inner.find('(') {
+        let name = inner[..paren_pos].trim().to_string();
+        if name.chars().all(|c| c.is_alphanumeric() || c == '_') && !name.is_empty() {
+            let args_str = inner[paren_pos + 1..].trim_end_matches(')').trim();
+            if args_str.is_empty() {
+                return Some((name, "{}".to_string()));
+            }
+            // Parse key=value pairs into a JSON object
+            if let Some(args_json) = parse_kwargs_to_json(args_str) {
+                return Some((name, args_json));
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse Python-like keyword arguments into a JSON string.
+/// Input: `id="title", text="My Books", style="h1"`
+/// Output: `{"id":"title","text":"My Books","style":"h1"}`
+fn parse_kwargs_to_json(input: &str) -> Option<String> {
+    let mut result = serde_json::Map::new();
+    let mut pos = 0;
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+
+    while pos < len {
+        // Skip whitespace and commas
+        while pos < len && (chars[pos] == ' ' || chars[pos] == ',' || chars[pos] == '\n' || chars[pos] == '\r') {
+            pos += 1;
+        }
+        if pos >= len { break; }
+
+        // Read key
+        let key_start = pos;
+        while pos < len && chars[pos] != '=' {
+            pos += 1;
+        }
+        if pos >= len { break; }
+        let key = input[key_start..pos].trim().to_string();
+        pos += 1; // skip '='
+
+        // Skip whitespace
+        while pos < len && chars[pos] == ' ' { pos += 1; }
+        if pos >= len { break; }
+
+        // Read value
+        let value: serde_json::Value = if chars[pos] == '"' || chars[pos] == '\'' {
+            // String value
+            let quote = chars[pos];
+            pos += 1;
+            let val_start = pos;
+            while pos < len && chars[pos] != quote {
+                if chars[pos] == '\\' { pos += 1; } // skip escaped chars
+                pos += 1;
+            }
+            let val = input[val_start..pos].to_string();
+            if pos < len { pos += 1; } // skip closing quote
+            serde_json::Value::String(val)
+        } else if chars[pos] == '[' {
+            // Array value - find matching ]
+            let val_start = pos;
+            let mut depth = 0;
+            while pos < len {
+                match chars[pos] {
+                    '[' => depth += 1,
+                    ']' => { depth -= 1; if depth == 0 { pos += 1; break; } },
+                    '"' => { pos += 1; while pos < len && chars[pos] != '"' { if chars[pos] == '\\' { pos += 1; } pos += 1; } },
+                    _ => {},
+                }
+                pos += 1;
+            }
+            let val_str = &input[val_start..pos];
+            serde_json::from_str(val_str).unwrap_or(serde_json::Value::String(val_str.to_string()))
+        } else if chars[pos] == '{' {
+            // Object value - find matching }
+            let val_start = pos;
+            let mut depth = 0;
+            while pos < len {
+                match chars[pos] {
+                    '{' => depth += 1,
+                    '}' => { depth -= 1; if depth == 0 { pos += 1; break; } },
+                    '"' => { pos += 1; while pos < len && chars[pos] != '"' { if chars[pos] == '\\' { pos += 1; } pos += 1; } },
+                    _ => {},
+                }
+                pos += 1;
+            }
+            let val_str = &input[val_start..pos];
+            serde_json::from_str(val_str).unwrap_or(serde_json::Value::String(val_str.to_string()))
+        } else {
+            // Number, boolean, or other literal
+            let val_start = pos;
+            while pos < len && chars[pos] != ',' && chars[pos] != ')' && chars[pos] != '\n' {
+                pos += 1;
+            }
+            let val_str = input[val_start..pos].trim();
+            if val_str == "true" || val_str == "True" {
+                serde_json::Value::Bool(true)
+            } else if val_str == "false" || val_str == "False" {
+                serde_json::Value::Bool(false)
+            } else if let Ok(n) = val_str.parse::<i64>() {
+                serde_json::Value::Number(n.into())
+            } else if let Ok(n) = val_str.parse::<f64>() {
+                serde_json::json!(n).as_number().map(|n| serde_json::Value::Number(n.clone())).unwrap_or(serde_json::Value::String(val_str.to_string()))
+            } else {
+                serde_json::Value::String(val_str.to_string())
+            }
+        };
+
+        result.insert(key, value);
+    }
+
+    if result.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&serde_json::Value::Object(result)).unwrap_or_else(|_| "{}".to_string()))
     }
 }
 
