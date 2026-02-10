@@ -1,6 +1,12 @@
+<div align="center">
+<img width="500" alt="OminiX-API" src="https://github.com/user-attachments/assets/3547f768-8bcb-4319-a7d4-e73a8f47e28d" />
+
+
 # OminiX-API
 
 OpenAI-compatible API server for OminiX-MLX models on Apple Silicon.
+
+</div>
 
 ## Features
 
