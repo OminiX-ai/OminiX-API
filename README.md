@@ -1,6 +1,8 @@
 <div align="center">
-<img width="500" alt="OminiX-API" src="https://github.com/user-attachments/assets/3547f768-8bcb-4319-a7d4-e73a8f47e28d" />
-
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/aecccf16-ddb0-4585-aa6c-948085ff3de1">
+  <img width="500" alt="OminiX-MLX" src="[https://github.com/user-attachments/assets/b168cf1c-8e2f-4969-bffa-b57ee33950c0](https://github.com/user-attachments/assets/3547f768-8bcb-4319-a7d4-e73a8f47e28d)" />
+</picture>
 
 # OminiX-API
 
