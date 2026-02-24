@@ -59,7 +59,7 @@ pub struct CatalogModel {
     pub status: String,
 }
 
-/// Get the 7 default models (ported from OminiX-Studio + 8-bit FLUX variant)
+/// Get the default models (ported from OminiX-Studio + 8-bit FLUX variant + Qwen3-ASR)
 pub fn get_default_models() -> Vec<CatalogModel> {
     vec![
         CatalogModel {
@@ -236,6 +236,56 @@ pub fn get_default_models() -> Vec<CatalogModel> {
             },
             runtime: CatalogRuntime {
                 memory_required_mb: 8192,
+                quantization: Some("8bit".into()),
+                inference_engine: Some("mlx".into()),
+            },
+            status: "not_downloaded".to_string(),
+        },
+        CatalogModel {
+            id: "qwen3-asr-1.7b".to_string(),
+            name: "Qwen3-ASR 1.7B 8-bit".to_string(),
+            description: "Qwen3-ASR 1.7B encoder-decoder ASR. 30+ languages, ~30x realtime on Apple Silicon. Best accuracy among Qwen3-ASR variants.".to_string(),
+            category: ModelCategory::Asr,
+            tags: vec!["asr".into(), "multilingual".into(), "speech-recognition".into(), "qwen3".into(), "8bit".into()],
+            source: CatalogSource {
+                primary_url: "https://huggingface.co/mlx-community/Qwen3-ASR-1.7B-8bit".to_string(),
+                backup_urls: vec![],
+                source_type: SourceType::Huggingface,
+                repo_id: Some("mlx-community/Qwen3-ASR-1.7B-8bit".to_string()),
+                revision: "main".to_string(),
+            },
+            storage: CatalogStorage {
+                local_path: "~/.OminiX/models/qwen3-asr-1.7b".to_string(),
+                total_size_bytes: 2_641_100_800,
+                total_size_display: "~2.5 GB".to_string(),
+            },
+            runtime: CatalogRuntime {
+                memory_required_mb: 4096,
+                quantization: Some("8bit".into()),
+                inference_engine: Some("mlx".into()),
+            },
+            status: "not_downloaded".to_string(),
+        },
+        CatalogModel {
+            id: "qwen3-asr-0.6b".to_string(),
+            name: "Qwen3-ASR 0.6B 8-bit".to_string(),
+            description: "Qwen3-ASR 0.6B encoder-decoder ASR. 30+ languages, compact model (~1 GB). Faster download, slightly lower accuracy.".to_string(),
+            category: ModelCategory::Asr,
+            tags: vec!["asr".into(), "multilingual".into(), "speech-recognition".into(), "qwen3".into(), "8bit".into(), "compact".into()],
+            source: CatalogSource {
+                primary_url: "https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-8bit".to_string(),
+                backup_urls: vec![],
+                source_type: SourceType::Huggingface,
+                repo_id: Some("mlx-community/Qwen3-ASR-0.6B-8bit".to_string()),
+                revision: "main".to_string(),
+            },
+            storage: CatalogStorage {
+                local_path: "~/.OminiX/models/qwen3-asr-0.6b".to_string(),
+                total_size_bytes: 1_085_276_160,
+                total_size_display: "~1.0 GB".to_string(),
+            },
+            runtime: CatalogRuntime {
+                memory_required_mb: 2048,
                 quantization: Some("8bit".into()),
                 inference_engine: Some("mlx".into()),
             },

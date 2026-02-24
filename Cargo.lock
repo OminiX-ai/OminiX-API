@@ -1178,7 +1178,9 @@ version = "0.1.0"
 dependencies = [
  "mlx-rs",
  "mlx-rs-core",
+ "ort",
  "rustfft",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -1187,6 +1189,7 @@ name = "funasr-qwen4b-mlx"
 version = "0.1.0"
 dependencies = [
  "dirs 5.0.1",
+ "funasr-mlx",
  "hound",
  "mlx-rs",
  "mlx-rs-core",
@@ -2882,6 +2885,7 @@ dependencies = [
  "mlx-rs-core",
  "mlx-sys",
  "moxin-vlm-mlx",
+ "qwen3-asr-mlx",
  "qwen3-mlx",
  "reqwest",
  "salvo",
@@ -3335,6 +3339,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21b2ebcf727b7760c461f091f9f0f539b77b8e87f2fd88131e7f1b433b3cece4"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "qwen3-asr-mlx"
+version = "0.1.0"
+dependencies = [
+ "dirs 5.0.1",
+ "hound",
+ "mlx-rs",
+ "mlx-rs-core",
+ "mlx-sys",
+ "rubato 0.16.2",
+ "rustfft",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers 0.21.4",
 ]
 
 [[package]]

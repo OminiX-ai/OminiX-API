@@ -1,8 +1,9 @@
 //! ASR (Automatic Speech Recognition) engine
 //!
-//! Supports two backends:
+//! Supports three backends:
 //! - **Paraformer**: Fast CTC-based model (funasr-mlx)
 //! - **SenseVoice + Qwen3-4B**: LLM-based multimodal ASR (funasr-qwen4b-mlx)
+//! - **Qwen3-ASR**: Encoder-decoder ASR with 30+ languages (qwen3-asr-mlx)
 //!
 //! Backend is auto-detected from the model directory contents.
 
@@ -25,6 +26,10 @@ enum AsrBackend {
     SenseVoiceQwen {
         model: funasr_qwen4b_mlx::FunASRQwen4B,
     },
+    /// Qwen3-ASR encoder-decoder (0.6B / 1.7B, 30+ languages)
+    Qwen3Asr {
+        model: qwen3_asr_mlx::Qwen3ASR,
+    },
 }
 
 /// ASR inference engine (auto-detects backend from model directory)
@@ -36,14 +41,18 @@ impl AsrEngine {
     /// Create a new ASR engine
     ///
     /// Auto-detects backend:
+    /// - If config.json has `model_type == "qwen3_asr"` → Qwen3-ASR
     /// - If directory contains `adaptor*.safetensors` → SenseVoice + Qwen3-4B
-    /// - If directory contains `paraformer.safetensors` → Paraformer
+    /// - Otherwise → Paraformer
     pub fn new(model_dir: &str) -> Result<Self> {
         // Resolve model directory
         let actual_model_dir = resolve_model_dir(model_dir)?;
 
         // Auto-detect backend
-        if has_sensevoice_qwen_files(&actual_model_dir) {
+        if is_qwen3_asr_model(&actual_model_dir) {
+            tracing::info!("Detected Qwen3-ASR model");
+            Self::new_qwen3_asr(&actual_model_dir)
+        } else if has_sensevoice_qwen_files(&actual_model_dir) {
             tracing::info!("Detected SenseVoice + Qwen3-4B ASR model");
             Self::new_sensevoice_qwen(&actual_model_dir)
         } else {
@@ -99,6 +108,18 @@ impl AsrEngine {
         })
     }
 
+    /// Load Qwen3-ASR backend
+    fn new_qwen3_asr(model_dir: &Path) -> Result<Self> {
+        let model = qwen3_asr_mlx::Qwen3ASR::load(model_dir)
+            .map_err(|e| eyre::eyre!("Failed to load Qwen3-ASR: {:?}", e))?;
+
+        tracing::info!("Qwen3-ASR loaded from {:?}", model_dir);
+
+        Ok(Self {
+            backend: AsrBackend::Qwen3Asr { model },
+        })
+    }
+
     /// Transcribe audio to text
     pub fn transcribe(&mut self, request: &TranscriptionRequest) -> Result<TranscriptionResponse> {
         let (samples, duration_secs) = decode_audio(request)?;
@@ -122,6 +143,17 @@ impl AsrEngine {
                 Ok(TranscriptionResponse {
                     text,
                     language: request.language.clone().or(Some("zh".to_string())),
+                    duration: Some(duration_secs),
+                })
+            }
+            AsrBackend::Qwen3Asr { model } => {
+                let language = request.language.as_deref().unwrap_or("Chinese");
+                let text = model.transcribe_samples(&samples, language)
+                    .map_err(|e| eyre::eyre!("Qwen3-ASR transcription failed: {:?}", e))?;
+
+                Ok(TranscriptionResponse {
+                    text,
+                    language: Some(language.to_string()),
                     duration: Some(duration_secs),
                 })
             }
@@ -171,6 +203,19 @@ fn decode_audio(request: &TranscriptionRequest) -> Result<(Vec<f32>, f32)> {
     Ok((samples, duration_secs))
 }
 
+/// Check if directory is a Qwen3-ASR model (config.json with model_type "qwen3_asr")
+fn is_qwen3_asr_model(model_dir: &Path) -> bool {
+    let config_path = model_dir.join("config.json");
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(model_type) = config.get("model_type").and_then(|v| v.as_str()) {
+                return model_type == "qwen3_asr";
+            }
+        }
+    }
+    false
+}
+
 /// Check if directory contains SenseVoice + Qwen3-4B model files
 fn has_sensevoice_qwen_files(model_dir: &Path) -> bool {
     // Look for adaptor weights (the distinguishing file)
@@ -195,8 +240,8 @@ fn has_sensevoice_qwen_files(model_dir: &Path) -> bool {
 
 /// Resolve model directory from config or path
 fn resolve_model_dir(model_dir: &str) -> Result<PathBuf> {
-    // Try funasr-qwen4b first (higher quality), then funasr-paraformer
-    for model_id in &["funasr-qwen4b", "funasr-paraformer"] {
+    // Try known ASR models: qwen3-asr (best quality), funasr-qwen4b, funasr-paraformer
+    for model_id in &["qwen3-asr", "qwen3-asr-1.7b", "qwen3-asr-0.6b", "funasr-qwen4b", "funasr-paraformer"] {
         match model_config::check_model(model_id, ModelCategory::Asr) {
             ModelAvailability::Ready { local_path, model_name } => {
                 tracing::info!("Found locally available ASR model: {}", model_name);

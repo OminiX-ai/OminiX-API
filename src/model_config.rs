@@ -723,13 +723,15 @@ fn detect_model_category(model_dir: &PathBuf) -> Option<ModelCategory> {
         return Some(ModelCategory::Asr);
     }
 
-    // ASR variant 2: funasr-style (config.json with model_type="funasr" + weight files)
+    // ASR variant 2: funasr-style or qwen3-asr (config.json with recognized model_type + weight files)
     let config_path = model_dir.join("config.json");
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(model_type) = config.get("model_type").and_then(|v| v.as_str()) {
-                    if model_type.starts_with("funasr") || model_type == "paraformer" {
+                    if model_type.starts_with("funasr") || model_type == "paraformer"
+                        || model_type == "qwen3_asr"
+                    {
                         if has_safetensors_in(model_dir) {
                             return Some(ModelCategory::Asr);
                         }
