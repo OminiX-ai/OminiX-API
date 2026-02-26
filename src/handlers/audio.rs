@@ -8,7 +8,7 @@ use crate::types::{SpeechRequest, TranscriptionRequest};
 use super::helpers::{get_state, send_and_wait};
 
 /// Timeout for audio transcription
-const TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes
+const TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(1800); // 30 minutes
 /// Timeout for text-to-speech
 const TTS_TIMEOUT: Duration = Duration::from_secs(60); // 1 minute
 

@@ -161,12 +161,18 @@ impl AsrEngine {
     }
 }
 
-/// Decode base64 audio from request, parse WAV, resample to 16kHz
+/// Decode audio from request: accepts a local file path (starts with '/') or base64-encoded WAV.
 fn decode_audio(request: &TranscriptionRequest) -> Result<(Vec<f32>, f32)> {
-    let audio_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &request.file,
-    ).context("Failed to decode base64 audio")?;
+    let audio_bytes = if request.file.starts_with('/') {
+        // Local file path — read directly (no size limit, no base64 overhead)
+        std::fs::read(&request.file)
+            .with_context(|| format!("Failed to read audio file: {}", request.file))?
+    } else {
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &request.file,
+        ).context("Failed to decode base64 audio")?
+    };
 
     let cursor = std::io::Cursor::new(audio_bytes);
     let reader = hound::WavReader::new(cursor)
