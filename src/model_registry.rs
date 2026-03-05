@@ -316,6 +316,31 @@ pub fn get_default_models() -> Vec<CatalogModel> {
             },
             status: "not_downloaded".to_string(),
         },
+        CatalogModel {
+            id: "qwen3-tts".to_string(),
+            name: "Qwen3-TTS 1.7B 8-bit".to_string(),
+            description: "Qwen3-TTS 1.7B text-to-speech with voice cloning. Supports Chinese/English, custom voice via reference audio.".to_string(),
+            category: ModelCategory::Tts,
+            tags: vec!["tts".into(), "text-to-speech".into(), "voice-cloning".into(), "qwen3".into(), "8bit".into()],
+            source: CatalogSource {
+                primary_url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit".to_string(),
+                backup_urls: vec![],
+                source_type: SourceType::Huggingface,
+                repo_id: Some("mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit".to_string()),
+                revision: "main".to_string(),
+            },
+            storage: CatalogStorage {
+                local_path: "~/.OminiX/models/qwen3-tts".to_string(),
+                total_size_bytes: 2_500_000_000,
+                total_size_display: "~2.5 GB".to_string(),
+            },
+            runtime: CatalogRuntime {
+                memory_required_mb: 4096,
+                quantization: Some("8bit".into()),
+                inference_engine: Some("mlx".into()),
+            },
+            status: "not_downloaded".to_string(),
+        },
     ]
 }
 
