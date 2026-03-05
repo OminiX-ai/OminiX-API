@@ -147,7 +147,7 @@ impl AsrEngine {
                 })
             }
             AsrBackend::Qwen3Asr { model } => {
-                let language = request.language.as_deref().unwrap_or("Chinese");
+                let language = request.language.as_deref().unwrap_or("auto");
                 let text = model.transcribe_samples(&samples, language)
                     .map_err(|e| eyre::eyre!("Qwen3-ASR transcription failed: {:?}", e))?;
 
