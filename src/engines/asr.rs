@@ -162,7 +162,7 @@ impl AsrEngine {
 }
 
 /// Decode audio from request: accepts a local file path (starts with '/') or base64-encoded audio.
-/// Supports WAV, OGG/Opus, MP3, FLAC, AAC via symphonia.
+/// Supports WAV (via hound) and all other formats (OGG/Opus, MP3, FLAC, AAC) via ffmpeg.
 fn decode_audio(request: &TranscriptionRequest) -> Result<(Vec<f32>, f32)> {
     let audio_bytes = if request.file.starts_with('/') {
         // Local file path — read directly (no size limit, no base64 overhead)
@@ -175,13 +175,13 @@ fn decode_audio(request: &TranscriptionRequest) -> Result<(Vec<f32>, f32)> {
         ).context("Failed to decode base64 audio")?
     };
 
-    // Try WAV first (fast path via hound)
+    // Try WAV first (fast path via hound, no subprocess needed)
     if audio_bytes.len() >= 4 && &audio_bytes[..4] == b"RIFF" {
         return decode_wav(&audio_bytes);
     }
 
-    // Non-WAV: use symphonia for OGG/Opus, MP3, FLAC, etc.
-    decode_with_symphonia(&audio_bytes)
+    // All other formats: use ffmpeg (OGG/Opus, MP3, FLAC, AAC, etc.)
+    decode_with_ffmpeg(&audio_bytes)
 }
 
 /// Fast WAV decoding via hound
@@ -221,88 +221,55 @@ fn decode_wav(audio_bytes: &[u8]) -> Result<(Vec<f32>, f32)> {
     Ok((samples, duration_secs))
 }
 
-/// Decode OGG/Opus, MP3, FLAC, and other formats via symphonia
-fn decode_with_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, f32)> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
+/// Decode any audio format via ffmpeg subprocess (OGG/Opus, MP3, FLAC, AAC, etc.)
+fn decode_with_ffmpeg(audio_bytes: &[u8]) -> Result<(Vec<f32>, f32)> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
-    let cursor = std::io::Cursor::new(audio_bytes.to_vec());
-    let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
+    // ffmpeg: read from stdin, output 16kHz mono s16le PCM to stdout
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-i", "pipe:0",        // read from stdin
+            "-ar", "16000",        // resample to 16kHz
+            "-ac", "1",            // mono
+            "-f", "s16le",         // raw 16-bit little-endian PCM
+            "-acodec", "pcm_s16le",
+            "pipe:1",              // write to stdout
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("ffmpeg not found — install with: brew install ffmpeg")?;
 
-    let hint = Hint::new();
-    let format_opts = FormatOptions::default();
-    let metadata_opts = MetadataOptions::default();
-    let decoder_opts = DecoderOptions::default();
+    // Write audio bytes to ffmpeg stdin
+    child.stdin.take().unwrap().write_all(audio_bytes)
+        .context("Failed to write to ffmpeg stdin")?;
 
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &format_opts, &metadata_opts)
-        .context("Unsupported audio format")?;
+    let output = child.wait_with_output()
+        .context("ffmpeg process failed")?;
 
-    let mut format = probed.format;
-
-    let track = format.default_track()
-        .ok_or_else(|| eyre::eyre!("No audio track found"))?;
-    let track_id = track.id;
-    let sample_rate = track.codec_params.sample_rate
-        .ok_or_else(|| eyre::eyre!("Unknown sample rate"))?;
-
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &decoder_opts)
-        .context("Failed to create audio decoder")?;
-
-    let mut all_samples: Vec<f32> = Vec::new();
-
-    loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(symphonia::core::errors::Error::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(_) => break,
-        };
-
-        if packet.track_id() != track_id {
-            continue;
-        }
-
-        let decoded = match decoder.decode(&packet) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-
-        let spec = *decoded.spec();
-        let num_frames = decoded.capacity();
-        let mut sample_buf = SampleBuffer::<f32>::new(num_frames as u64, spec);
-        sample_buf.copy_interleaved_ref(decoded);
-
-        let channels = spec.channels.count();
-        let samples = sample_buf.samples();
-
-        if channels == 1 {
-            all_samples.extend_from_slice(samples);
-        } else {
-            // Mix to mono
-            for chunk in samples.chunks(channels) {
-                let mono = chunk.iter().sum::<f32>() / channels as f32;
-                all_samples.push(mono);
-            }
-        }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eyre::bail!("ffmpeg failed: {}", stderr.lines().last().unwrap_or("unknown error"));
     }
 
-    if all_samples.is_empty() {
-        eyre::bail!("No audio samples decoded");
+    let pcm_bytes = &output.stdout;
+    if pcm_bytes.is_empty() {
+        eyre::bail!("ffmpeg produced no output");
     }
 
-    let duration_secs = all_samples.len() as f32 / sample_rate as f32;
+    // Convert s16le bytes to f32 samples
+    let samples: Vec<f32> = pcm_bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+            sample as f32 / 32768.0
+        })
+        .collect();
 
-    let samples = if sample_rate != 16000 {
-        funasr_mlx::audio::resample(&all_samples, sample_rate, 16000)
-    } else {
-        all_samples
-    };
+    let duration_secs = samples.len() as f32 / 16000.0;
+    tracing::info!(samples = samples.len(), duration = duration_secs, "Audio decoded via ffmpeg");
 
     Ok((samples, duration_secs))
 }

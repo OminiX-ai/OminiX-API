@@ -48,9 +48,8 @@ hex = "0.4"
 base64 = "0.22"
 dirs = "6.0"
 
-# Audio processing
+# Audio processing (WAV via hound, other formats via ffmpeg subprocess)
 hound = "3.5"
-symphonia = { version = "0.5", features = ["ogg", "pcm", "mp3", "flac", "aac"] }
 
 # Image processing
 image = "0.25"
