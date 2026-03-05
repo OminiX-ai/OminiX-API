@@ -161,7 +161,8 @@ impl AsrEngine {
     }
 }
 
-/// Decode audio from request: accepts a local file path (starts with '/') or base64-encoded WAV.
+/// Decode audio from request: accepts a local file path (starts with '/') or base64-encoded audio.
+/// Supports WAV, OGG/Opus, MP3, FLAC, AAC via symphonia.
 fn decode_audio(request: &TranscriptionRequest) -> Result<(Vec<f32>, f32)> {
     let audio_bytes = if request.file.starts_with('/') {
         // Local file path — read directly (no size limit, no base64 overhead)
@@ -174,6 +175,17 @@ fn decode_audio(request: &TranscriptionRequest) -> Result<(Vec<f32>, f32)> {
         ).context("Failed to decode base64 audio")?
     };
 
+    // Try WAV first (fast path via hound)
+    if audio_bytes.len() >= 4 && &audio_bytes[..4] == b"RIFF" {
+        return decode_wav(&audio_bytes);
+    }
+
+    // Non-WAV: use symphonia for OGG/Opus, MP3, FLAC, etc.
+    decode_with_symphonia(&audio_bytes)
+}
+
+/// Fast WAV decoding via hound
+fn decode_wav(audio_bytes: &[u8]) -> Result<(Vec<f32>, f32)> {
     let cursor = std::io::Cursor::new(audio_bytes);
     let reader = hound::WavReader::new(cursor)
         .context("Failed to parse WAV file")?;
@@ -204,6 +216,92 @@ fn decode_audio(request: &TranscriptionRequest) -> Result<(Vec<f32>, f32)> {
         funasr_mlx::audio::resample(&samples, sample_rate, 16000)
     } else {
         samples
+    };
+
+    Ok((samples, duration_secs))
+}
+
+/// Decode OGG/Opus, MP3, FLAC, and other formats via symphonia
+fn decode_with_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, f32)> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let cursor = std::io::Cursor::new(audio_bytes.to_vec());
+    let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
+
+    let hint = Hint::new();
+    let format_opts = FormatOptions::default();
+    let metadata_opts = MetadataOptions::default();
+    let decoder_opts = DecoderOptions::default();
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &format_opts, &metadata_opts)
+        .context("Unsupported audio format")?;
+
+    let mut format = probed.format;
+
+    let track = format.default_track()
+        .ok_or_else(|| eyre::eyre!("No audio track found"))?;
+    let track_id = track.id;
+    let sample_rate = track.codec_params.sample_rate
+        .ok_or_else(|| eyre::eyre!("Unknown sample rate"))?;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &decoder_opts)
+        .context("Failed to create audio decoder")?;
+
+    let mut all_samples: Vec<f32> = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(_) => break,
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let spec = *decoded.spec();
+        let num_frames = decoded.capacity();
+        let mut sample_buf = SampleBuffer::<f32>::new(num_frames as u64, spec);
+        sample_buf.copy_interleaved_ref(decoded);
+
+        let channels = spec.channels.count();
+        let samples = sample_buf.samples();
+
+        if channels == 1 {
+            all_samples.extend_from_slice(samples);
+        } else {
+            // Mix to mono
+            for chunk in samples.chunks(channels) {
+                let mono = chunk.iter().sum::<f32>() / channels as f32;
+                all_samples.push(mono);
+            }
+        }
+    }
+
+    if all_samples.is_empty() {
+        eyre::bail!("No audio samples decoded");
+    }
+
+    let duration_secs = all_samples.len() as f32 / sample_rate as f32;
+
+    let samples = if sample_rate != 16000 {
+        funasr_mlx::audio::resample(&all_samples, sample_rate, 16000)
+    } else {
+        all_samples
     };
 
     Ok((samples, duration_secs))

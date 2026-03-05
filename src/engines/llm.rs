@@ -3,6 +3,7 @@
 //! Currently supports:
 //! - Qwen3 (via qwen3-mlx) — ChatML format
 //! - GLM-4.7-Flash (via glm47-flash-mlx) — GLM chat format with MLA attention
+//! - MiniCPM-SALA (via minicpm-sala-mlx) — ChatML format, hybrid sparse+linear attention, 1M+ context
 
 use std::path::PathBuf;
 
@@ -44,6 +45,10 @@ enum ModelBackend {
     },
     Glm4Flash {
         model: glm47_flash_mlx::Model,
+        eos_tokens: Vec<u32>,
+    },
+    MiniCpmSala {
+        model: minicpm_sala_mlx::Model,
         eos_tokens: Vec<u32>,
     },
 }
@@ -95,6 +100,15 @@ impl LlmEngine {
                 let model = glm47_flash_mlx::load_model(&model_dir)
                     .map_err(|e| eyre::eyre!("Failed to load GLM model: {}", e))?;
                 ModelBackend::Glm4Flash {
+                    model,
+                    eos_tokens,
+                }
+            }
+            "minicpm_sala" => {
+                tracing::info!("Loading MiniCPM-SALA backend");
+                let model = minicpm_sala_mlx::load_model(&model_dir)
+                    .map_err(|e| eyre::eyre!("Failed to load MiniCPM-SALA model: {}", e))?;
+                ModelBackend::MiniCpmSala {
                     model,
                     eos_tokens,
                 }
@@ -248,21 +262,24 @@ impl LlmEngine {
     }
 
     /// Generate a chat completion response
-    pub fn generate(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
+    pub fn generate(&mut self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
         let temperature = request.temperature.unwrap_or(0.7);
         let max_tokens = request.max_tokens.unwrap_or(2048);
 
         // Format messages using appropriate template
         let prompt = self.format_messages(&request.messages, request.tools.as_deref());
 
+        // MiniCPM-SALA needs BOS token added by the tokenizer
+        let add_special_tokens = matches!(self.model_type.as_str(), "minicpm_sala");
+
         // Tokenize
-        let encoding = self.tokenizer.encode(prompt.as_str(), false)
+        let encoding = self.tokenizer.encode(prompt.as_str(), add_special_tokens)
             .map_err(|e| eyre::eyre!("Tokenization failed: {}", e))?;
         let prompt_tokens = encoding.get_ids().len() as u32;
         let prompt_array = mlx_rs::Array::from(encoding.get_ids()).index(NewAxis);
 
         // Generate based on backend
-        let generated_tokens = match &self.backend {
+        let generated_tokens = match &mut self.backend {
             ModelBackend::Qwen3 { model, eos_tokens } => {
                 let mut model = model.clone();
                 let mut cache: Vec<Option<qwen3_mlx::KVCache>> = Vec::new();
@@ -307,6 +324,31 @@ impl LlmEngine {
                 }
                 tokens
             }
+            ModelBackend::MiniCpmSala { model, eos_tokens } => {
+                let mut caches = minicpm_sala_mlx::create_layer_caches(&model.args);
+
+                // Prefill
+                let logits = model.forward(&prompt_array, &mut caches)?;
+                let last_logits = logits.index((.., -1, ..));
+                let mut token = minicpm_sala_mlx::sample(&last_logits, temperature)?;
+                mlx_rs::transforms::eval([&token])?;
+
+                // Decode
+                let mut tokens = Vec::new();
+                for _ in 0..max_tokens {
+                    let token_id = token.item::<u32>();
+                    if eos_tokens.contains(&token_id) {
+                        break;
+                    }
+                    tokens.push(token.clone());
+
+                    let input = token.reshape(&[1, 1])?;
+                    let logits = model.forward(&input, &mut caches)?;
+                    let last_logits = logits.index((.., -1, ..));
+                    token = minicpm_sala_mlx::sample(&last_logits, temperature)?;
+                }
+                tokens
+            }
         };
 
         // Synchronize before decoding
@@ -321,6 +363,13 @@ impl LlmEngine {
 
         let raw_content = self.tokenizer.decode(&token_ids, true)
             .map_err(|e| eyre::eyre!("Decoding failed: {}", e))?;
+
+        // Strip <think>...</think> blocks from MiniCPM-SALA output
+        let raw_content = if self.model_type == "minicpm_sala" {
+            strip_thinking(&raw_content).to_string()
+        } else {
+            raw_content
+        };
 
         // Parse tool calls from output (Qwen3 format: <tool_call>...</tool_call>)
         let has_tools = request.tools.as_ref().map_or(false, |t| !t.is_empty());
@@ -414,6 +463,61 @@ fn parse_tool_calls(content: &str) -> (String, Vec<ToolCall>, String) {
     let remaining = remaining.trim().to_string();
 
     if tool_calls.is_empty() {
+        // Fallback: try parsing bare JSON tool calls without <tool_call> tags
+        // (MiniCPM-SALA outputs raw JSON, possibly multiple separated by newlines)
+        // Find all top-level JSON objects in the content
+        let mut search_pos = 0;
+        let bytes = remaining.as_bytes();
+        while search_pos < bytes.len() {
+            // Find next '{'
+            let start = match remaining[search_pos..].find('{') {
+                Some(s) => search_pos + s,
+                None => break,
+            };
+            // Find matching '}' by counting braces
+            let mut depth = 0i32;
+            let mut end = None;
+            let mut in_string = false;
+            let mut escape_next = false;
+            for (i, &b) in bytes[start..].iter().enumerate() {
+                if escape_next {
+                    escape_next = false;
+                    continue;
+                }
+                match b {
+                    b'\\' if in_string => escape_next = true,
+                    b'"' => in_string = !in_string,
+                    b'{' if !in_string => depth += 1,
+                    b'}' if !in_string => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(start + i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = match end {
+                Some(e) => e,
+                None => break,
+            };
+            let json_str = &remaining[start..end];
+            if let Some((name, arguments)) = parse_tool_call_inner(json_str) {
+                if !name.is_empty() {
+                    let id = format!("call_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]);
+                    tool_calls.push(ToolCall {
+                        id,
+                        call_type: "function".to_string(),
+                        function: FunctionCall { name, arguments },
+                    });
+                }
+            }
+            search_pos = end;
+        }
+        if !tool_calls.is_empty() {
+            return (String::new(), tool_calls, "tool_calls".to_string());
+        }
         (content.to_string(), vec![], "stop".to_string())
     } else {
         (remaining, tool_calls, "tool_calls".to_string())
@@ -635,6 +739,19 @@ fn resolve_model_dir(model_path: &str) -> Result<PathBuf> {
                 model_path
             ))
         }
+    }
+}
+
+/// Strip `<think>...</think>` block from the beginning of generated text.
+/// Returns the content after `</think>` if present, or the original text.
+fn strip_thinking(text: &str) -> &str {
+    if let Some(end) = text.find("</think>") {
+        text[end + "</think>".len()..].trim()
+    } else if text.starts_with("<think>") {
+        // Unclosed think block (hit max_tokens) — return empty
+        ""
+    } else {
+        text
     }
 }
 

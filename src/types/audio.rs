@@ -53,6 +53,12 @@ pub struct SpeechRequest {
     #[serde(default = "default_speed")]
     #[allow(dead_code)]
     pub speed: f32,
+    /// Path to reference audio file for voice cloning (x-vector mode via qwen3-tts)
+    #[serde(default)]
+    pub reference_audio: Option<String>,
+    /// Language for synthesis (used with voice cloning)
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 fn default_audio_format() -> String {

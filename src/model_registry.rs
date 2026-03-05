@@ -267,6 +267,31 @@ pub fn get_default_models() -> Vec<CatalogModel> {
             status: "not_downloaded".to_string(),
         },
         CatalogModel {
+            id: "minicpm-sala-9b-8bit".to_string(),
+            name: "MiniCPM-SALA 9B 8-bit".to_string(),
+            description: "9B hybrid attention model with 1M+ token context. Combines sparse + linear attention for efficient long-context inference.".to_string(),
+            category: ModelCategory::Llm,
+            tags: vec!["llm".into(), "chat".into(), "long-context".into(), "minicpm".into(), "8bit".into()],
+            source: CatalogSource {
+                primary_url: "https://huggingface.co/moxin-org/MiniCPM4-SALA-9B-8bit-mlx".to_string(),
+                backup_urls: vec![],
+                source_type: SourceType::Huggingface,
+                repo_id: Some("moxin-org/MiniCPM4-SALA-9B-8bit-mlx".to_string()),
+                revision: "main".to_string(),
+            },
+            storage: CatalogStorage {
+                local_path: "~/.cache/huggingface/hub/models--moxin-org--MiniCPM4-SALA-9B-8bit-mlx".to_string(),
+                total_size_bytes: 9_600_000_000,
+                total_size_display: "~9.6 GB".to_string(),
+            },
+            runtime: CatalogRuntime {
+                memory_required_mb: 12288,
+                quantization: Some("8bit".into()),
+                inference_engine: Some("mlx".into()),
+            },
+            status: "not_downloaded".to_string(),
+        },
+        CatalogModel {
             id: "qwen3-asr-0.6b".to_string(),
             name: "Qwen3-ASR 0.6B 8-bit".to_string(),
             description: "Qwen3-ASR 0.6B encoder-decoder ASR. 30+ languages, compact model (~1 GB). Faster download, slightly lower accuracy.".to_string(),

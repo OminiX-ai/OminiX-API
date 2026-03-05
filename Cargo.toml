@@ -24,10 +24,12 @@ glm47-flash-mlx = { path = "../OminiX-MLX/glm-4.7-flash-mlx" }
 funasr-mlx = { path = "../OminiX-MLX/funasr-mlx" }
 funasr-qwen4b-mlx = { path = "../OminiX-MLX/funasr-qwen4b-mlx" }
 gpt-sovits-mlx = { path = "../OminiX-MLX/gpt-sovits-mlx" }
+qwen3-tts-mlx = { path = "../OminiX-MLX/qwen3-tts-mlx" }
 flux-klein-mlx = { path = "../OminiX-MLX/flux-klein-mlx" }
 zimage-mlx = { path = "../OminiX-MLX/zimage-mlx" }
 moxin-vlm-mlx = { path = "../OminiX-MLX/moxin-vlm-mlx" }
 qwen3-asr-mlx = { path = "../OminiX-MLX/qwen3-asr-mlx" }
+minicpm-sala-mlx = { path = "../OminiX-MLX/minicpm-sala-mlx" }
 
 # Tokenization
 tokenizers = "0.22"
@@ -48,6 +50,7 @@ dirs = "6.0"
 
 # Audio processing
 hound = "3.5"
+symphonia = { version = "0.5", features = ["ogg", "pcm", "mp3", "flac", "aac"] }
 
 # Image processing
 image = "0.25"

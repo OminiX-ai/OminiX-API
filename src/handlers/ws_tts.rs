@@ -122,6 +122,8 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
                     voice: msg_voice,
                     response_format: audio_format.clone(),
                     speed,
+                    reference_audio: None,
+                    language: None,
                 };
 
                 let (response_tx, response_rx) = oneshot::channel();

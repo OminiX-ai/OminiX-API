@@ -370,11 +370,13 @@ pub fn scan_hub_caches() -> usize {
 
     let mut added = 0;
 
-    // Scan ~/.OminiX/models/ (locally placed models)
+    // Scan locally placed models (try both ~/.ominix/models and ~/.OminiX/models)
     if let Some(home) = dirs::home_dir() {
-        let local_models_dir = home.join(".OminiX/models");
-        if local_models_dir.exists() {
-            added += scan_local_models(&local_models_dir, &mut config);
+        for subdir in &[".ominix/models", ".OminiX/models"] {
+            let local_models_dir = home.join(subdir);
+            if local_models_dir.exists() {
+                added += scan_local_models(&local_models_dir, &mut config);
+            }
         }
     }
 

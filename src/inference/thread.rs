@@ -1,7 +1,7 @@
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
-use crate::engines::{asr, image, llm, tts, vlm};
+use crate::engines::{asr, image, llm, qwen3_tts, tts, vlm};
 
 use super::{InferenceRequest, ModelStatus};
 
@@ -42,6 +42,7 @@ pub fn inference_thread(
     let mut tts_engine: Option<tts::TtsEngine> = None;
     let mut image_engine: Option<image::ImageEngine> = None;
     let mut vlm_engine: Option<vlm::VlmEngine> = None;
+    let mut qwen3_tts_engine: Option<qwen3_tts::Qwen3TtsEngine> = None;
 
     // Name tracking
     let mut current_llm_model: Option<String> = None;
@@ -49,6 +50,7 @@ pub fn inference_thread(
     let mut current_tts_model: Option<String> = None;
     let mut current_image_model: Option<String> = None;
     let mut current_vlm_model: Option<String> = None;
+    let mut current_qwen3_tts_model: Option<String> = None;
 
     // Startup loading
     if !config.llm_model.is_empty() {
@@ -85,6 +87,12 @@ pub fn inference_thread(
             tracing::warn!("Failed to load VLM model: {}", e);
         }
     }
+    if !config.qwen3_tts_model_dir.is_empty() {
+        tracing::info!("Loading Qwen3-TTS model: {}", config.qwen3_tts_model_dir);
+        if let Err(e) = load_model_slot(&mut qwen3_tts_engine, &mut current_qwen3_tts_model, &config.qwen3_tts_model_dir, qwen3_tts::Qwen3TtsEngine::new) {
+            tracing::warn!("Failed to load Qwen3-TTS model: {}", e);
+        }
+    }
 
     // Signal that models are loaded
     let _ = ready_tx.send(());
@@ -96,7 +104,7 @@ pub fn inference_thread(
     while let Some(request) = rx.blocking_recv() {
         match request {
             InferenceRequest::Chat { request, response_tx } => {
-                let result = if let Some(ref engine) = llm_engine {
+                let result = if let Some(ref mut engine) = llm_engine {
                     engine.generate(&request)
                 } else {
                     Err(eyre::eyre!("LLM model not loaded"))
@@ -112,7 +120,19 @@ pub fn inference_thread(
                 let _ = response_tx.send(result);
             }
             InferenceRequest::Speech { request, response_tx } => {
-                let result = if let Some(ref mut engine) = tts_engine {
+                let result = if request.reference_audio.is_some() {
+                    // Voice cloning via Qwen3-TTS x-vector
+                    if let Some(ref mut engine) = qwen3_tts_engine {
+                        let ref_audio = request.reference_audio.as_deref().unwrap();
+                        let language = request.language.as_deref().unwrap_or("chinese");
+                        engine.synthesize_clone(&request.input, ref_audio, language, request.speed)
+                    } else {
+                        Err(eyre::eyre!("Qwen3-TTS model not loaded (set QWEN3_TTS_MODEL_DIR)"))
+                    }
+                } else if let Some(ref mut engine) = qwen3_tts_engine {
+                    // Prefer Qwen3-TTS for preset speakers if loaded
+                    engine.synthesize(&request)
+                } else if let Some(ref mut engine) = tts_engine {
                     engine.synthesize(&request)
                 } else {
                     Err(eyre::eyre!("TTS model not loaded"))
@@ -182,6 +202,11 @@ pub fn inference_thread(
                 let result = load_model_slot(&mut vlm_engine, &mut current_vlm_model, &model_id, vlm::VlmEngine::new);
                 let _ = response_tx.send(result);
             }
+            InferenceRequest::LoadQwen3TtsModel { model_dir, response_tx } => {
+                tracing::info!("Loading Qwen3-TTS model: {}", model_dir);
+                let result = load_model_slot(&mut qwen3_tts_engine, &mut current_qwen3_tts_model, &model_dir, qwen3_tts::Qwen3TtsEngine::new);
+                let _ = response_tx.send(result);
+            }
             InferenceRequest::LoadImageModel { model_id, response_tx } => {
                 let normalized = normalize_image_model(&model_id);
                 tracing::info!("Loading image model: {} (normalized: {})", model_id, normalized);
@@ -230,20 +255,27 @@ pub fn inference_thread(
                         let prev = current_vlm_model.take();
                         Ok(format!("Unloaded VLM model: {:?}", prev))
                     }
+                    "qwen3_tts" => {
+                        qwen3_tts_engine = None;
+                        let prev = current_qwen3_tts_model.take();
+                        Ok(format!("Unloaded Qwen3-TTS model: {:?}", prev))
+                    }
                     "all" => {
                         llm_engine = None;
                         asr_engine = None;
                         tts_engine = None;
+                        qwen3_tts_engine = None;
                         image_engine = None;
                         vlm_engine = None;
                         current_llm_model = None;
                         current_asr_model = None;
                         current_tts_model = None;
+                        current_qwen3_tts_model = None;
                         current_image_model = None;
                         current_vlm_model = None;
                         Ok("Unloaded all models".to_string())
                     }
-                    _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, image, vlm, or all", model_type)),
+                    _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, qwen3_tts, image, vlm, or all", model_type)),
                 };
                 let _ = response_tx.send(result);
             }
@@ -253,6 +285,7 @@ pub fn inference_thread(
                     llm: current_llm_model.clone(),
                     asr: current_asr_model.clone(),
                     tts: current_tts_model.clone(),
+                    qwen3_tts: current_qwen3_tts_model.clone(),
                     image: current_image_model.clone(),
                     vlm: current_vlm_model.clone(),
                 };

@@ -49,6 +49,11 @@ pub enum InferenceRequest {
         model_id: String,
         response_tx: oneshot::Sender<eyre::Result<String>>,
     },
+    /// Load/switch Qwen3-TTS model dynamically
+    LoadQwen3TtsModel {
+        model_dir: String,
+        response_tx: oneshot::Sender<eyre::Result<String>>,
+    },
     /// Unload a model to free memory
     UnloadModel {
         model_type: String,
@@ -70,6 +75,7 @@ pub struct ModelStatus {
     pub llm: Option<String>,
     pub asr: Option<String>,
     pub tts: Option<String>,
+    pub qwen3_tts: Option<String>,
     pub image: Option<String>,
     pub vlm: Option<String>,
 }
