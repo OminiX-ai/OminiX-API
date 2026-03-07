@@ -113,6 +113,20 @@ async fn main() -> eyre::Result<()> {
     let acceptor = TcpListener::new(&listen_addr).bind().await;
 
     tracing::info!("HTTP server listening on http://{}", listen_addr);
+
+    // Write discovery file so other tools can find us without hardcoded URLs
+    let api_url = format!("http://localhost:{}", config.port);
+    if let Some(home) = std::env::var_os("HOME") {
+        let discovery_dir = std::path::Path::new(&home).join(".ominix");
+        let _ = std::fs::create_dir_all(&discovery_dir);
+        let discovery_file = discovery_dir.join("api_url");
+        if let Err(e) = std::fs::write(&discovery_file, &api_url) {
+            tracing::warn!("Failed to write discovery file {}: {e}", discovery_file.display());
+        } else {
+            tracing::info!("Discovery file: {}", discovery_file.display());
+        }
+    }
+
     tracing::info!("Endpoints:");
     tracing::info!("  GET  /health");
     tracing::info!("  GET  /v1/models");
