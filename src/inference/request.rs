@@ -16,6 +16,11 @@ pub enum InferenceRequest {
         request: SpeechRequest,
         response_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
     },
+    /// Voice cloning TTS (dedicated endpoint, always uses Base model)
+    SpeechClone {
+        request: SpeechCloneRequest,
+        response_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
+    },
     Image {
         request: ImageGenerationRequest,
         response_tx: oneshot::Sender<eyre::Result<ImageGenerationResponse>>,

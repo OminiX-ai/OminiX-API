@@ -3,7 +3,8 @@
 //! Provides endpoints for:
 //! - POST /v1/chat/completions - LLM chat completions
 //! - POST /v1/audio/transcriptions - Speech-to-text (ASR)
-//! - POST /v1/audio/speech - Text-to-speech (TTS)
+//! - POST /v1/audio/speech - Text-to-speech with preset voices (TTS)
+//! - POST /v1/audio/speech/clone - Voice cloning TTS with reference audio
 //! - POST /v1/images/generations - Image generation
 //! - WS   /ws/v1/tts - WebSocket streaming TTS with per-message voice switching
 //! - POST /v1/voices/train - Voice cloning training (quick mode)
@@ -143,7 +144,8 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("  POST /v1/models/scan");
     tracing::info!("  POST /v1/chat/completions");
     tracing::info!("  POST /v1/audio/transcriptions");
-    tracing::info!("  POST /v1/audio/speech");
+    tracing::info!("  POST /v1/audio/speech          (preset voices)");
+    tracing::info!("  POST /v1/audio/speech/clone    (voice cloning)");
     tracing::info!("  POST /v1/images/generations");
     tracing::info!("  WS   /ws/v1/tts");
     tracing::info!("  GET  /v1/voices");

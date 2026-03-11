@@ -27,6 +27,7 @@ pub fn build_router(state: AppState) -> Router {
         // Audio endpoints
         .push(Router::with_path("v1/audio/transcriptions").post(handlers::audio::audio_transcriptions))
         .push(Router::with_path("v1/audio/speech").post(handlers::audio::audio_speech))
+        .push(Router::with_path("v1/audio/speech/clone").post(handlers::audio::audio_speech_clone))
         // Image generation
         .push(Router::with_path("v1/images/generations").post(handlers::image::images_generations))
         // VLM (Vision-Language Model)

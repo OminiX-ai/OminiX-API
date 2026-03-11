@@ -61,10 +61,32 @@ pub struct SpeechRequest {
     pub language: Option<String>,
 }
 
+// ============================================================================
+// Audio Speech Clone (Voice Cloning TTS)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct SpeechCloneRequest {
+    /// Text to synthesize
+    pub input: String,
+    /// Path to reference audio file (3-10s clip for x-vector speaker embedding)
+    pub reference_audio: String,
+    /// Language for synthesis: chinese, english, japanese, korean
+    #[serde(default = "default_clone_language")]
+    pub language: String,
+    /// Speaking speed (0.25 to 4.0)
+    #[serde(default = "default_speed")]
+    pub speed: f32,
+}
+
 fn default_audio_format() -> String {
     "wav".to_string()
 }
 
 fn default_speed() -> f32 {
     1.0
+}
+
+fn default_clone_language() -> String {
+    "chinese".to_string()
 }

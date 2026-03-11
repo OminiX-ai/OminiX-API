@@ -141,65 +141,94 @@ pub fn inference_thread(
                 };
                 let _ = response_tx.send(result);
             }
+            // Preset voices endpoint: /v1/audio/speech
+            // Always uses CustomVoice model (vivian, aiden, serena, etc.)
             InferenceRequest::Speech { request, response_tx } => {
-                let needs_cloning = request.reference_audio.is_some();
-
-                // Auto-switch TTS model variant if needed
-                if needs_cloning {
-                    // Voice cloning needs Base model
-                    if qwen3_tts_engine.as_ref().is_some_and(|e| !e.supports_voice_cloning())
-                        || qwen3_tts_engine.is_none()
-                    {
-                        if let Some(base_path) = find_tts_model("base") {
-                            tracing::info!("Auto-switching to Base TTS model: {base_path}");
-                            if let Err(e) = load_model_slot(
-                                &mut qwen3_tts_engine,
-                                &mut current_qwen3_tts_model,
-                                &base_path,
-                                qwen3_tts::Qwen3TtsEngine::new,
-                            ) {
-                                tracing::warn!("Failed to auto-load Base TTS: {e}");
-                            }
-                        } else {
-                            tracing::warn!("Base TTS model not found on disk — download qwen3-tts-base");
+                // Auto-switch to CustomVoice model if current model doesn't support presets
+                if qwen3_tts_engine.as_ref().is_some_and(|e| !e.supports_preset_speakers()) {
+                    if let Some(cv_path) = find_tts_model("customvoice") {
+                        tracing::info!("Auto-switching to CustomVoice TTS model: {cv_path}");
+                        if let Err(e) = load_model_slot(
+                            &mut qwen3_tts_engine,
+                            &mut current_qwen3_tts_model,
+                            &cv_path,
+                            qwen3_tts::Qwen3TtsEngine::new,
+                        ) {
+                            tracing::warn!("Failed to auto-load CustomVoice TTS: {e}");
                         }
+                    } else {
+                        tracing::warn!("CustomVoice TTS model not found on disk — download qwen3-tts");
                     }
-                } else {
-                    // Preset speakers need CustomVoice model
-                    if qwen3_tts_engine.as_ref().is_some_and(|e| !e.supports_preset_speakers()) {
-                        if let Some(cv_path) = find_tts_model("customvoice") {
-                            tracing::info!("Auto-switching to CustomVoice TTS model: {cv_path}");
-                            if let Err(e) = load_model_slot(
-                                &mut qwen3_tts_engine,
-                                &mut current_qwen3_tts_model,
-                                &cv_path,
-                                qwen3_tts::Qwen3TtsEngine::new,
-                            ) {
-                                tracing::warn!("Failed to auto-load CustomVoice TTS: {e}");
-                            }
-                        } else {
-                            tracing::warn!("CustomVoice TTS model not found on disk — download qwen3-tts");
+                } else if qwen3_tts_engine.is_none() {
+                    // No engine loaded at all — try loading CustomVoice
+                    if let Some(cv_path) = find_tts_model("customvoice") {
+                        tracing::info!("Loading CustomVoice TTS model: {cv_path}");
+                        if let Err(e) = load_model_slot(
+                            &mut qwen3_tts_engine,
+                            &mut current_qwen3_tts_model,
+                            &cv_path,
+                            qwen3_tts::Qwen3TtsEngine::new,
+                        ) {
+                            tracing::warn!("Failed to load CustomVoice TTS: {e}");
                         }
                     }
                 }
 
-                let result = if needs_cloning {
+                // Legacy fallback: if reference_audio is provided, redirect to clone path
+                let result = if request.reference_audio.is_some() {
+                    // Backward compat: old clients sending reference_audio to /v1/audio/speech
+                    if qwen3_tts_engine.as_ref().is_some_and(|e| !e.supports_voice_cloning()) || qwen3_tts_engine.is_none() {
+                        if let Some(base_path) = find_tts_model("base") {
+                            tracing::info!("Auto-switching to Base TTS for legacy clone request: {base_path}");
+                            let _ = load_model_slot(&mut qwen3_tts_engine, &mut current_qwen3_tts_model, &base_path, qwen3_tts::Qwen3TtsEngine::new);
+                        }
+                    }
                     if let Some(ref mut engine) = qwen3_tts_engine {
                         let ref_audio = request.reference_audio.as_deref().unwrap();
                         let language = request.language.as_deref().unwrap_or("chinese");
                         engine.synthesize_clone(&request.input, ref_audio, language, request.speed)
                     } else {
-                        Err(eyre::eyre!(
-                            "Base TTS model not available. Download it first: \
-                             download_model(model_id='qwen3-tts-base')"
-                        ))
+                        Err(eyre::eyre!("Base TTS model not available for voice cloning. Use /v1/audio/speech/clone endpoint."))
                     }
                 } else if let Some(ref mut engine) = qwen3_tts_engine {
                     engine.synthesize(&request)
                 } else if let Some(ref mut engine) = tts_engine {
                     engine.synthesize(&request)
                 } else {
-                    Err(eyre::eyre!("TTS model not loaded"))
+                    Err(eyre::eyre!("TTS model not loaded. No CustomVoice model found on disk."))
+                };
+                let _ = response_tx.send(result);
+            }
+
+            // Voice cloning endpoint: /v1/audio/speech/clone
+            // Always uses Base model (with ECAPA-TDNN speaker encoder)
+            InferenceRequest::SpeechClone { request, response_tx } => {
+                // Auto-switch to Base model if current model doesn't support cloning
+                if qwen3_tts_engine.as_ref().is_some_and(|e| !e.supports_voice_cloning())
+                    || qwen3_tts_engine.is_none()
+                {
+                    if let Some(base_path) = find_tts_model("base") {
+                        tracing::info!("Auto-switching to Base TTS model for cloning: {base_path}");
+                        if let Err(e) = load_model_slot(
+                            &mut qwen3_tts_engine,
+                            &mut current_qwen3_tts_model,
+                            &base_path,
+                            qwen3_tts::Qwen3TtsEngine::new,
+                        ) {
+                            tracing::warn!("Failed to auto-load Base TTS: {e}");
+                        }
+                    } else {
+                        tracing::warn!("Base TTS model not found on disk — download qwen3-tts-base");
+                    }
+                }
+
+                let result = if let Some(ref mut engine) = qwen3_tts_engine {
+                    engine.synthesize_clone(&request.input, &request.reference_audio, &request.language, request.speed)
+                } else {
+                    Err(eyre::eyre!(
+                        "Base TTS model not available for voice cloning. \
+                         Download it: POST /v1/models/download {{\"model_id\": \"qwen3-tts-base\"}}"
+                    ))
                 };
                 let _ = response_tx.send(result);
             }
