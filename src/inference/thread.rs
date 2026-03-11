@@ -1,7 +1,7 @@
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
-use crate::engines::{asr, image, llm, qwen3_tts, tts, vlm};
+use crate::engines::{asr, image, llm, tts, vlm};
 
 use super::{InferenceRequest, ModelStatus};
 
@@ -30,41 +30,19 @@ fn normalize_image_model(model: &str) -> &'static str {
     image::ImageModelType::from_model_id(model).normalized_name()
 }
 
-/// Search standard model directories for a TTS model variant.
-/// Looks in `~/.OminiX/models/` and `~/.ominix/models/` for dirs matching the pattern.
-fn find_tts_model(variant: &str) -> Option<String> {
-    let home = dirs::home_dir()?;
-    let search_dirs = [
-        home.join(".OminiX").join("models"),
-        home.join(".ominix").join("models"),
-    ];
-    for dir in &search_dirs {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy().to_lowercase();
-                if entry.path().is_dir() && name_str.contains("tts") && name_str.contains(variant) {
-                    return Some(entry.path().to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Inference thread that owns all models (models are not Send/Sync)
+/// Inference thread that owns all models except TTS (models are not Send/Sync).
+/// TTS is handled by the separate TTS worker pool (see `tts_pool.rs`).
 pub fn inference_thread(
     config: Config,
     mut rx: mpsc::Receiver<InferenceRequest>,
     ready_tx: oneshot::Sender<()>,
 ) {
-    // Model slots
+    // Model slots (TTS/Qwen3-TTS handled by tts_pool, not here)
     let mut llm_engine: Option<llm::LlmEngine> = None;
     let mut asr_engine: Option<asr::AsrEngine> = None;
     let mut tts_engine: Option<tts::TtsEngine> = None;
     let mut image_engine: Option<image::ImageEngine> = None;
     let mut vlm_engine: Option<vlm::VlmEngine> = None;
-    let mut qwen3_tts_engine: Option<qwen3_tts::Qwen3TtsEngine> = None;
 
     // Name tracking
     let mut current_llm_model: Option<String> = None;
@@ -72,7 +50,6 @@ pub fn inference_thread(
     let mut current_tts_model: Option<String> = None;
     let mut current_image_model: Option<String> = None;
     let mut current_vlm_model: Option<String> = None;
-    let mut current_qwen3_tts_model: Option<String> = None;
 
     // Startup loading
     if !config.llm_model.is_empty() {
@@ -109,12 +86,7 @@ pub fn inference_thread(
             tracing::warn!("Failed to load VLM model: {}", e);
         }
     }
-    if !config.qwen3_tts_model_dir.is_empty() {
-        tracing::info!("Loading Qwen3-TTS model: {}", config.qwen3_tts_model_dir);
-        if let Err(e) = load_model_slot(&mut qwen3_tts_engine, &mut current_qwen3_tts_model, &config.qwen3_tts_model_dir, qwen3_tts::Qwen3TtsEngine::new) {
-            tracing::warn!("Failed to load Qwen3-TTS model: {}", e);
-        }
-    }
+    // Qwen3-TTS is now managed by the TTS pool (tts_pool.rs), not this thread.
 
     // Signal that models are loaded
     let _ = ready_tx.send(());
@@ -141,96 +113,22 @@ pub fn inference_thread(
                 };
                 let _ = response_tx.send(result);
             }
-            // Preset voices endpoint: /v1/audio/speech
-            // Always uses CustomVoice model (vivian, aiden, serena, etc.)
-            InferenceRequest::Speech { request, response_tx } => {
-                // Auto-switch to CustomVoice model if current model doesn't support presets
-                if qwen3_tts_engine.as_ref().is_some_and(|e| !e.supports_preset_speakers()) {
-                    if let Some(cv_path) = find_tts_model("customvoice") {
-                        tracing::info!("Auto-switching to CustomVoice TTS model: {cv_path}");
-                        if let Err(e) = load_model_slot(
-                            &mut qwen3_tts_engine,
-                            &mut current_qwen3_tts_model,
-                            &cv_path,
-                            qwen3_tts::Qwen3TtsEngine::new,
-                        ) {
-                            tracing::warn!("Failed to auto-load CustomVoice TTS: {e}");
-                        }
-                    } else {
-                        tracing::warn!("CustomVoice TTS model not found on disk — download qwen3-tts");
-                    }
-                } else if qwen3_tts_engine.is_none() {
-                    // No engine loaded at all — try loading CustomVoice
-                    if let Some(cv_path) = find_tts_model("customvoice") {
-                        tracing::info!("Loading CustomVoice TTS model: {cv_path}");
-                        if let Err(e) = load_model_slot(
-                            &mut qwen3_tts_engine,
-                            &mut current_qwen3_tts_model,
-                            &cv_path,
-                            qwen3_tts::Qwen3TtsEngine::new,
-                        ) {
-                            tracing::warn!("Failed to load CustomVoice TTS: {e}");
-                        }
-                    }
-                }
-
-                // Legacy fallback: if reference_audio is provided, redirect to clone path
-                let result = if request.reference_audio.is_some() {
-                    // Backward compat: old clients sending reference_audio to /v1/audio/speech
-                    if qwen3_tts_engine.as_ref().is_some_and(|e| !e.supports_voice_cloning()) || qwen3_tts_engine.is_none() {
-                        if let Some(base_path) = find_tts_model("base") {
-                            tracing::info!("Auto-switching to Base TTS for legacy clone request: {base_path}");
-                            let _ = load_model_slot(&mut qwen3_tts_engine, &mut current_qwen3_tts_model, &base_path, qwen3_tts::Qwen3TtsEngine::new);
-                        }
-                    }
-                    if let Some(ref mut engine) = qwen3_tts_engine {
-                        let ref_audio = request.reference_audio.as_deref().unwrap();
-                        let language = request.language.as_deref().unwrap_or("chinese");
-                        engine.synthesize_clone(&request.input, ref_audio, language, request.speed)
-                    } else {
-                        Err(eyre::eyre!("Base TTS model not available for voice cloning. Use /v1/audio/speech/clone endpoint."))
-                    }
-                } else if let Some(ref mut engine) = qwen3_tts_engine {
-                    engine.synthesize(&request)
-                } else if let Some(ref mut engine) = tts_engine {
-                    engine.synthesize(&request)
-                } else {
-                    Err(eyre::eyre!("TTS model not loaded. No CustomVoice model found on disk."))
-                };
-                let _ = response_tx.send(result);
+            // Speech, SpeechStream, SpeechClone are handled by the TTS pool.
+            // They should never arrive here — if they do, return an error.
+            InferenceRequest::Speech { response_tx, .. } => {
+                let _ = response_tx.send(Err(eyre::eyre!(
+                    "TTS requests should be routed to the TTS pool, not the inference thread"
+                )));
             }
-
-            // Voice cloning endpoint: /v1/audio/speech/clone
-            // Always uses Base model (with ECAPA-TDNN speaker encoder)
-            InferenceRequest::SpeechClone { request, response_tx } => {
-                // Auto-switch to Base model if current model doesn't support cloning
-                if qwen3_tts_engine.as_ref().is_some_and(|e| !e.supports_voice_cloning())
-                    || qwen3_tts_engine.is_none()
-                {
-                    if let Some(base_path) = find_tts_model("base") {
-                        tracing::info!("Auto-switching to Base TTS model for cloning: {base_path}");
-                        if let Err(e) = load_model_slot(
-                            &mut qwen3_tts_engine,
-                            &mut current_qwen3_tts_model,
-                            &base_path,
-                            qwen3_tts::Qwen3TtsEngine::new,
-                        ) {
-                            tracing::warn!("Failed to auto-load Base TTS: {e}");
-                        }
-                    } else {
-                        tracing::warn!("Base TTS model not found on disk — download qwen3-tts-base");
-                    }
-                }
-
-                let result = if let Some(ref mut engine) = qwen3_tts_engine {
-                    engine.synthesize_clone(&request.input, &request.reference_audio, &request.language, request.speed)
-                } else {
-                    Err(eyre::eyre!(
-                        "Base TTS model not available for voice cloning. \
-                         Download it: POST /v1/models/download {{\"model_id\": \"qwen3-tts-base\"}}"
-                    ))
-                };
-                let _ = response_tx.send(result);
+            InferenceRequest::SpeechStream { chunk_tx, .. } => {
+                let _ = chunk_tx.blocking_send(super::AudioChunk::Error(
+                    "TTS requests should be routed to the TTS pool".to_string(),
+                ));
+            }
+            InferenceRequest::SpeechClone { response_tx, .. } => {
+                let _ = response_tx.send(Err(eyre::eyre!(
+                    "TTS requests should be routed to the TTS pool, not the inference thread"
+                )));
             }
             InferenceRequest::Image { request, response_tx } => {
                 // Check if we need to switch models based on request
@@ -295,10 +193,9 @@ pub fn inference_thread(
                 let result = load_model_slot(&mut vlm_engine, &mut current_vlm_model, &model_id, vlm::VlmEngine::new);
                 let _ = response_tx.send(result);
             }
-            InferenceRequest::LoadQwen3TtsModel { model_dir, response_tx } => {
-                tracing::info!("Loading Qwen3-TTS model: {}", model_dir);
-                let result = load_model_slot(&mut qwen3_tts_engine, &mut current_qwen3_tts_model, &model_dir, qwen3_tts::Qwen3TtsEngine::new);
-                let _ = response_tx.send(result);
+            InferenceRequest::LoadQwen3TtsModel { response_tx, .. } => {
+                // Qwen3-TTS is managed by the TTS pool, not this thread.
+                let _ = response_tx.send(Ok("Qwen3-TTS is managed by the TTS pool (auto-loads on demand)".to_string()));
             }
             InferenceRequest::LoadImageModel { model_id, response_tx } => {
                 let normalized = normalize_image_model(&model_id);
@@ -349,24 +246,22 @@ pub fn inference_thread(
                         Ok(format!("Unloaded VLM model: {:?}", prev))
                     }
                     "qwen3_tts" => {
-                        qwen3_tts_engine = None;
-                        let prev = current_qwen3_tts_model.take();
-                        Ok(format!("Unloaded Qwen3-TTS model: {:?}", prev))
+                        // Qwen3-TTS is managed by the TTS pool — idle workers are auto-reclaimed
+                        Ok("Qwen3-TTS is managed by the TTS pool (idle workers auto-reclaimed)".to_string())
                     }
                     "all" => {
                         llm_engine = None;
                         asr_engine = None;
                         tts_engine = None;
-                        qwen3_tts_engine = None;
                         image_engine = None;
                         vlm_engine = None;
                         current_llm_model = None;
                         current_asr_model = None;
                         current_tts_model = None;
-                        current_qwen3_tts_model = None;
                         current_image_model = None;
                         current_vlm_model = None;
-                        Ok("Unloaded all models".to_string())
+                        // Note: Qwen3-TTS is managed by the TTS pool, not unloaded here
+                        Ok("Unloaded all models (Qwen3-TTS managed by TTS pool)".to_string())
                     }
                     _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, qwen3_tts, image, vlm, or all", model_type)),
                 };
@@ -378,7 +273,7 @@ pub fn inference_thread(
                     llm: current_llm_model.clone(),
                     asr: current_asr_model.clone(),
                     tts: current_tts_model.clone(),
-                    qwen3_tts: current_qwen3_tts_model.clone(),
+                    qwen3_tts: Some("managed by TTS pool".to_string()),
                     image: current_image_model.clone(),
                     vlm: current_vlm_model.clone(),
                 };

@@ -5,46 +5,59 @@ use crate::handlers;
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
+    let cors = Cors::new()
+        .allow_origin(AllowOrigin::any())
+        .allow_methods(AllowMethods::any())
+        .allow_headers(AllowHeaders::any())
+        .into_handler();
+
     Router::new()
         .hoop(affix_state::inject(state))
-        .hoop(
-            Cors::new()
-                .allow_origin(AllowOrigin::any())
-                .allow_methods(AllowMethods::any())
-                .allow_headers(AllowHeaders::any())
-                .into_handler(),
-        )
-        // Health & Models
+        .hoop(cors)
         .push(Router::with_path("health").get(handlers::health::health))
-        .push(Router::with_path("v1/models").get(handlers::health::list_models))
-        .push(Router::with_path("v1/models/status").get(handlers::health::model_status))
-        .push(Router::with_path("v1/models/report").get(handlers::health::models_report))
-        .push(Router::with_path("v1/models/load").post(handlers::models::load_model))
-        .push(Router::with_path("v1/models/unload").post(handlers::models::unload_model))
-        .push(Router::with_path("v1/models/quantize").post(handlers::image::quantize_model))
-        // Chat completions
-        .push(Router::with_path("v1/chat/completions").post(handlers::chat::chat_completions))
-        // Audio endpoints
-        .push(Router::with_path("v1/audio/transcriptions").post(handlers::audio::audio_transcriptions))
-        .push(Router::with_path("v1/audio/speech").post(handlers::audio::audio_speech))
-        .push(Router::with_path("v1/audio/speech/clone").post(handlers::audio::audio_speech_clone))
-        // Image generation
-        .push(Router::with_path("v1/images/generations").post(handlers::image::images_generations))
-        // VLM (Vision-Language Model)
-        .push(Router::with_path("v1/vlm/completions").post(handlers::vlm::vlm_completions))
-        // WebSocket TTS
+        .push(
+            Router::with_path("v1")
+                // Models — no handler on "models" itself, use empty-path child for exact match
+                .push(Router::with_path("models")
+                    .push(Router::new().get(handlers::health::list_models))
+                    .push(Router::with_path("status").get(handlers::health::model_status))
+                    .push(Router::with_path("report").get(handlers::health::models_report))
+                    .push(Router::with_path("load").post(handlers::models::load_model))
+                    .push(Router::with_path("unload").post(handlers::models::unload_model))
+                    .push(Router::with_path("quantize").post(handlers::image::quantize_model))
+                    .push(Router::with_path("catalog").get(handlers::download::model_catalog))
+                    .push(Router::with_path("download")
+                        .push(Router::new().post(handlers::download::download_model))
+                        .push(Router::with_path("progress").get(handlers::download::download_progress_sse))
+                        .push(Router::with_path("cancel").post(handlers::download::cancel_download))
+                    )
+                    .push(Router::with_path("remove").post(handlers::download::remove_model))
+                    .push(Router::with_path("scan").post(handlers::download::scan_models))
+                )
+                // Chat
+                .push(Router::with_path("chat/completions").post(handlers::chat::chat_completions))
+                // Audio
+                .push(Router::with_path("audio")
+                    .push(Router::with_path("transcriptions").post(handlers::audio::audio_transcriptions))
+                    .push(Router::with_path("speech")
+                        .push(Router::new().post(handlers::audio::audio_speech))
+                        .push(Router::with_path("clone").post(handlers::audio::audio_speech_clone))
+                    )
+                )
+                // Images
+                .push(Router::with_path("images/generations").post(handlers::image::images_generations))
+                // VLM
+                .push(Router::with_path("vlm/completions").post(handlers::vlm::vlm_completions))
+                // Voices
+                .push(Router::with_path("voices")
+                    .push(Router::new().get(handlers::training::list_voices))
+                    .push(Router::with_path("train")
+                        .push(Router::new().post(handlers::training::start_voice_training))
+                        .push(Router::with_path("status").get(handlers::training::get_training_status))
+                        .push(Router::with_path("progress").get(handlers::training::training_progress_sse))
+                        .push(Router::with_path("cancel").post(handlers::training::cancel_training))
+                    )
+                )
+        )
         .push(Router::with_path("ws/v1/tts").get(handlers::ws_tts::ws_tts))
-        // Model management
-        .push(Router::with_path("v1/models/catalog").get(handlers::download::model_catalog))
-        .push(Router::with_path("v1/models/download").post(handlers::download::download_model))
-        .push(Router::with_path("v1/models/download/progress").get(handlers::download::download_progress_sse))
-        .push(Router::with_path("v1/models/download/cancel").post(handlers::download::cancel_download))
-        .push(Router::with_path("v1/models/remove").post(handlers::download::remove_model))
-        .push(Router::with_path("v1/models/scan").post(handlers::download::scan_models))
-        // Voice cloning training
-        .push(Router::with_path("v1/voices").get(handlers::training::list_voices))
-        .push(Router::with_path("v1/voices/train").post(handlers::training::start_voice_training))
-        .push(Router::with_path("v1/voices/train/status").get(handlers::training::get_training_status))
-        .push(Router::with_path("v1/voices/train/progress").get(handlers::training::training_progress_sse))
-        .push(Router::with_path("v1/voices/train/cancel").post(handlers::training::cancel_training))
 }

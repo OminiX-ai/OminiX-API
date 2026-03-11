@@ -5,7 +5,7 @@
 //! which conditions the TTS generation to match the reference speaker.
 
 use eyre::{Context, Result};
-use qwen3_tts_mlx::{Synthesizer, SynthesizeOptions};
+use qwen3_tts_mlx::{Synthesizer, SynthesizeOptions, DEFAULT_CHUNK_FRAMES};
 
 use crate::types::SpeechRequest;
 
@@ -102,6 +102,57 @@ impl Qwen3TtsEngine {
     /// Whether preset speakers (vivian, ryan, etc.) are supported (requires CustomVoice model).
     pub fn supports_preset_speakers(&self) -> bool {
         self.synthesizer.supports_preset_speakers()
+    }
+
+    /// Sample rate of the loaded model (typically 24000).
+    pub fn sample_rate(&self) -> u32 {
+        self.synthesizer.sample_rate
+    }
+
+    /// Streaming synthesis: yields audio sample chunks via a callback.
+    /// Each chunk is ~800ms of audio (DEFAULT_CHUNK_FRAMES=10 frames at 12Hz).
+    pub fn synthesize_streaming(
+        &mut self,
+        request: &SpeechRequest,
+        mut on_chunk: impl FnMut(Vec<f32>) -> bool, // return false to stop
+    ) -> Result<()> {
+        let speaker = request.voice.as_deref().unwrap_or("vivian");
+        let language = request.language.as_deref().unwrap_or("chinese");
+
+        let opts = SynthesizeOptions {
+            speaker,
+            language,
+            speed_factor: if request.speed != 1.0 { Some(request.speed) } else { None },
+            ..Default::default()
+        };
+
+        let mut session = self.synthesizer.start_streaming(&request.input, &opts, DEFAULT_CHUNK_FRAMES)
+            .map_err(|e| eyre::eyre!("Failed to start streaming TTS: {e}"))?;
+
+        while let Some(samples) = session.next_chunk()
+            .map_err(|e| eyre::eyre!("Streaming TTS chunk error: {e}"))?
+        {
+            if !on_chunk(samples) {
+                break;
+            }
+        }
+
+        tracing::info!(
+            "Streaming TTS complete: {:.1}s audio ({} samples)",
+            session.duration_secs(),
+            session.total_samples()
+        );
+        Ok(())
+    }
+
+    /// Convert f32 samples to raw PCM i16 bytes (no header, for streaming).
+    pub fn samples_to_pcm(samples: &[f32]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(samples.len() * 2);
+        for &s in samples {
+            let i = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            buf.extend_from_slice(&i.to_le_bytes());
+        }
+        buf
     }
 
     /// Convert f32 samples to WAV bytes (16-bit PCM, mono).

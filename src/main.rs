@@ -35,7 +35,7 @@ mod types;
 mod utils;
 
 use config::Config;
-use inference::InferenceRequest;
+use inference::{InferenceRequest, TtsPoolConfig, TtsRequest};
 use state::AppState;
 use types::{DownloadProgressEvent, TrainingProgressEvent};
 
@@ -82,6 +82,13 @@ async fn main() -> eyre::Result<()> {
         );
     });
 
+    // Spawn TTS worker pool (handles Speech, SpeechStream, SpeechClone)
+    let tts_pool_config = TtsPoolConfig::from_env();
+    let (tts_pool_tx, tts_pool_rx) = mpsc::channel::<TtsRequest>(64);
+    std::thread::spawn(move || {
+        inference::run_pool(tts_pool_rx, tts_pool_config);
+    });
+
     // Create download channels and thread
     let (download_tx, download_rx) = mpsc::channel::<download::DownloadRequest>(16);
     let (download_progress_tx, _) = broadcast::channel::<DownloadProgressEvent>(256);
@@ -100,6 +107,7 @@ async fn main() -> eyre::Result<()> {
 
     let state = AppState {
         inference_tx,
+        tts_pool_tx,
         training_tx,
         progress_tx,
         cancel_flag,

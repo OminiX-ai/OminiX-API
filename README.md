@@ -202,10 +202,16 @@ Synthesize speech from text. Supports dynamic voice switching per request.
 | `input` | string | (required) | Text to synthesize |
 | `voice` | string | (none) | Voice name, alias, or file path |
 | `model` | string | (ignored) | Accepted for OpenAI compatibility |
-| `response_format` | string | `"wav"` | Audio format |
+| `response_format` | string | `"pcm"` | Audio format: `"pcm"` (streaming) or `"wav"` (buffered) |
 | `speed` | float | `1.0` | Speaking speed (0.25 - 4.0) |
+| `reference_audio` | string | (none) | Base64-encoded reference audio for voice cloning |
+| `language` | string | (none) | Language: chinese, english, japanese, korean |
 
-**Response:** Raw WAV audio bytes with `Content-Type: audio/wav`.
+**Response formats:**
+
+- **Default (PCM streaming):** Raw PCM audio (16-bit signed LE, mono, 24kHz) with `Content-Type: audio/pcm` and `Transfer-Encoding: chunked`. Chunks are sent as they're generated (~800ms per chunk). Headers include `X-Audio-Sample-Rate: 24000`, `X-Audio-Channels: 1`, `X-Audio-Bits-Per-Sample: 16`.
+
+- **WAV (buffered):** Complete WAV file with `Content-Type: audio/wav`. Triggered by `?format=wav` query parameter, `"response_format": "wav"`, or when `reference_audio` is present (voice cloning always returns WAV).
 
 **Examples:**
 
@@ -337,7 +343,7 @@ Send text to synthesize. Optionally override the voice per message:
 | `text` | string | Yes | Text to synthesize |
 | `voice_id` | string | No | Override voice for this message (falls back to `task_start` voice) |
 
-The server synthesizes the audio and streams it back as hex-encoded 8KB chunks:
+The server synthesizes the audio using native streaming generation and sends PCM chunks as they're produced (~800ms of audio per chunk, hex-encoded):
 
 ```json
 {"event": "task_progress", "data": {"audio": "52494646..."}, "is_final": false}
@@ -369,7 +375,6 @@ Common errors:
 - `"Missing 'text' field"` - `task_continue` without `text`
 - `"TTS error: ..."` - Synthesis failure
 - `"Inference unavailable"` - TTS model not loaded
-- `"TTS timed out after 60s"` - Synthesis exceeded timeout
 - `"Invalid JSON"` - Malformed message
 - `"Unknown event: ..."` - Unrecognized event type
 
@@ -905,7 +910,9 @@ src/
     llm.rs             LLM inference — Qwen3, GLM-4.7-Flash backends
     asr.rs             ASR inference — Paraformer, SenseVoice+Qwen backends
     tts.rs             TTS synthesis — GPT-SoVITS with voice registry
+    qwen3_tts.rs       Qwen3-TTS engine — streaming synthesis, voice cloning (x-vector)
     image.rs           Image generation — FLUX.2-klein, Z-Image-Turbo
+    vlm.rs             Vision-Language Model inference
 
   types/
     chat.rs            ChatCompletionRequest/Response, ChatMessage, ChatUsage
@@ -951,18 +958,18 @@ To add a new capability (e.g., video generation):
 │              Inference Thread (owns all models)               │
 │                                                               │
 │  ┌──────────────┐ ┌──────────────┐ ┌───────────────────────┐ │
-│  │  LLM Slot    │ │  ASR Slot    │ │      TTS Slot         │ │
-│  │  Qwen3 /     │ │  Paraformer  │ │  GPT-SoVITS engine    │ │
-│  │  Mistral /   │ │      /       │ │  + voice registry     │ │
+│  │  LLM Slot    │ │  ASR Slot    │ │   TTS Slot (legacy)   │ │
+│  │  Qwen3 /     │ │  Qwen3-ASR / │ │  GPT-SoVITS engine    │ │
+│  │  Mistral /   │ │  Paraformer /│ │  + voice registry     │ │
 │  │  (empty)     │ │   (empty)    │ │  + on-demand switching│ │
 │  └──────────────┘ └──────────────┘ └───────────────────────┘ │
 │                                                               │
-│  ┌──────────────┐                                             │
-│  │ Image Slot   │                                             │
-│  │ Z-Image /    │                                             │
-│  │ FLUX /       │                                             │
-│  │ (empty)      │                                             │
-│  └──────────────┘                                             │
+│  ┌──────────────┐ ┌──────────────┐ ┌───────────────────────┐ │
+│  │ Image Slot   │ │  VLM Slot    │ │  Qwen3-TTS Slot       │ │
+│  │ Z-Image /    │ │  Qwen2.5-VL /│ │  CustomVoice (preset) │ │
+│  │ FLUX /       │ │  (empty)     │ │  Base (voice cloning) │ │
+│  │ (empty)      │ │              │ │  + streaming synthesis│ │
+│  └──────────────┘ └──────────────┘ └───────────────────────┘ │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -972,18 +979,63 @@ To add a new capability (e.g., video generation):
 
 - **One Model Per Slot**: Each category has exactly one model slot. Loading a new model automatically unloads the previous one to free GPU memory.
 
-- **Shared Inference Path**: Both the REST `POST /v1/audio/speech` and WebSocket `ws/v1/tts` endpoints use the same `InferenceRequest::Speech` channel to the inference thread. Voice switching works identically for both.
+- **Shared Inference Path**: Both the REST `POST /v1/audio/speech` and WebSocket `ws/v1/tts` endpoints use the same `InferenceRequest::SpeechStream` channel to the inference thread. Voice switching works identically for both.
+
+- **Streaming TTS**: The default response format is raw PCM (16-bit signed LE, mono, 24kHz) streamed via chunked transfer encoding. Each chunk is ~800ms of audio generated by qwen3-tts-mlx's native streaming API (`Synthesizer::start_streaming` → `StreamingSession::next_chunk`). This eliminates timeout issues for long text — chunks flow continuously regardless of total audio length. Clients that need WAV can request it explicitly via `?format=wav` query parameter or `"response_format": "wav"` in the JSON body.
+
+- **TTS Model Auto-Switching**: Two Qwen3-TTS model variants exist — **Base** (with ECAPA-TDNN speaker encoder for voice cloning) and **CustomVoice** (with preset speakers like vivian, serena, ryan). The inference thread auto-switches between them based on request type: preset voice → CustomVoice, reference audio → Base. Models are discovered dynamically by scanning `~/.OminiX/models/` for directories containing "tts" and "base" or "customvoice" in the name.
 
 - **Dynamic Loading**: Models can be loaded, switched, and unloaded at runtime via `/v1/models/load` and `/v1/models/unload` endpoints.
 
 - **Memory Efficient**: Unused model slots remain empty. Unload models you're not using to free GPU memory for other tasks.
 
-- **Request Timeouts**: All inference operations have configurable timeouts to prevent hanging:
-  - Chat: 5 minutes
-  - Transcription: 2 minutes
-  - TTS: 1 minute
-  - Image: 10 minutes
-  - Model loading: 5 minutes
+### Concurrency Model & Limitations
+
+The current architecture uses a **single inference thread** that processes all requests sequentially via an mpsc channel. This means:
+
+- A long TTS generation (30s-2min) **blocks all other inference** (chat, ASR, image)
+- Concurrent TTS requests queue up — session B waits until session A finishes
+- Streaming solves client timeouts but not head-of-line blocking
+
+**Workaround: Run separate instances per modality.** For production deployments (e.g. crew gateway), run dedicated ominix-api instances for each service:
+
+```bash
+# ASR instance on port 8080
+ASR_MODEL_DIR=~/.OminiX/models/Qwen3-ASR-1.7B-8bit PORT=8080 ./ominix-api
+
+# TTS instance on port 8081
+QWEN3_TTS_MODEL=~/.OminiX/models/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit PORT=8081 ./ominix-api
+```
+
+This ensures ASR and TTS never block each other. No code changes needed.
+
+### Roadmap: Dynamic Instance Pool
+
+For high-concurrency TTS workloads, the planned architecture is a **dynamic instance pool**:
+
+```
+┌──────────────────────────────────────────────────────┐
+│                  TTS Instance Pool                     │
+│                                                        │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐               │
+│  │ Engine 0│  │ Engine 1│  │ Engine N│  (spawned on   │
+│  │ (always)│  │ (on     │  │  demand)│   demand when  │
+│  │         │  │  demand)│  │         │   RAM allows)  │
+│  └────┬────┘  └────┬────┘  └────┬────┘               │
+│       └────────────┼────────────┘                     │
+│                    │                                   │
+│           Request Router                               │
+│     (route to idle instance,                           │
+│      spawn new if all busy                             │
+│      and RAM available)                                │
+└──────────────────────────────────────────────────────┘
+```
+
+- Each Qwen3-TTS 1.7B 8-bit instance uses ~2GB RAM
+- On a 128GB machine, 3-5 concurrent TTS instances are feasible
+- Instances are spawned on demand when all existing instances are busy
+- Idle instances are reclaimed after a configurable timeout
+- System RAM is checked before spawning (`sysctl hw.memsize` - current usage)
 
 ## Performance
 

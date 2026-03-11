@@ -1,15 +1,17 @@
 use tokio::sync::{broadcast, mpsc};
 
 use crate::download;
-use crate::inference::InferenceRequest;
+use crate::inference::{InferenceRequest, TtsRequest};
 use crate::training;
 use crate::types::{DownloadProgressEvent, TrainingProgressEvent};
 
 /// Application state shared across HTTP handlers
 #[derive(Clone)]
 pub struct AppState {
-    /// Channel to send inference requests
+    /// Channel to send inference requests (LLM, ASR, image, VLM)
     pub inference_tx: mpsc::Sender<InferenceRequest>,
+    /// Channel to send TTS requests (routed to dynamic worker pool)
+    pub tts_pool_tx: mpsc::Sender<TtsRequest>,
     /// Channel to send training requests
     pub training_tx: mpsc::Sender<training::TrainingRequest>,
     /// Broadcast channel for training progress events (Sender is Clone)

@@ -1,6 +1,17 @@
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::types::*;
+
+/// A chunk of streaming audio data.
+#[derive(Debug)]
+pub enum AudioChunk {
+    /// Raw PCM i16 samples (little-endian, mono, model sample rate)
+    Pcm(Vec<u8>),
+    /// Generation finished successfully
+    Done { total_samples: usize, duration_secs: f32 },
+    /// Error during generation
+    Error(String),
+}
 
 /// Request sent to the inference thread
 pub enum InferenceRequest {
@@ -15,6 +26,11 @@ pub enum InferenceRequest {
     Speech {
         request: SpeechRequest,
         response_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
+    },
+    /// Streaming TTS — sends audio chunks as they are generated
+    SpeechStream {
+        request: SpeechRequest,
+        chunk_tx: mpsc::Sender<AudioChunk>,
     },
     /// Voice cloning TTS (dedicated endpoint, always uses Base model)
     SpeechClone {

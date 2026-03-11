@@ -80,7 +80,7 @@ pub struct SpeechCloneRequest {
 }
 
 fn default_audio_format() -> String {
-    "wav".to_string()
+    "pcm".to_string()
 }
 
 fn default_speed() -> f32 {

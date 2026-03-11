@@ -1,20 +1,14 @@
-use std::time::Duration;
-
 use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocket, WebSocketUpgrade};
-use tokio::sync::oneshot;
-use tokio::time::timeout;
+use tokio::sync::mpsc;
 
-use crate::inference::InferenceRequest;
+use crate::inference::{AudioChunk, TtsRequest};
 use crate::state::AppState;
 use crate::types::SpeechRequest;
 
 use super::helpers::get_state;
 
-/// Timeout for text-to-speech
-const TTS_TIMEOUT: Duration = Duration::from_secs(60); // 1 minute
-
-/// GET /ws/v1/tts - WebSocket streaming TTS
+/// GET /ws/v1/tts - WebSocket streaming TTS (routed to TTS pool)
 ///
 /// Protocol (MiniMax T2A compatible):
 /// 1. Connect -> Server sends {"event": "connected_success"}
@@ -46,8 +40,7 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
     // Session state from task_start
     let mut voice: Option<String> = None;
     let mut speed: f32 = 1.0;
-    let mut audio_format = "wav".to_string();
-    const CHUNK_SIZE: usize = 8192;
+    let mut _audio_format = "wav".to_string();
 
     while let Some(msg) = ws.recv().await {
         let msg = match msg {
@@ -86,7 +79,7 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
                         .unwrap_or(1.0) as f32;
                 }
                 if let Some(audio_s) = event.get("audio_setting") {
-                    audio_format = audio_s
+                    _audio_format = audio_s
                         .get("format")
                         .and_then(|v| v.as_str())
                         .unwrap_or("wav")
@@ -120,78 +113,68 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
                     model: None,
                     input: input_text,
                     voice: msg_voice,
-                    response_format: audio_format.clone(),
+                    response_format: "pcm".to_string(),
                     speed,
                     reference_audio: None,
                     language: None,
                 };
 
-                let (response_tx, response_rx) = oneshot::channel();
+                // Route to TTS pool (not inference thread)
+                let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(32);
+
                 if state
-                    .inference_tx
-                    .send(InferenceRequest::Speech {
+                    .tts_pool_tx
+                    .send(TtsRequest::SpeechStream {
                         request: speech_req,
-                        response_tx,
+                        chunk_tx,
                     })
                     .await
                     .is_err()
                 {
-                    let err = serde_json::json!({"event": "error", "message": "Inference unavailable"});
+                    let err = serde_json::json!({"event": "error", "message": "TTS pool unavailable"});
                     let _ = ws.send(Message::text(err.to_string())).await;
                     break;
                 }
 
-                match timeout(TTS_TIMEOUT, response_rx).await {
-                    Ok(Ok(Ok(audio_data))) => {
-                        if audio_data.is_empty() {
+                // Stream chunks to WebSocket as they arrive
+                let mut errored = false;
+                while let Some(chunk) = chunk_rx.recv().await {
+                    match chunk {
+                        AudioChunk::Pcm(pcm_data) => {
+                            let hex_audio = hex::encode(&pcm_data);
+                            let resp = serde_json::json!({
+                                "event": "task_progress",
+                                "data": {"audio": hex_audio},
+                                "is_final": false
+                            });
+                            if ws.send(Message::text(resp.to_string())).await.is_err() {
+                                return; // client disconnected
+                            }
+                        }
+                        AudioChunk::Done { .. } => {
+                            // Send final empty chunk
                             let resp = serde_json::json!({
                                 "event": "task_progress",
                                 "data": {"audio": ""},
                                 "is_final": true
                             });
                             let _ = ws.send(Message::text(resp.to_string())).await;
-                        } else {
-                            let total = audio_data.len();
-                            let mut sent = 0;
-
-                            for chunk in audio_data.chunks(CHUNK_SIZE) {
-                                sent += chunk.len();
-                                let is_final = sent >= total;
-                                let hex_audio = hex::encode(chunk);
-
-                                let resp = serde_json::json!({
-                                    "event": "task_progress",
-                                    "data": {"audio": hex_audio},
-                                    "is_final": is_final
-                                });
-
-                                if ws.send(Message::text(resp.to_string())).await.is_err() {
-                                    return;
-                                }
-                            }
+                            break;
+                        }
+                        AudioChunk::Error(e) => {
+                            let err = serde_json::json!({
+                                "event": "error",
+                                "message": format!("TTS error: {}", e)
+                            });
+                            let _ = ws.send(Message::text(err.to_string())).await;
+                            errored = true;
+                            break;
                         }
                     }
-                    Ok(Ok(Err(e))) => {
-                        let err = serde_json::json!({
-                            "event": "error",
-                            "message": format!("TTS error: {}", e)
-                        });
-                        let _ = ws.send(Message::text(err.to_string())).await;
-                    }
-                    Ok(Err(_)) => {
-                        let err = serde_json::json!({
-                            "event": "error",
-                            "message": "Inference channel dropped"
-                        });
-                        let _ = ws.send(Message::text(err.to_string())).await;
-                    }
-                    Err(_) => {
-                        let err = serde_json::json!({
-                            "event": "error",
-                            "message": format!("TTS timed out after {:?}", TTS_TIMEOUT)
-                        });
-                        let _ = ws.send(Message::text(err.to_string())).await;
-                    }
+                }
+
+                if errored {
+                    continue;
                 }
             }
 
