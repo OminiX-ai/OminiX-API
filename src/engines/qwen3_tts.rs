@@ -99,6 +99,11 @@ impl Qwen3TtsEngine {
         self.synthesizer.supports_voice_cloning()
     }
 
+    /// Whether preset speakers (vivian, ryan, etc.) are supported (requires CustomVoice model).
+    pub fn supports_preset_speakers(&self) -> bool {
+        self.synthesizer.supports_preset_speakers()
+    }
+
     /// Convert f32 samples to WAV bytes (16-bit PCM, mono).
     fn samples_to_wav(&self, samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
         let mut buffer = Vec::new();

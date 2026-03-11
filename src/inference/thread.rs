@@ -30,6 +30,28 @@ fn normalize_image_model(model: &str) -> &'static str {
     image::ImageModelType::from_model_id(model).normalized_name()
 }
 
+/// Search standard model directories for a TTS model variant.
+/// Looks in `~/.OminiX/models/` and `~/.ominix/models/` for dirs matching the pattern.
+fn find_tts_model(variant: &str) -> Option<String> {
+    let home = dirs::home_dir()?;
+    let search_dirs = [
+        home.join(".OminiX").join("models"),
+        home.join(".ominix").join("models"),
+    ];
+    for dir in &search_dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy().to_lowercase();
+                if entry.path().is_dir() && name_str.contains("tts") && name_str.contains(variant) {
+                    return Some(entry.path().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Inference thread that owns all models (models are not Send/Sync)
 pub fn inference_thread(
     config: Config,
@@ -120,17 +142,59 @@ pub fn inference_thread(
                 let _ = response_tx.send(result);
             }
             InferenceRequest::Speech { request, response_tx } => {
-                let result = if request.reference_audio.is_some() {
-                    // Voice cloning via Qwen3-TTS x-vector
+                let needs_cloning = request.reference_audio.is_some();
+
+                // Auto-switch TTS model variant if needed
+                if needs_cloning {
+                    // Voice cloning needs Base model
+                    if qwen3_tts_engine.as_ref().is_some_and(|e| !e.supports_voice_cloning())
+                        || qwen3_tts_engine.is_none()
+                    {
+                        if let Some(base_path) = find_tts_model("base") {
+                            tracing::info!("Auto-switching to Base TTS model: {base_path}");
+                            if let Err(e) = load_model_slot(
+                                &mut qwen3_tts_engine,
+                                &mut current_qwen3_tts_model,
+                                &base_path,
+                                qwen3_tts::Qwen3TtsEngine::new,
+                            ) {
+                                tracing::warn!("Failed to auto-load Base TTS: {e}");
+                            }
+                        } else {
+                            tracing::warn!("Base TTS model not found on disk — download qwen3-tts-base");
+                        }
+                    }
+                } else {
+                    // Preset speakers need CustomVoice model
+                    if qwen3_tts_engine.as_ref().is_some_and(|e| !e.supports_preset_speakers()) {
+                        if let Some(cv_path) = find_tts_model("customvoice") {
+                            tracing::info!("Auto-switching to CustomVoice TTS model: {cv_path}");
+                            if let Err(e) = load_model_slot(
+                                &mut qwen3_tts_engine,
+                                &mut current_qwen3_tts_model,
+                                &cv_path,
+                                qwen3_tts::Qwen3TtsEngine::new,
+                            ) {
+                                tracing::warn!("Failed to auto-load CustomVoice TTS: {e}");
+                            }
+                        } else {
+                            tracing::warn!("CustomVoice TTS model not found on disk — download qwen3-tts");
+                        }
+                    }
+                }
+
+                let result = if needs_cloning {
                     if let Some(ref mut engine) = qwen3_tts_engine {
                         let ref_audio = request.reference_audio.as_deref().unwrap();
                         let language = request.language.as_deref().unwrap_or("chinese");
                         engine.synthesize_clone(&request.input, ref_audio, language, request.speed)
                     } else {
-                        Err(eyre::eyre!("Qwen3-TTS model not loaded (set QWEN3_TTS_MODEL_DIR)"))
+                        Err(eyre::eyre!(
+                            "Base TTS model not available. Download it first: \
+                             download_model(model_id='qwen3-tts-base')"
+                        ))
                     }
                 } else if let Some(ref mut engine) = qwen3_tts_engine {
-                    // Prefer Qwen3-TTS for preset speakers if loaded
                     engine.synthesize(&request)
                 } else if let Some(ref mut engine) = tts_engine {
                     engine.synthesize(&request)
