@@ -285,6 +285,77 @@ impl Qwen3TtsEngine {
         self.samples_to_wav(&all_samples, self.synthesizer.sample_rate)
     }
 
+    /// Sentence-level streaming for voice cloning: split text, synthesize each
+    /// sentence with the same speaker embedding, send PCM per sentence via callback.
+    pub fn synthesize_clone_sentences(
+        &mut self,
+        text: &str,
+        ref_audio_path: &str,
+        language: &str,
+        speed: f32,
+        mut on_pcm: impl FnMut(&[u8]) -> bool,
+    ) -> Result<()> {
+        let expanded = crate::utils::expand_tilde(ref_audio_path);
+
+        if !std::path::Path::new(&expanded).exists() {
+            return Err(eyre::eyre!("Reference audio not found: {expanded}"));
+        }
+
+        // Load and resample to 24kHz
+        let (samples, sr) = mlx_rs_core::audio::load_wav(&expanded)
+            .context("Failed to load reference audio")?;
+
+        let ref_samples = if sr != 24000 {
+            tracing::info!("Resampling reference audio from {sr}Hz to 24000Hz");
+            mlx_rs_core::audio::resample(&samples, sr, 24000)
+        } else {
+            samples
+        };
+
+        let opts = SynthesizeOptions {
+            language,
+            speed_factor: if speed != 1.0 { Some(speed) } else { None },
+            ..Default::default()
+        };
+
+        let sentences = split_sentences(text);
+        tracing::info!(
+            "Clone sentence streaming: {} sentences from {} chars",
+            sentences.len(),
+            text.chars().count()
+        );
+
+        let mut total_samples = 0usize;
+        for (i, sentence) in sentences.iter().enumerate() {
+            let samples = self.synthesizer
+                .synthesize_voice_clone(sentence, &ref_samples, language, &opts)
+                .map_err(|e| eyre::eyre!("Clone sentence {i} failed: {e}"))?;
+
+            total_samples += samples.len();
+            let pcm = Self::samples_to_pcm(&samples);
+
+            tracing::debug!(
+                "Clone sentence {}/{}: {:.1}s audio, {} chars",
+                i + 1,
+                sentences.len(),
+                samples.len() as f32 / self.synthesizer.sample_rate as f32,
+                sentence.chars().count()
+            );
+
+            if !on_pcm(&pcm) {
+                tracing::info!("Client disconnected after clone sentence {i}");
+                break;
+            }
+        }
+
+        let duration = total_samples as f32 / self.synthesizer.sample_rate as f32;
+        tracing::info!(
+            "Clone sentence streaming complete: {:.1}s audio ({total_samples} samples)",
+            duration
+        );
+        Ok(())
+    }
+
     /// Whether voice cloning is supported (requires Base model with speaker encoder).
     pub fn supports_voice_cloning(&self) -> bool {
         self.synthesizer.supports_voice_cloning()

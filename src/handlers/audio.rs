@@ -124,7 +124,8 @@ pub async fn audio_speech(
 /// POST /v1/audio/speech/clone - Voice cloning TTS
 ///
 /// Dedicated endpoint for voice cloning with reference audio.
-/// Routed to TTS pool which auto-loads Base model with ECAPA-TDNN speaker encoder.
+/// Streams PCM chunks per-sentence by default (pseudo-streaming).
+/// Use `?format=wav` for a complete WAV response.
 #[handler]
 pub async fn audio_speech_clone(
     req: &mut Request,
@@ -138,15 +139,55 @@ pub async fn audio_speech_clone(
         StatusError::bad_request()
     })?;
 
-    let audio_data = send_tts_and_wait(
-        &state.tts_pool_tx,
-        |tx| TtsRequest::SpeechClone { request, response_tx: tx },
-        TTS_CLONE_TIMEOUT,
-    )
-    .await?;
+    let wants_wav = req.query::<String>("format").as_deref() == Some("wav");
+
+    if wants_wav {
+        // Non-streaming: complete WAV
+        let audio_data = send_tts_and_wait(
+            &state.tts_pool_tx,
+            |tx| TtsRequest::SpeechClone { request, response_tx: tx },
+            TTS_CLONE_TIMEOUT,
+        )
+        .await?;
+
+        res.headers_mut()
+            .insert("Content-Type", "audio/wav".parse().unwrap());
+        res.write_body(audio_data).ok();
+        return Ok(());
+    }
+
+    // Streaming: send PCM chunks per sentence
+    let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
+
+    state
+        .tts_pool_tx
+        .send(TtsRequest::SpeechCloneStream {
+            request,
+            chunk_tx,
+        })
+        .await
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    let stream = ReceiverStream::new(chunk_rx).filter_map(|chunk| match chunk {
+        AudioChunk::Pcm(data) => Some(Ok::<_, std::io::Error>(salvo::hyper::body::Bytes::from(data))),
+        AudioChunk::Done { .. } => None,
+        AudioChunk::Error(e) => {
+            tracing::error!("Streaming clone TTS error: {e}");
+            None
+        }
+    });
 
     res.headers_mut()
-        .insert("Content-Type", "audio/wav".parse().unwrap());
-    res.write_body(audio_data).ok();
+        .insert("Content-Type", "audio/pcm".parse().unwrap());
+    res.headers_mut()
+        .insert("X-Audio-Sample-Rate", "24000".parse().unwrap());
+    res.headers_mut()
+        .insert("X-Audio-Channels", "1".parse().unwrap());
+    res.headers_mut()
+        .insert("X-Audio-Bits-Per-Sample", "16".parse().unwrap());
+    res.headers_mut()
+        .insert("Transfer-Encoding", "chunked".parse().unwrap());
+
+    res.stream(stream);
     Ok(())
 }

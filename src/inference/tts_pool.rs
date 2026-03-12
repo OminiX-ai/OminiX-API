@@ -44,10 +44,15 @@ pub enum TtsRequest {
         request: SpeechRequest,
         chunk_tx: mpsc::Sender<AudioChunk>,
     },
-    /// Voice cloning (always returns complete WAV).
+    /// Voice cloning (returns complete WAV).
     SpeechClone {
         request: SpeechCloneRequest,
         response_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
+    },
+    /// Streaming voice cloning — yields PCM chunks per sentence.
+    SpeechCloneStream {
+        request: SpeechCloneRequest,
+        chunk_tx: mpsc::Sender<AudioChunk>,
     },
 }
 
@@ -234,6 +239,38 @@ fn worker_main(
                     None => Err(eyre::eyre!("Base TTS model not found for voice cloning")),
                 };
                 let _ = response_tx.send(result);
+            }
+
+            TtsRequest::SpeechCloneStream {
+                request,
+                chunk_tx,
+            } => {
+                let engine = ensure_base(&mut base_engine, id);
+                if let Some(engine) = engine {
+                    let tx = chunk_tx.clone();
+                    let result = engine.synthesize_clone_sentences(
+                        &request.input,
+                        &request.reference_audio,
+                        &request.language,
+                        request.speed,
+                        |pcm_bytes| tx.blocking_send(AudioChunk::Pcm(pcm_bytes.to_vec())).is_ok(),
+                    );
+                    match result {
+                        Ok(()) => {
+                            let _ = chunk_tx.blocking_send(AudioChunk::Done {
+                                total_samples: 0,
+                                duration_secs: 0.0,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = chunk_tx.blocking_send(AudioChunk::Error(
+                        "Base TTS model not found for voice cloning".to_string(),
+                    ));
+                }
             }
         }
 
