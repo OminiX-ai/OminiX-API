@@ -59,28 +59,23 @@ pub enum TtsRequest {
 /// Configuration for the TTS worker pool.
 #[derive(Debug, Clone)]
 pub struct TtsPoolConfig {
-    // NOTE: Scaling fields kept for future use when MLX supports concurrent
-    // inference from multiple threads. Currently only 1 worker is used.
-    //
-    // /// Maximum number of concurrent TTS worker threads.
-    // pub max_workers: usize,
-    // /// Seconds of idle time before a surplus worker is reclaimed.
-    // pub idle_timeout_secs: u64,
-    // /// Minimum free RAM (GB) required before spawning a new worker.
-    // pub min_free_ram_gb: f64,
-    // /// Approximate RAM per TTS engine instance (GB).
-    // pub ram_per_instance_gb: f64,
+    /// When true (default), load both CustomVoice and Base models at startup
+    /// instead of on first request. Set `TTS_LAZY_LOAD=1` to use lazy loading.
+    pub eager_load: bool,
 }
 
 impl Default for TtsPoolConfig {
     fn default() -> Self {
-        Self {}
+        Self { eager_load: true }
     }
 }
 
 impl TtsPoolConfig {
     pub fn from_env() -> Self {
-        Self::default()
+        let eager_load = std::env::var("TTS_LAZY_LOAD")
+            .map(|v| v != "1" && v.to_lowercase() != "true")
+            .unwrap_or(true);
+        Self { eager_load }
     }
 }
 
@@ -132,7 +127,7 @@ fn now_epoch_secs() -> u64 {
 
 // ── Worker thread ───────────────────────────────────────────────────
 
-fn spawn_worker(id: usize) -> WorkerHandle {
+fn spawn_worker(id: usize, eager_load: bool) -> WorkerHandle {
     let queued = Arc::new(AtomicU64::new(0));
     let last_active = Arc::new(AtomicU64::new(now_epoch_secs()));
 
@@ -144,7 +139,7 @@ fn spawn_worker(id: usize) -> WorkerHandle {
     let thread = std::thread::Builder::new()
         .name(format!("tts-worker-{id}"))
         .spawn(move || {
-            worker_main(id, rx, queued_clone, last_active_clone);
+            worker_main(id, rx, queued_clone, last_active_clone, eager_load);
         })
         .expect("failed to spawn TTS worker thread");
 
@@ -161,12 +156,23 @@ fn worker_main(
     rx: std::sync::mpsc::Receiver<TtsRequest>,
     queued: Arc<AtomicU64>,
     last_active: Arc<AtomicU64>,
+    eager_load: bool,
 ) {
-    tracing::info!("TTS worker {id} started");
+    tracing::info!("TTS worker {id} started (eager_load={eager_load})");
 
-    // Lazy-loaded engine slots (one per model variant).
     let mut cv_engine: Option<qwen3_tts::Qwen3TtsEngine> = None;
     let mut base_engine: Option<qwen3_tts::Qwen3TtsEngine> = None;
+
+    if eager_load {
+        tracing::info!("TTS worker {id}: eager-loading models at startup...");
+        ensure_customvoice(&mut cv_engine, id);
+        ensure_base(&mut base_engine, id);
+        let cv_ok = cv_engine.is_some();
+        let base_ok = base_engine.is_some();
+        tracing::info!(
+            "TTS worker {id}: eager load complete (CustomVoice={cv_ok}, Base={base_ok})"
+        );
+    }
 
     while let Ok(request) = rx.recv() {
 
@@ -343,10 +349,10 @@ fn ensure_base(
 ///
 /// Only one worker is used because MLX lacks thread-safe concurrent
 /// inference (see module docs). All requests queue to worker 0.
-pub fn run_pool(mut rx: mpsc::Receiver<TtsRequest>, _config: TtsPoolConfig) {
+pub fn run_pool(mut rx: mpsc::Receiver<TtsRequest>, config: TtsPoolConfig) {
     tracing::info!("TTS pool started (single worker — MLX is not thread-safe for concurrent inference)");
 
-    let worker = spawn_worker(0);
+    let worker = spawn_worker(0, config.eager_load);
 
     while let Some(request) = rx.blocking_recv() {
         worker.queued.fetch_add(1, Ordering::Release);
