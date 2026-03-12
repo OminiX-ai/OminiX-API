@@ -204,6 +204,10 @@ impl Qwen3TtsEngine {
     /// Synthesize speech using x-vector voice cloning.
     /// Loads reference audio from `ref_audio_path`, extracts speaker embedding,
     /// then generates speech in that voice.
+    ///
+    /// For long text, automatically splits at sentence boundaries and synthesizes
+    /// each sentence independently (reusing the same speaker embedding). This
+    /// avoids hitting the per-call token limit (~25-30s audio) of the Base model.
     pub fn synthesize_clone(
         &mut self,
         text: &str,
@@ -237,10 +241,48 @@ impl Qwen3TtsEngine {
             ..Default::default()
         };
 
-        let output = self.synthesizer.synthesize_voice_clone(text, &ref_samples, language, &opts)
-            .map_err(|e| eyre::eyre!("Voice cloning failed: {e}"))?;
+        // Split into sentences for long text to avoid per-call token limits
+        let sentences = split_sentences(text);
 
-        self.samples_to_wav(&output, self.synthesizer.sample_rate)
+        let all_samples = if sentences.len() <= 1 {
+            // Short text — single pass
+            self.synthesizer.synthesize_voice_clone(text, &ref_samples, language, &opts)
+                .map_err(|e| eyre::eyre!("Voice cloning failed: {e}"))?
+        } else {
+            // Long text — synthesize each sentence with the same speaker embedding
+            tracing::info!(
+                "Clone sentence chunking: {} sentences from {} chars",
+                sentences.len(),
+                text.chars().count()
+            );
+
+            let mut all = Vec::new();
+            for (i, sentence) in sentences.iter().enumerate() {
+                let samples = self.synthesizer
+                    .synthesize_voice_clone(sentence, &ref_samples, language, &opts)
+                    .map_err(|e| eyre::eyre!("Clone sentence {i} failed: {e}"))?;
+
+                tracing::debug!(
+                    "Clone sentence {}/{}: {:.1}s audio, {} chars",
+                    i + 1,
+                    sentences.len(),
+                    samples.len() as f32 / self.synthesizer.sample_rate as f32,
+                    sentence.chars().count()
+                );
+
+                all.extend_from_slice(&samples);
+            }
+
+            let duration = all.len() as f32 / self.synthesizer.sample_rate as f32;
+            tracing::info!(
+                "Clone sentence chunking complete: {:.1}s audio ({} samples)",
+                duration,
+                all.len()
+            );
+            all
+        };
+
+        self.samples_to_wav(&all_samples, self.synthesizer.sample_rate)
     }
 
     /// Whether voice cloning is supported (requires Base model with speaker encoder).
