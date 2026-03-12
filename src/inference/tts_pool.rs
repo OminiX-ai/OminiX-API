@@ -192,12 +192,15 @@ fn worker_main(
             }
 
             TtsRequest::SpeechStream { request, chunk_tx } => {
+                // Sentence-level streaming: split text into sentences, synthesize
+                // each independently (full decode per sentence = no artifacts),
+                // and send PCM as each sentence completes. Client receives first
+                // audio after ~2-3s instead of waiting for full synthesis.
                 let engine = ensure_customvoice(&mut cv_engine, id);
                 if let Some(engine) = engine {
                     let tx = chunk_tx.clone();
-                    let result = engine.synthesize_streaming(&request, |samples| {
-                        let pcm = qwen3_tts::Qwen3TtsEngine::samples_to_pcm(&samples);
-                        tx.blocking_send(AudioChunk::Pcm(pcm)).is_ok()
+                    let result = engine.synthesize_sentences(&request, |pcm_bytes| {
+                        tx.blocking_send(AudioChunk::Pcm(pcm_bytes.to_vec())).is_ok()
                     });
                     match result {
                         Ok(()) => {
@@ -207,8 +210,7 @@ fn worker_main(
                             });
                         }
                         Err(e) => {
-                            let _ =
-                                chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
+                            let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
                         }
                     }
                 } else {

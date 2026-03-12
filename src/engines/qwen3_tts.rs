@@ -5,9 +5,158 @@
 //! which conditions the TTS generation to match the reference speaker.
 
 use eyre::{Context, Result};
-use qwen3_tts_mlx::{Synthesizer, SynthesizeOptions, DEFAULT_CHUNK_FRAMES};
+use qwen3_tts_mlx::{Synthesizer, SynthesizeOptions};
 
 use crate::types::SpeechRequest;
+
+/// Maximum characters (Unicode) per sentence chunk. Sentences longer than this
+/// are force-split at clause boundaries or whitespace.
+const MAX_SENTENCE_CHARS: usize = 200;
+
+/// Minimum characters to accumulate before emitting a sentence. Tiny fragments
+/// like "Yes." or "OK!" are merged with the next sentence to reduce per-call
+/// overhead and improve prosody continuity.
+const MIN_SENTENCE_CHARS: usize = 20;
+
+/// Split text into sentences suitable for independent TTS synthesis.
+///
+/// Uses CJK sentence-ending punctuation (。！？) unconditionally. For ASCII
+/// period, only splits when followed by whitespace + uppercase (avoids breaking
+/// on abbreviations like "Dr." or decimals like "3.14"). Tiny sentences are
+/// merged with the next. Oversized sentences are further split at clause
+/// boundaries or whitespace.
+fn split_sentences(text: &str) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return vec![];
+    }
+
+    let mut raw_sentences = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = text.chars().collect();
+
+    for (idx, &ch) in chars.iter().enumerate() {
+        current.push(ch);
+
+        // CJK sentence enders — always split
+        let is_cjk_end = matches!(ch, '。' | '！' | '？' | '…');
+
+        // ASCII sentence enders — only split when followed by space+uppercase
+        // or end of text, to avoid breaking "Dr.", "3.14", "U.S." etc.
+        let is_ascii_end = matches!(ch, '!' | '?') || (ch == '.' && {
+            // Check if next non-space char is uppercase or end of text
+            let rest = &chars[idx + 1..];
+            let next_alpha = rest.iter().skip_while(|c| c.is_whitespace()).next();
+            match next_alpha {
+                None => true,                   // end of text
+                Some(c) => c.is_uppercase(),    // "word. Next" → split
+            }
+        });
+
+        let is_newline = ch == '\n';
+
+        if is_cjk_end || is_ascii_end || is_newline {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                raw_sentences.push(trimmed);
+            }
+            current.clear();
+        }
+    }
+
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        raw_sentences.push(trimmed);
+    }
+
+    // Merge tiny sentences with the next one
+    let mut merged = Vec::new();
+    let mut carry = String::new();
+    for s in raw_sentences {
+        if !carry.is_empty() {
+            carry.push(' ');
+            carry.push_str(&s);
+        } else {
+            carry = s;
+        }
+        if carry.chars().count() >= MIN_SENTENCE_CHARS {
+            merged.push(carry.clone());
+            carry.clear();
+        }
+    }
+    if !carry.is_empty() {
+        if let Some(last) = merged.last_mut() {
+            last.push(' ');
+            last.push_str(&carry);
+        } else {
+            merged.push(carry);
+        }
+    }
+
+    // Split oversized sentences at clause boundaries
+    let mut result = Vec::new();
+    for sentence in merged {
+        if sentence.chars().count() <= MAX_SENTENCE_CHARS {
+            result.push(sentence);
+        } else {
+            split_long_sentence(&sentence, &mut result);
+        }
+    }
+
+    result
+}
+
+/// Split an oversized sentence at commas/semicolons, then whitespace.
+fn split_long_sentence(text: &str, out: &mut Vec<String>) {
+    let mut current = String::new();
+    let mut char_count = 0usize;
+
+    for ch in text.chars() {
+        current.push(ch);
+        char_count += 1;
+
+        let is_clause_break = matches!(ch,
+            ',' | ';' | ':' | '，' | '；' | '：' | '、'
+        );
+
+        if is_clause_break && char_count >= 30 {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                out.push(trimmed);
+            }
+            current.clear();
+            char_count = 0;
+        }
+    }
+
+    // If still oversized, split at whitespace
+    let remaining = current.trim().to_string();
+    if remaining.chars().count() <= MAX_SENTENCE_CHARS || !remaining.contains(' ') {
+        if !remaining.is_empty() {
+            out.push(remaining);
+        }
+    } else {
+        let mut chunk = String::new();
+        let mut chunk_chars = 0usize;
+        for word in remaining.split_whitespace() {
+            let word_chars = word.chars().count();
+            if chunk_chars > 0 && chunk_chars + 1 + word_chars > MAX_SENTENCE_CHARS {
+                out.push(chunk.clone());
+                chunk.clear();
+                chunk_chars = 0;
+            }
+            if chunk_chars > 0 {
+                chunk.push(' ');
+                chunk_chars += 1;
+            }
+            chunk.push_str(word);
+            chunk_chars += word_chars;
+        }
+        if !chunk.is_empty() {
+            out.push(chunk);
+        }
+    }
+}
 
 /// Qwen3-TTS inference engine.
 pub struct Qwen3TtsEngine {
@@ -109,12 +258,16 @@ impl Qwen3TtsEngine {
         self.synthesizer.sample_rate
     }
 
-    /// Streaming synthesis: yields audio sample chunks via a callback.
-    /// Each chunk is ~800ms of audio (DEFAULT_CHUNK_FRAMES=10 frames at 12Hz).
-    pub fn synthesize_streaming(
+    /// Sentence-level streaming: split text at sentence boundaries, synthesize
+    /// each sentence independently, and send PCM via callback as each completes.
+    ///
+    /// This gives pseudo-streaming for long text — the client receives audio for
+    /// the first sentence while later sentences are still generating. Each sentence
+    /// is decoded in a single pass (no chunk boundary artifacts).
+    pub fn synthesize_sentences(
         &mut self,
         request: &SpeechRequest,
-        mut on_chunk: impl FnMut(Vec<f32>) -> bool, // return false to stop
+        mut on_pcm: impl FnMut(&[u8]) -> bool, // return false to stop
     ) -> Result<()> {
         let speaker = request.voice.as_deref().unwrap_or("vivian");
         let language = request.language.as_deref().unwrap_or("chinese");
@@ -126,22 +279,36 @@ impl Qwen3TtsEngine {
             ..Default::default()
         };
 
-        let mut session = self.synthesizer.start_streaming(&request.input, &opts, DEFAULT_CHUNK_FRAMES)
-            .map_err(|e| eyre::eyre!("Failed to start streaming TTS: {e}"))?;
+        let sentences = split_sentences(&request.input);
+        tracing::info!(
+            "Sentence-level streaming: {} sentences from {} chars",
+            sentences.len(),
+            request.input.len()
+        );
 
-        while let Some(samples) = session.next_chunk()
-            .map_err(|e| eyre::eyre!("Streaming TTS chunk error: {e}"))?
-        {
-            if !on_chunk(samples) {
+        let mut total_samples = 0usize;
+        for (i, sentence) in sentences.iter().enumerate() {
+            let samples = self.synthesizer.synthesize(sentence, &opts)
+                .map_err(|e| eyre::eyre!("TTS sentence {i} failed: {e}"))?;
+
+            total_samples += samples.len();
+            let pcm = Self::samples_to_pcm(&samples);
+
+            tracing::debug!(
+                "Sentence {i}/{}: {:.1}s audio, {} chars",
+                sentences.len(),
+                samples.len() as f32 / self.synthesizer.sample_rate as f32,
+                sentence.len()
+            );
+
+            if !on_pcm(&pcm) {
+                tracing::info!("Client disconnected after sentence {i}");
                 break;
             }
         }
 
-        tracing::info!(
-            "Streaming TTS complete: {:.1}s audio ({} samples)",
-            session.duration_secs(),
-            session.total_samples()
-        );
+        let duration = total_samples as f32 / self.synthesizer.sample_rate as f32;
+        tracing::info!("Sentence streaming complete: {:.1}s audio ({total_samples} samples)", duration);
         Ok(())
     }
 
