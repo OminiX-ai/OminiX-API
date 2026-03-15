@@ -17,6 +17,8 @@ pub fn build_router(state: AppState) -> Router {
         .push(Router::with_path("health").get(handlers::health::health))
         .push(
             Router::with_path("v1")
+                // Version
+                .push(Router::with_path("version").get(handlers::version::get_version))
                 // Models — no handler on "models" itself, use empty-path child for exact match
                 .push(Router::with_path("models")
                     .push(Router::new().get(handlers::health::list_models))

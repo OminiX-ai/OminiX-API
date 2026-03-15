@@ -56,6 +56,9 @@ ASR_MODEL_DIR=./models/paraformer \
 TTS_REF_AUDIO=./audio/reference.wav \
 IMAGE_MODEL=zimage \
 cargo run --release
+
+# Run with app manifest validation
+cargo run --release -- --app-manifest my-app.ominix.toml
 ```
 
 ## Environment Variables
@@ -69,14 +72,18 @@ cargo run --release
 | `IMAGE_MODEL` | (empty) | Image model: `zimage` or `flux` |
 | `FLUX_MODEL_DIR` | (auto-download) | Custom path to FLUX.2-klein model |
 | `ZIMAGE_MODEL_DIR` | (auto-download) | Custom path to Z-Image-Turbo model |
+| `QWEN3_TTS_MODEL_DIR` | (empty) | Path to Qwen3-TTS model directory |
+| `VLM_MODEL` | (empty) | VLM model ID |
 | `VOICES_CONFIG` | `~/.dora/models/primespeech/voices.json` | Path to voice registry file |
 | `TTS_VOICES_DIR` | (none) | Allowed directory for voice file path references |
+| `OMINIX_APP_MANIFEST` | (none) | Path to app manifest (`ominix.toml`) for startup validation |
 
 ## Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
+| `/v1/version` | GET | Server capabilities and version info |
 | `/v1/models` | GET | List loaded models |
 | `/v1/models/status` | GET | Get current model status for each category |
 | `/v1/models/report` | GET | Model availability report (scanned from config + hub caches) |
@@ -882,15 +889,136 @@ models/zimage/                        # Z-Image-Turbo
 
 ---
 
+## Versioning & App Manifests
+
+OminiX-API includes a capability versioning system. Each OminiX-MLX model crate declares its capabilities in an `ominix.toml` manifest. At build time, these are compiled into a registry that apps can query at runtime or validate against at startup.
+
+### Version Endpoint
+
+**`GET /v1/version`**
+
+Returns all available capabilities, their versions, and currently loaded models:
+
+```bash
+curl http://localhost:8080/v1/version
+```
+
+```json
+{
+  "ominix_api": "0.1.0",
+  "capabilities": {
+    "qwen3-tts": {
+      "name": "qwen3-tts",
+      "version": "1.0.0",
+      "category": "tts",
+      "description": "Qwen3 TTS with preset voices and voice cloning",
+      "capabilities": ["streaming", "voice_cloning", "preset_voices"]
+    },
+    "qwen3-asr": {
+      "name": "qwen3-asr",
+      "version": "0.1.0",
+      "category": "asr",
+      "description": "Qwen3 ASR speech recognition",
+      "capabilities": ["multilingual"]
+    },
+    "flux-klein": {
+      "name": "flux-klein",
+      "version": "0.1.0",
+      "category": "image",
+      "description": "FLUX.2-klein image generation",
+      "capabilities": ["quantization", "text_to_image"]
+    }
+  },
+  "models_loaded": []
+}
+```
+
+### App Manifest (`ominix.toml`)
+
+Apps can declare their requirements in an `ominix.toml` file. OminiX-API validates these at startup when launched with `--app-manifest`:
+
+```bash
+ominix-api --app-manifest my-app.ominix.toml
+# or via environment variable:
+OMINIX_APP_MANIFEST=my-app.ominix.toml ominix-api
+```
+
+**Example manifest:**
+
+```toml
+[app]
+name = "my-voice-bot"
+version = "0.1.0"
+ominix_api = ">=0.1.0"
+
+[requires]
+tts = ">=1.0.0"
+asr = ">=0.1.0"
+llm = ">=0.1.0"
+```
+
+Requirements are checked by **category** (tts, asr, llm, image, vlm, ocr). Version constraints use [semver](https://semver.org/) syntax.
+
+**Advanced: require specific capabilities:**
+
+```toml
+[app]
+name = "voice-cloning-app"
+version = "0.1.0"
+
+[requires.tts]
+version = ">=1.0.0"
+[requires.tts.capabilities]
+voice_cloning = true
+streaming = true
+```
+
+If any requirement is not satisfied, the server exits with a clear error message listing what's missing.
+
+### OminiX-MLX Capability Manifest
+
+Each model crate in OminiX-MLX has an `ominix.toml` describing what it provides:
+
+```toml
+# qwen3-tts-mlx/ominix.toml
+[package]
+name = "qwen3-tts"
+version = "1.0.0"
+category = "tts"
+description = "Qwen3 TTS with preset voices and voice cloning"
+
+[capabilities]
+streaming = true
+voice_cloning = true
+preset_voices = true
+```
+
+These are read at build time by `build.rs` and compiled into the binary. When you update a crate's version or capabilities, just rebuild OminiX-API.
+
+### Available Capabilities
+
+| Category | Crate | Version | Key Capabilities |
+|----------|-------|---------|------------------|
+| `tts` | qwen3-tts | 1.0.0 | streaming, voice_cloning, preset_voices |
+| `asr` | qwen3-asr | 0.1.0 | multilingual |
+| `llm` | qwen3-llm | 0.1.0 | streaming, tool_use, thinking |
+| `image` | flux-klein | 0.1.0 | text_to_image, quantization |
+| `image` | zimage | 0.1.0 | text_to_image, quantization |
+| `vlm` | moxin-vlm | 0.1.0 | image_understanding, quantization |
+| `ocr` | deepseek-ocr2 | 0.1.0 | pdf, document, grounding |
+
+---
+
 ## Project Structure
 
 ```
 src/
   main.rs              Entry point — tracing, channels, thread spawning, server start
-  config.rs            Config struct (from environment variables)
+  config.rs            Config struct (from environment variables and CLI args)
   state.rs             AppState (shared across HTTP handlers)
   error.rs             render_error() helper for OpenAI-compatible error responses
   router.rs            Builds the Salvo Router with all endpoint routes
+  version.rs           Capability registry, app manifest parsing, requirement validation
 
   inference/
     request.rs         InferenceRequest enum — the message protocol between handlers and inference thread
@@ -899,6 +1027,7 @@ src/
   handlers/
     helpers.rs         get_state(), send_and_wait() — dedup boilerplate across handlers
     health.rs          GET /health, /v1/models, /v1/models/status, /v1/models/report
+    version.rs         GET /v1/version — capability registry and version info
     chat.rs            POST /v1/chat/completions
     audio.rs           POST /v1/audio/transcriptions, /v1/audio/speech
     image.rs           POST /v1/images/generations, /v1/models/quantize
@@ -925,6 +1054,10 @@ src/
   model_config.rs      Model registry, hub cache scanning, availability checking
   training.rs          Voice cloning pipeline (5 stages on dedicated thread)
   utils.rs             Path utilities and security helpers
+
+build.rs               Reads OminiX-MLX ominix.toml manifests, generates capability_registry.rs
+examples/
+  voice-bot.ominix.toml  Example app manifest for startup validation
 ```
 
 ### Adding a New Model Type

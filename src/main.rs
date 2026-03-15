@@ -33,6 +33,7 @@ mod model_config;
 mod training;
 mod types;
 mod utils;
+mod version;
 
 use config::Config;
 use inference::{InferenceRequest, TtsPoolConfig, TtsRequest};
@@ -50,7 +51,12 @@ async fn main() -> eyre::Result<()> {
         .init();
 
     let config = Config::from_env();
-    tracing::info!("Starting OminiX-API server on port {}", config.port);
+    tracing::info!("Starting OminiX-API v{} on port {}", version::API_VERSION, config.port);
+
+    // Validate app manifest if provided
+    if let Some(ref manifest_path) = config.app_manifest {
+        version::validate_manifest(manifest_path)?;
+    }
 
     // Scan hub caches and register discovered models
     model_config::scan_hub_caches();
@@ -138,6 +144,7 @@ async fn main() -> eyre::Result<()> {
 
     tracing::info!("Endpoints:");
     tracing::info!("  GET  /health");
+    tracing::info!("  GET  /v1/version");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  GET  /v1/models/status");
     tracing::info!("  GET  /v1/models/report");

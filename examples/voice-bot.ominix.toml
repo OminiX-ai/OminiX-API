@@ -1,0 +1,12 @@
+# Example app manifest for a voice bot
+# Validates at startup: ominix-api --app-manifest voice-bot.ominix.toml
+
+[app]
+name = "my-voice-bot"
+version = "0.1.0"
+ominix_api = ">=0.1.0"
+
+[requires]
+tts = ">=1.0.0"
+asr = ">=0.1.0"
+llm = ">=0.1.0"

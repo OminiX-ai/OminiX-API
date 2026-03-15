@@ -19,6 +19,8 @@ pub struct Config {
     pub image_model: String,
     pub vlm_model: String,
     pub qwen3_tts_model_dir: String,
+    /// Path to app manifest (`ominix.toml`) for requirement validation.
+    pub app_manifest: Option<String>,
 }
 
 impl Config {
@@ -41,6 +43,7 @@ impl Config {
                 .unwrap_or_default(),
             qwen3_tts_model_dir: std::env::var("QWEN3_TTS_MODEL_DIR")
                 .unwrap_or_default(),
+            app_manifest: std::env::var("OMINIX_APP_MANIFEST").ok(),
         };
 
         // Override with CLI arguments
@@ -95,6 +98,12 @@ impl Config {
                 "--models-dir" => {
                     // Consumed by model_config, not stored here
                     i += 1;
+                }
+                "--app-manifest" => {
+                    if let Some(val) = args.get(i + 1) {
+                        config.app_manifest = Some(val.clone());
+                        i += 1;
+                    }
                 }
                 _ => {}
             }
