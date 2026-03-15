@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: blaze/macos-15
+    steps:
+      - name: Checkout OminiX-API
+        uses: actions/checkout@v5
+        with:
+          path: OminiX-API
+          fetch-depth: 0
+
+      - name: Checkout OminiX-MLX
+        uses: actions/checkout@v5
+        with:
+          repository: OminiX-ai/OminiX-MLX
+          path: OminiX-MLX
+          submodules: true
+          token: ${{ secrets.MLX_REPO_TOKEN }}
+
+      - run: sudo xcodes select 16.4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: OminiX-API
+          key: release
+
+      - name: Build release binary
+        working-directory: OminiX-API
+        run: cargo build --release
+
+      - name: Generate release notes
+        run: |
+          brew install git-cliff || true
+          cd OminiX-API
+          git cliff --latest --strip header -o RELEASE_NOTES.md
+
+      - name: Package binary
+        working-directory: OminiX-API
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p dist
+          cp target/release/ominix-api dist/
+          cd dist
+          tar czf ominix-api-${VERSION}-darwin-aarch64.tar.gz ominix-api
+          shasum -a 256 ominix-api-${VERSION}-darwin-aarch64.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: OminiX-API/RELEASE_NOTES.md
+          files: |
+            OminiX-API/dist/ominix-api-*.tar.gz
+            OminiX-API/dist/checksums.txt

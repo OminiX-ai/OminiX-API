@@ -1,0 +1,11 @@
+[workspace]
+allow-branch = ["main"]
+sign-commit = false
+sign-tag = false
+push = true
+publish = false           # Not publishing to crates.io (path deps)
+tag-prefix = "v"
+tag-name = "v{{version}}"
+pre-release-commit-message = "release: v{{version}}"
+tag-message = "v{{version}}"
+pre-release-hook = ["git-cliff", "-o", "CHANGELOG.md", "--tag", "v{{version}}"]
