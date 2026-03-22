@@ -304,53 +304,53 @@ pub fn get_model_catalog() -> Vec<CatalogModel> {
             continue;
         }
 
-            catalog.push(CatalogModel {
-                id: config_model.id.clone(),
-                name: config_model.name.clone(),
-                description: config_model
-                    .description
+        catalog.push(CatalogModel {
+            id: config_model.id.clone(),
+            name: config_model.name.clone(),
+            description: config_model
+                .description
+                .clone()
+                .unwrap_or_default(),
+            category: config_model.category.clone(),
+            tags: vec![],
+            source: CatalogSource {
+                primary_url: config_model
+                    .source
+                    .primary_url
                     .clone()
                     .unwrap_or_default(),
-                category: config_model.category.clone(),
-                tags: vec![],
-                source: CatalogSource {
-                    primary_url: config_model
-                        .source
-                        .primary_url
-                        .clone()
-                        .unwrap_or_default(),
-                    backup_urls: vec![],
-                    source_type: if config_model.source.source_type.as_deref()
-                        == Some("modelscope")
-                    {
-                        SourceType::Modelscope
-                    } else {
-                        SourceType::Huggingface
-                    },
-                    repo_id: config_model.source.repo_id.clone(),
-                    revision: "main".to_string(),
-                },
-                storage: CatalogStorage {
-                    local_path: config_model.storage.local_path.clone(),
-                    total_size_bytes: config_model.storage.total_size_bytes.unwrap_or(0),
-                    total_size_display: config_model
-                        .storage
-                        .total_size_display
-                        .clone()
-                        .unwrap_or_default(),
-                },
-                runtime: CatalogRuntime {
-                    memory_required_mb: 0,
-                    quantization: None,
-                    inference_engine: None,
-                },
-                status: if config_model.is_ready() {
-                    "ready".to_string()
+                backup_urls: vec![],
+                source_type: if config_model.source.source_type.as_deref()
+                    == Some("modelscope")
+                {
+                    SourceType::Modelscope
                 } else {
-                    "not_downloaded".to_string()
+                    SourceType::Huggingface
                 },
-            });
-        }
+                repo_id: config_model.source.repo_id.clone(),
+                revision: "main".to_string(),
+            },
+            storage: CatalogStorage {
+                local_path: config_model.storage.local_path.clone(),
+                total_size_bytes: config_model.storage.total_size_bytes.unwrap_or(0),
+                total_size_display: config_model
+                    .storage
+                    .total_size_display
+                    .clone()
+                    .unwrap_or_default(),
+            },
+            runtime: CatalogRuntime {
+                memory_required_mb: 0,
+                quantization: None,
+                inference_engine: None,
+            },
+            status: if config_model.is_ready() {
+                "ready".to_string()
+            } else {
+                "not_downloaded".to_string()
+            },
+        });
+    }
 
     catalog
 }

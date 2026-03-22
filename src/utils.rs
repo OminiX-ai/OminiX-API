@@ -109,7 +109,27 @@ pub fn sanitize_voice_name(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-/// Validate that a path does not contain traversal components (`..`).
+/// Validate that a path does not contain traversal components (`..`)
+/// and is not an absolute path (unless it starts with a known model directory).
 pub fn is_safe_path(path: &str) -> bool {
-    !path.contains("..")
+    if path.contains("..") {
+        return false;
+    }
+    // Allow absolute paths only under known model directories
+    if path.starts_with('/') {
+        let known_prefixes = [
+            "/Users/",              // macOS home dirs
+            "/home/",               // Linux home dirs
+            "/tmp/",                // temp dirs
+        ];
+        // Also allow paths under ~/.cache and ~/.OminiX
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy();
+            if path.starts_with(home.as_ref()) {
+                return true;
+            }
+        }
+        return known_prefixes.iter().any(|p| path.starts_with(p));
+    }
+    true
 }

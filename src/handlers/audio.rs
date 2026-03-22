@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
+use crate::error::render_error;
 use crate::inference::{AudioChunk, InferenceRequest, TtsRequest};
 use crate::types::{SpeechCloneRequest, SpeechRequest, TranscriptionRequest};
 
@@ -37,7 +38,7 @@ pub async fn audio_transcriptions(
 
     let response = send_and_wait(
         &state.inference_tx,
-        |tx| InferenceRequest::Transcribe { request, response_tx: tx },
+        |tx| InferenceRequest::Transcribe { request, expected_backend: None, response_tx: tx },
         TRANSCRIPTION_TIMEOUT,
     )
     .await?;
@@ -190,4 +191,286 @@ pub async fn audio_speech_clone(
 
     res.stream(stream);
     Ok(())
+}
+
+// ============================================================================
+// Model-specific TTS endpoints
+// ============================================================================
+
+/// POST /v1/audio/tts/qwen3 — Qwen3-TTS with preset voices
+///
+/// Always routes to the TTS pool (CustomVoice model).
+/// Streams PCM by default; use `?format=wav` for a complete WAV response.
+#[handler]
+pub async fn tts_qwen3(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+
+    if state.server_config.is_category_disabled("tts") {
+        render_error(
+            res,
+            salvo::http::StatusCode::FORBIDDEN,
+            "TTS is disabled by server configuration",
+            "forbidden",
+        );
+        return Ok(());
+    }
+
+    let request: SpeechRequest = req.parse_json().await.map_err(|e| {
+        tracing::error!("Failed to parse request: {}", e);
+        StatusError::bad_request()
+    })?;
+
+    let wants_wav = req.query::<String>("format").as_deref() == Some("wav")
+        || request.response_format == "wav";
+
+    if wants_wav {
+        let audio_data = send_tts_and_wait(
+            &state.tts_pool_tx,
+            |tx| TtsRequest::Speech { request, response_tx: tx },
+            TTS_TIMEOUT,
+        )
+        .await?;
+
+        res.headers_mut()
+            .insert("Content-Type", "audio/wav".parse().unwrap());
+        res.write_body(audio_data).ok();
+        return Ok(());
+    }
+
+    // Streaming PCM
+    let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
+
+    state
+        .tts_pool_tx
+        .send(TtsRequest::SpeechStream { request, chunk_tx })
+        .await
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    stream_pcm_response(chunk_rx, res);
+    Ok(())
+}
+
+/// POST /v1/audio/tts/clone — Qwen3-TTS voice cloning (Base model)
+///
+/// Dedicated endpoint for zero-shot voice cloning via x-vector speaker embedding.
+/// Streams PCM by default; use `?format=wav` for a complete WAV response.
+#[handler]
+pub async fn tts_clone(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+
+    if state.server_config.is_category_disabled("tts") {
+        render_error(
+            res,
+            salvo::http::StatusCode::FORBIDDEN,
+            "TTS is disabled by server configuration",
+            "forbidden",
+        );
+        return Ok(());
+    }
+
+    let request: SpeechCloneRequest = req.parse_json().await.map_err(|e| {
+        tracing::error!("Failed to parse clone request: {}", e);
+        StatusError::bad_request()
+    })?;
+
+    let wants_wav = req.query::<String>("format").as_deref() == Some("wav");
+
+    if wants_wav {
+        let audio_data = send_tts_and_wait(
+            &state.tts_pool_tx,
+            |tx| TtsRequest::SpeechClone { request, response_tx: tx },
+            TTS_CLONE_TIMEOUT,
+        )
+        .await?;
+
+        res.headers_mut()
+            .insert("Content-Type", "audio/wav".parse().unwrap());
+        res.write_body(audio_data).ok();
+        return Ok(());
+    }
+
+    // Streaming PCM per sentence
+    let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
+
+    state
+        .tts_pool_tx
+        .send(TtsRequest::SpeechCloneStream { request, chunk_tx })
+        .await
+        .map_err(|_| StatusError::internal_server_error())?;
+
+    stream_pcm_response(chunk_rx, res);
+    Ok(())
+}
+
+/// POST /v1/audio/tts/sovits — GPT-SoVITS text-to-speech
+///
+/// Routes to the inference thread's GPT-SoVITS engine (not the Qwen3 TTS pool).
+/// Returns WAV audio. Requires GPT-SoVITS model to be loaded via
+/// `POST /v1/models/load { "model": "<ref_audio>", "model_type": "tts" }`.
+#[handler]
+pub async fn tts_sovits(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+
+    if state.server_config.is_category_disabled("tts") {
+        render_error(
+            res,
+            salvo::http::StatusCode::FORBIDDEN,
+            "TTS is disabled by server configuration",
+            "forbidden",
+        );
+        return Ok(());
+    }
+
+    let request: SpeechRequest = req.parse_json().await.map_err(|e| {
+        tracing::error!("Failed to parse request: {}", e);
+        StatusError::bad_request()
+    })?;
+
+    // Route to inference thread (GPT-SoVITS, not TTS pool)
+    let audio_data = send_and_wait(
+        &state.inference_tx,
+        |tx| InferenceRequest::Speech { request, response_tx: tx },
+        TTS_TIMEOUT,
+    )
+    .await?;
+
+    res.headers_mut()
+        .insert("Content-Type", "audio/wav".parse().unwrap());
+    res.write_body(audio_data).ok();
+    Ok(())
+}
+
+// ============================================================================
+// Model-specific ASR endpoints
+// ============================================================================
+
+/// POST /v1/audio/asr/qwen3 — Qwen3-ASR speech recognition
+///
+/// Routes to the inference thread; validates that Qwen3-ASR is the loaded backend.
+#[handler]
+pub async fn asr_qwen3(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+
+    if state.server_config.is_category_disabled("asr") {
+        render_error(
+            res,
+            salvo::http::StatusCode::FORBIDDEN,
+            "ASR is disabled by server configuration",
+            "forbidden",
+        );
+        return Ok(());
+    }
+
+    let request: TranscriptionRequest = req
+        .parse_json_with_max_size(10 * 1024 * 1024)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to parse request: {}", e);
+            StatusError::bad_request()
+        })?;
+
+    let response = send_and_wait(
+        &state.inference_tx,
+        |tx| InferenceRequest::Transcribe {
+            request,
+            expected_backend: Some("qwen3-asr".to_string()),
+            response_tx: tx,
+        },
+        TRANSCRIPTION_TIMEOUT,
+    )
+    .await?;
+
+    res.render(Json(response));
+    Ok(())
+}
+
+/// POST /v1/audio/asr/paraformer — Paraformer speech recognition
+///
+/// Routes to the inference thread; validates that Paraformer is the loaded backend.
+#[handler]
+pub async fn asr_paraformer(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+
+    if state.server_config.is_category_disabled("asr") {
+        render_error(
+            res,
+            salvo::http::StatusCode::FORBIDDEN,
+            "ASR is disabled by server configuration",
+            "forbidden",
+        );
+        return Ok(());
+    }
+
+    let request: TranscriptionRequest = req
+        .parse_json_with_max_size(10 * 1024 * 1024)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to parse request: {}", e);
+            StatusError::bad_request()
+        })?;
+
+    let response = send_and_wait(
+        &state.inference_tx,
+        |tx| InferenceRequest::Transcribe {
+            request,
+            expected_backend: Some("paraformer".to_string()),
+            response_tx: tx,
+        },
+        TRANSCRIPTION_TIMEOUT,
+    )
+    .await?;
+
+    res.render(Json(response));
+    Ok(())
+}
+
+// ============================================================================
+// Shared helpers
+// ============================================================================
+
+/// Set PCM streaming response headers and stream audio chunks.
+fn stream_pcm_response(chunk_rx: mpsc::Receiver<AudioChunk>, res: &mut Response) {
+    let stream = ReceiverStream::new(chunk_rx).filter_map(|chunk| match chunk {
+        AudioChunk::Pcm(data) => {
+            Some(Ok::<_, std::io::Error>(salvo::hyper::body::Bytes::from(data)))
+        }
+        AudioChunk::Done { .. } => None,
+        AudioChunk::Error(e) => {
+            tracing::error!("Streaming TTS error: {e}");
+            None
+        }
+    });
+
+    res.headers_mut()
+        .insert("Content-Type", "audio/pcm".parse().unwrap());
+    res.headers_mut()
+        .insert("X-Audio-Sample-Rate", "24000".parse().unwrap());
+    res.headers_mut()
+        .insert("X-Audio-Channels", "1".parse().unwrap());
+    res.headers_mut()
+        .insert("X-Audio-Bits-Per-Sample", "16".parse().unwrap());
+    res.headers_mut()
+        .insert("Transfer-Encoding", "chunked".parse().unwrap());
+
+    res.stream(stream);
 }

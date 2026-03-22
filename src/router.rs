@@ -38,8 +38,20 @@ pub fn build_router(state: AppState) -> Router {
                 )
                 // Chat
                 .push(Router::with_path("chat/completions").post(handlers::chat::chat_completions))
-                // Audio
+                // Audio — model-specific endpoints (preferred)
                 .push(Router::with_path("audio")
+                    // TTS model-specific
+                    .push(Router::with_path("tts")
+                        .push(Router::with_path("qwen3").post(handlers::audio::tts_qwen3))
+                        .push(Router::with_path("clone").post(handlers::audio::tts_clone))
+                        .push(Router::with_path("sovits").post(handlers::audio::tts_sovits))
+                    )
+                    // ASR model-specific
+                    .push(Router::with_path("asr")
+                        .push(Router::with_path("qwen3").post(handlers::audio::asr_qwen3))
+                        .push(Router::with_path("paraformer").post(handlers::audio::asr_paraformer))
+                    )
+                    // Legacy endpoints (backward-compatible, auto-routes)
                     .push(Router::with_path("transcriptions").post(handlers::audio::audio_transcriptions))
                     .push(Router::with_path("speech")
                         .push(Router::new().post(handlers::audio::audio_speech))

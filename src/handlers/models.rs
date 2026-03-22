@@ -55,6 +55,20 @@ pub async fn load_model(
         return Ok(());
     }
 
+    // Gatekeeper: check if this model is allowed by server config
+    if !state.server_config.is_model_allowed(model_type, &request.model) {
+        render_error(
+            res,
+            salvo::http::StatusCode::FORBIDDEN,
+            &format!(
+                "Model '{}' is not allowed for category '{}' by server configuration",
+                request.model, model_type
+            ),
+            "forbidden",
+        );
+        return Ok(());
+    }
+
     let inference_request = match model_type {
         "llm" => {
             let (response_tx, response_rx) = oneshot::channel();

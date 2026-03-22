@@ -657,8 +657,6 @@ fn expand_tilde(path: &str) -> String {
     crate::utils::expand_tilde(path)
 }
 
-
-
 /// Send a training progress event
 fn send_progress(
     tx: &broadcast::Sender<TrainingProgressEvent>,

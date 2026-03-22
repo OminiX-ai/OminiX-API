@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use tokio::sync::{broadcast, mpsc};
 
 use crate::download;
 use crate::inference::{InferenceRequest, TtsRequest};
+use crate::server_config::ServerConfig;
 use crate::training;
 use crate::types::{DownloadProgressEvent, TrainingProgressEvent};
 
@@ -24,4 +27,6 @@ pub struct AppState {
     pub download_progress_tx: broadcast::Sender<DownloadProgressEvent>,
     /// Shared cancel flags for active downloads
     pub download_cancel_flags: download::DownloadCancelFlags,
+    /// Server config (model gatekeeper)
+    pub server_config: Arc<ServerConfig>,
 }

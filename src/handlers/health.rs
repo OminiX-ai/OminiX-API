@@ -41,16 +41,23 @@ pub async fn list_models(depot: &mut Depot, res: &mut Response) -> Result<(), St
     }
     if let Some(ref id) = status.asr {
         data.push(serde_json::json!({
-            "id": "paraformer", "object": "model", "created": now,
+            "id": id, "object": "model", "created": now,
             "owned_by": "local", "type": "asr"
         }));
-        let _ = id; // asr stores path, not display name
     }
-    if let Some(ref _id) = status.tts {
+    if let Some(ref id) = status.tts {
         data.push(serde_json::json!({
-            "id": "gpt-sovits", "object": "model", "created": now,
+            "id": id, "object": "model", "created": now,
             "owned_by": "local", "type": "tts"
         }));
+    }
+    if let Some(ref id) = status.qwen3_tts {
+        if id != "managed by TTS pool" {
+            data.push(serde_json::json!({
+                "id": id, "object": "model", "created": now,
+                "owned_by": "local", "type": "qwen3_tts"
+            }));
+        }
     }
     if let Some(ref id) = status.image {
         data.push(serde_json::json!({

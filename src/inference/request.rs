@@ -21,6 +21,9 @@ pub enum InferenceRequest {
     },
     Transcribe {
         request: TranscriptionRequest,
+        /// Expected ASR backend: "qwen3-asr", "paraformer", or None for any.
+        /// Set by model-specific endpoints (/v1/audio/asr/qwen3 etc.).
+        expected_backend: Option<String>,
         response_tx: oneshot::Sender<eyre::Result<TranscriptionResponse>>,
     },
     Speech {

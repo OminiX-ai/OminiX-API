@@ -60,8 +60,14 @@ pub fn inference_thread(
     }
     if !config.asr_model_dir.is_empty() {
         tracing::info!("Loading ASR model from: {}", config.asr_model_dir);
-        if let Err(e) = load_model_slot(&mut asr_engine, &mut current_asr_model, &config.asr_model_dir, asr::AsrEngine::new) {
-            tracing::warn!("Failed to load ASR model: {}", e);
+        match load_model_slot(&mut asr_engine, &mut current_asr_model, &config.asr_model_dir, asr::AsrEngine::new) {
+            Ok(_) => {
+                // Store the detected backend name instead of the raw path
+                if let Some(ref engine) = asr_engine {
+                    current_asr_model = Some(engine.backend_name().to_string());
+                }
+            }
+            Err(e) => tracing::warn!("Failed to load ASR model: {}", e),
         }
     }
     if !config.tts_ref_audio.is_empty() {
@@ -105,29 +111,64 @@ pub fn inference_thread(
                 };
                 let _ = response_tx.send(result);
             }
-            InferenceRequest::Transcribe { request, response_tx } => {
+            InferenceRequest::Transcribe { request, expected_backend, response_tx } => {
+                // Validate backend if a model-specific endpoint was used
+                if let Some(ref expected) = expected_backend {
+                    if let Some(ref engine) = asr_engine {
+                        let actual = engine.backend_name();
+                        if actual != expected.as_str() {
+                            let _ = response_tx.send(Err(eyre::eyre!(
+                                "Expected {} ASR but {} is loaded. Use POST /v1/models/load with model_type=asr to switch.",
+                                expected, actual
+                            )));
+                            continue;
+                        }
+                    }
+                }
                 let result = if let Some(ref mut engine) = asr_engine {
                     engine.transcribe(&request)
                 } else {
-                    Err(eyre::eyre!("ASR model not loaded"))
+                    Err(eyre::eyre!("ASR model not loaded. Use POST /v1/models/load with model_type=asr"))
                 };
                 let _ = response_tx.send(result);
             }
-            // Speech, SpeechStream, SpeechClone are handled by the TTS pool.
-            // They should never arrive here — if they do, return an error.
-            InferenceRequest::Speech { response_tx, .. } => {
-                let _ = response_tx.send(Err(eyre::eyre!(
-                    "TTS requests should be routed to the TTS pool, not the inference thread"
-                )));
+            // Speech via inference thread: only for GPT-SoVITS (tts_engine).
+            // Qwen3-TTS Speech requests go to the TTS pool instead.
+            InferenceRequest::Speech { request, response_tx } => {
+                let result = if let Some(ref mut engine) = tts_engine {
+                    engine.synthesize(&request)
+                } else {
+                    Err(eyre::eyre!(
+                        "GPT-SoVITS model not loaded. Use POST /v1/models/load with model_type=tts, \
+                         or use /v1/audio/tts/qwen3 for Qwen3-TTS."
+                    ))
+                };
+                let _ = response_tx.send(result);
             }
-            InferenceRequest::SpeechStream { chunk_tx, .. } => {
-                let _ = chunk_tx.blocking_send(super::AudioChunk::Error(
-                    "TTS requests should be routed to the TTS pool".to_string(),
-                ));
+            InferenceRequest::SpeechStream { request, chunk_tx } => {
+                // GPT-SoVITS doesn't support streaming — synthesize full then send
+                if let Some(ref mut engine) = tts_engine {
+                    match engine.synthesize(&request) {
+                        Ok(wav_data) => {
+                            let _ = chunk_tx.blocking_send(super::AudioChunk::Pcm(wav_data));
+                            let _ = chunk_tx.blocking_send(super::AudioChunk::Done {
+                                total_samples: 0,
+                                duration_secs: 0.0,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = chunk_tx.blocking_send(super::AudioChunk::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = chunk_tx.blocking_send(super::AudioChunk::Error(
+                        "GPT-SoVITS model not loaded".to_string(),
+                    ));
+                }
             }
             InferenceRequest::SpeechClone { response_tx, .. } => {
                 let _ = response_tx.send(Err(eyre::eyre!(
-                    "TTS requests should be routed to the TTS pool, not the inference thread"
+                    "Voice cloning is only available via Qwen3-TTS. Use /v1/audio/tts/clone"
                 )));
             }
             InferenceRequest::Image { request, response_tx } => {
@@ -181,6 +222,12 @@ pub fn inference_thread(
             InferenceRequest::LoadAsrModel { model_dir, response_tx } => {
                 tracing::info!("Loading ASR model from: {}", model_dir);
                 let result = load_model_slot(&mut asr_engine, &mut current_asr_model, &model_dir, asr::AsrEngine::new);
+                // Store backend name instead of raw path for better observability
+                if result.is_ok() {
+                    if let Some(ref engine) = asr_engine {
+                        current_asr_model = Some(engine.backend_name().to_string());
+                    }
+                }
                 let _ = response_tx.send(result);
             }
             InferenceRequest::LoadTtsModel { ref_audio, response_tx } => {

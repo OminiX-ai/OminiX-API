@@ -1,0 +1,9 @@
+{
+  "allowed_models": {
+    "llm": ["*"],
+    "image": ["flux-8bit", "zimage"],
+    "asr": ["qwen3-asr", "paraformer"],
+    "tts": ["qwen3-tts", "qwen3-tts-base"],
+    "vlm": ["*"]
+  }
+}

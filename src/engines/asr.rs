@@ -120,6 +120,15 @@ impl AsrEngine {
         })
     }
 
+    /// Get the backend type name (for model-specific endpoint validation).
+    pub fn backend_name(&self) -> &'static str {
+        match &self.backend {
+            AsrBackend::Paraformer { .. } => "paraformer",
+            AsrBackend::SenseVoiceQwen { .. } => "funasr-qwen4b",
+            AsrBackend::Qwen3Asr { .. } => "qwen3-asr",
+        }
+    }
+
     /// Transcribe audio to text
     pub fn transcribe(&mut self, request: &TranscriptionRequest) -> Result<TranscriptionResponse> {
         let (samples, duration_secs) = decode_audio(request)?;

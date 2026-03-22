@@ -20,6 +20,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 mod config;
 mod error;
+mod server_config;
 mod state;
 
 mod download;
@@ -51,6 +52,7 @@ async fn main() -> eyre::Result<()> {
         .init();
 
     let config = Config::from_env();
+    let server_config = std::sync::Arc::new(server_config::ServerConfig::load());
     tracing::info!("Starting OminiX-API v{} on port {}", version::API_VERSION, config.port);
 
     // Validate app manifest if provided
@@ -120,6 +122,7 @@ async fn main() -> eyre::Result<()> {
         download_tx,
         download_progress_tx,
         download_cancel_flags,
+        server_config,
     };
 
     let router = router::build_router(state);
@@ -145,6 +148,7 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("Endpoints:");
     tracing::info!("  GET  /health");
     tracing::info!("  GET  /v1/version");
+    tracing::info!("  --- Models ---");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  GET  /v1/models/status");
     tracing::info!("  GET  /v1/models/report");
@@ -157,11 +161,22 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("  POST /v1/models/download/cancel");
     tracing::info!("  POST /v1/models/remove");
     tracing::info!("  POST /v1/models/scan");
+    tracing::info!("  --- LLM ---");
     tracing::info!("  POST /v1/chat/completions");
-    tracing::info!("  POST /v1/audio/transcriptions");
-    tracing::info!("  POST /v1/audio/speech          (preset voices)");
-    tracing::info!("  POST /v1/audio/speech/clone    (voice cloning)");
+    tracing::info!("  --- TTS (model-specific) ---");
+    tracing::info!("  POST /v1/audio/tts/qwen3       (Qwen3-TTS preset voices)");
+    tracing::info!("  POST /v1/audio/tts/clone        (Qwen3-TTS voice cloning)");
+    tracing::info!("  POST /v1/audio/tts/sovits       (GPT-SoVITS)");
+    tracing::info!("  --- ASR (model-specific) ---");
+    tracing::info!("  POST /v1/audio/asr/qwen3        (Qwen3-ASR)");
+    tracing::info!("  POST /v1/audio/asr/paraformer    (Paraformer)");
+    tracing::info!("  --- Legacy (auto-routes) ---");
+    tracing::info!("  POST /v1/audio/speech            (legacy TTS)");
+    tracing::info!("  POST /v1/audio/speech/clone      (legacy clone)");
+    tracing::info!("  POST /v1/audio/transcriptions    (legacy ASR)");
+    tracing::info!("  --- Other ---");
     tracing::info!("  POST /v1/images/generations");
+    tracing::info!("  POST /v1/vlm/completions");
     tracing::info!("  WS   /ws/v1/tts");
     tracing::info!("  GET  /v1/voices");
     tracing::info!("  POST /v1/voices/train");
