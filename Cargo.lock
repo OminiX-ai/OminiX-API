@@ -2910,6 +2910,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
  "tokio",
  "tokio-stream",

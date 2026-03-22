@@ -30,6 +30,24 @@ use crate::types::{SpeechCloneRequest, SpeechRequest};
 
 use super::AudioChunk;
 
+/// Write raw audio bytes to a temp file for engine consumption.
+/// The caller must keep the `NamedTempFile` alive until inference completes.
+fn ref_audio_to_tempfile(bytes: &[u8]) -> eyre::Result<tempfile::NamedTempFile> {
+    if bytes.len() < 44 {
+        return Err(eyre::eyre!("Reference audio too small ({} bytes)", bytes.len()));
+    }
+    if bytes.len() > 10_000_000 {
+        return Err(eyre::eyre!("Reference audio too large (>10MB)"));
+    }
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .map_err(|e| eyre::eyre!("Failed to create temp file: {e}"))?;
+    std::io::Write::write_all(&mut tmp, bytes)
+        .map_err(|e| eyre::eyre!("Failed to write temp audio: {e}"))?;
+    Ok(tmp)
+}
+
 // ── Public types ────────────────────────────────────────────────────
 
 /// Request routed to the TTS pool (instead of the main inference thread).
@@ -183,15 +201,18 @@ fn worker_main(
             } => {
                 let needs_clone = request.reference_audio.is_some();
                 let result = if needs_clone {
-                    let engine = ensure_base(&mut base_engine, id);
-                    match engine {
-                        Some(e) => {
-                            let ref_audio = request.reference_audio.as_deref().unwrap();
-                            let lang = request.language.as_deref().unwrap_or("chinese");
-                            e.synthesize_clone(&request.input, ref_audio, lang, request.speed)
-                        }
-                        None => Err(eyre::eyre!("Base TTS model not found on disk")),
-                    }
+                    (|| -> eyre::Result<Vec<u8>> {
+                        let b64 = request.reference_audio.as_deref().unwrap();
+                        use base64::Engine;
+                        let raw = base64::engine::general_purpose::STANDARD
+                            .decode(b64)
+                            .map_err(|e| eyre::eyre!("Invalid base64 in reference_audio: {e}"))?;
+                        let tmp = ref_audio_to_tempfile(&raw)?;
+                        let engine = ensure_base(&mut base_engine, id)
+                            .ok_or_else(|| eyre::eyre!("Base TTS model not found on disk"))?;
+                        let lang = request.language.as_deref().unwrap_or("chinese");
+                        engine.synthesize_clone(&request.input, tmp.path().to_str().unwrap(), lang, request.speed)
+                    })()
                 } else {
                     let engine = ensure_customvoice(&mut cv_engine, id);
                     match engine {
@@ -234,16 +255,17 @@ fn worker_main(
                 request,
                 response_tx,
             } => {
-                let engine = ensure_base(&mut base_engine, id);
-                let result = match engine {
-                    Some(e) => e.synthesize_clone(
+                let result = (|| -> eyre::Result<Vec<u8>> {
+                    let tmp = ref_audio_to_tempfile(&request.reference_audio)?;
+                    let engine = ensure_base(&mut base_engine, id)
+                        .ok_or_else(|| eyre::eyre!("Base TTS model not found for voice cloning"))?;
+                    engine.synthesize_clone(
                         &request.input,
-                        &request.reference_audio,
+                        tmp.path().to_str().unwrap(),
                         &request.language,
                         request.speed,
-                    ),
-                    None => Err(eyre::eyre!("Base TTS model not found for voice cloning")),
-                };
+                    )
+                })();
                 let _ = response_tx.send(result);
             }
 
@@ -251,12 +273,19 @@ fn worker_main(
                 request,
                 chunk_tx,
             } => {
+                let tmp = match ref_audio_to_tempfile(&request.reference_audio) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
+                        continue;
+                    }
+                };
                 let engine = ensure_base(&mut base_engine, id);
                 if let Some(engine) = engine {
                     let tx = chunk_tx.clone();
                     let result = engine.synthesize_clone_sentences(
                         &request.input,
-                        &request.reference_audio,
+                        tmp.path().to_str().unwrap(),
                         &request.language,
                         request.speed,
                         |pcm_bytes| tx.blocking_send(AudioChunk::Pcm(pcm_bytes.to_vec())).is_ok(),

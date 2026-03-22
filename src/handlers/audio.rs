@@ -60,7 +60,7 @@ pub async fn audio_speech(
 ) -> Result<(), StatusError> {
     let state = get_state(depot)?;
 
-    let request: SpeechRequest = req.parse_json().await.map_err(|e| {
+    let request: SpeechRequest = req.parse_json_with_max_size(10 * 1024 * 1024).await.map_err(|e| {
         tracing::error!("Failed to parse request: {}", e);
         StatusError::bad_request()
     })?;
@@ -124,7 +124,8 @@ pub async fn audio_speech(
 
 /// POST /v1/audio/speech/clone - Voice cloning TTS
 ///
-/// Dedicated endpoint for voice cloning with reference audio.
+/// Accepts multipart form: `reference_audio` (raw WAV/MP3/OGG file),
+/// `input` (text), `language` (optional), `speed` (optional).
 /// Streams PCM chunks per-sentence by default (pseudo-streaming).
 /// Use `?format=wav` for a complete WAV response.
 #[handler]
@@ -135,12 +136,8 @@ pub async fn audio_speech_clone(
 ) -> Result<(), StatusError> {
     let state = get_state(depot)?;
 
-    let request: SpeechCloneRequest = req.parse_json().await.map_err(|e| {
-        tracing::error!("Failed to parse clone request: {}", e);
-        StatusError::bad_request()
-    })?;
-
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav");
+    let request = parse_clone_multipart(req).await?;
 
     if wants_wav {
         // Non-streaming: complete WAV
@@ -219,7 +216,7 @@ pub async fn tts_qwen3(
         return Ok(());
     }
 
-    let request: SpeechRequest = req.parse_json().await.map_err(|e| {
+    let request: SpeechRequest = req.parse_json_with_max_size(10 * 1024 * 1024).await.map_err(|e| {
         tracing::error!("Failed to parse request: {}", e);
         StatusError::bad_request()
     })?;
@@ -276,12 +273,8 @@ pub async fn tts_clone(
         return Ok(());
     }
 
-    let request: SpeechCloneRequest = req.parse_json().await.map_err(|e| {
-        tracing::error!("Failed to parse clone request: {}", e);
-        StatusError::bad_request()
-    })?;
-
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav");
+    let request = parse_clone_multipart(req).await?;
 
     if wants_wav {
         let audio_data = send_tts_and_wait(
@@ -333,7 +326,7 @@ pub async fn tts_sovits(
         return Ok(());
     }
 
-    let request: SpeechRequest = req.parse_json().await.map_err(|e| {
+    let request: SpeechRequest = req.parse_json_with_max_size(10 * 1024 * 1024).await.map_err(|e| {
         tracing::error!("Failed to parse request: {}", e);
         StatusError::bad_request()
     })?;
@@ -447,6 +440,52 @@ pub async fn asr_paraformer(
 // ============================================================================
 // Shared helpers
 // ============================================================================
+
+/// Parse a clone request from multipart form data.
+///
+/// Fields: `reference_audio` (file), `input` (text), `language` (text, optional),
+/// `speed` (text, optional).
+async fn parse_clone_multipart(req: &mut Request) -> Result<SpeechCloneRequest, StatusError> {
+    req.set_secure_max_size(10 * 1024 * 1024);
+    let form = req.form_data().await.map_err(|e| {
+        tracing::error!("Failed to parse multipart form: {e}");
+        StatusError::bad_request()
+    })?;
+
+    let input = form
+        .fields
+        .get("input")
+        .cloned()
+        .ok_or_else(StatusError::bad_request)?;
+    let language = form
+        .fields
+        .get("language")
+        .cloned()
+        .unwrap_or_else(|| "chinese".to_string());
+    let speed: f32 = form
+        .fields
+        .get("speed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let audio_path = form
+        .files
+        .get("reference_audio")
+        .ok_or_else(StatusError::bad_request)?
+        .path()
+        .to_path_buf();
+
+    let audio_bytes = tokio::fs::read(&audio_path).await.map_err(|e| {
+        tracing::error!("Failed to read uploaded audio: {e}");
+        StatusError::internal_server_error()
+    })?;
+
+    Ok(SpeechCloneRequest {
+        input,
+        reference_audio: audio_bytes,
+        language,
+        speed,
+    })
+}
 
 /// Set PCM streaming response headers and stream audio chunks.
 fn stream_pcm_response(chunk_rx: mpsc::Receiver<AudioChunk>, res: &mut Response) {

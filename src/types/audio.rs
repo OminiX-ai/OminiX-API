@@ -53,7 +53,7 @@ pub struct SpeechRequest {
     #[serde(default = "default_speed")]
     #[allow(dead_code)]
     pub speed: f32,
-    /// Path to reference audio file for voice cloning (x-vector mode via qwen3-tts)
+    /// Base64-encoded reference audio for voice cloning (x-vector mode via qwen3-tts)
     #[serde(default)]
     pub reference_audio: Option<String>,
     /// Language for synthesis (used with voice cloning)
@@ -65,17 +65,16 @@ pub struct SpeechRequest {
 // Audio Speech Clone (Voice Cloning TTS)
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+/// Clone request built from multipart form fields (not JSON).
+#[derive(Debug)]
 pub struct SpeechCloneRequest {
     /// Text to synthesize
     pub input: String,
-    /// Path to reference audio file (3-10s clip for x-vector speaker embedding)
-    pub reference_audio: String,
+    /// Raw reference audio bytes (3-10s WAV/MP3/OGG clip for x-vector speaker embedding)
+    pub reference_audio: Vec<u8>,
     /// Language for synthesis: chinese, english, japanese, korean
-    #[serde(default = "default_clone_language")]
     pub language: String,
     /// Speaking speed (0.25 to 4.0)
-    #[serde(default = "default_speed")]
     pub speed: f32,
 }
 
