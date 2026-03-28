@@ -125,7 +125,8 @@ pub async fn audio_speech(
 /// POST /v1/audio/speech/clone - Voice cloning TTS
 ///
 /// Accepts multipart form: `reference_audio` (raw WAV/MP3/OGG file),
-/// `input` (text), `language` (optional), `speed` (optional).
+/// `input` (text), `language` (optional), `speed` (optional),
+/// `instruct`/`prompt` (optional style instruction).
 /// Streams PCM chunks per-sentence by default (pseudo-streaming).
 /// Use `?format=wav` for a complete WAV response.
 #[handler]
@@ -444,7 +445,7 @@ pub async fn asr_paraformer(
 /// Parse a clone request from multipart form data.
 ///
 /// Fields: `reference_audio` (file), `input` (text), `language` (text, optional),
-/// `speed` (text, optional).
+/// `speed` (text, optional), `instruct`/`prompt` (text, optional).
 async fn parse_clone_multipart(req: &mut Request) -> Result<SpeechCloneRequest, StatusError> {
     req.set_secure_max_size(10 * 1024 * 1024);
     let form = req.form_data().await.map_err(|e| {
@@ -467,6 +468,12 @@ async fn parse_clone_multipart(req: &mut Request) -> Result<SpeechCloneRequest, 
         .get("speed")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1.0);
+    let instruct = form
+        .fields
+        .get("instruct")
+        .cloned()
+        .or_else(|| form.fields.get("prompt").cloned())
+        .filter(|s| !s.trim().is_empty());
     let audio_path = form
         .files
         .get("reference_audio")
@@ -484,6 +491,7 @@ async fn parse_clone_multipart(req: &mut Request) -> Result<SpeechCloneRequest, 
         reference_audio: audio_bytes,
         language,
         speed,
+        instruct,
     })
 }
 

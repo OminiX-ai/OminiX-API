@@ -2511,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-internal-macros"
-version = "0.25.2"
+version = "1.0.0"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2522,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-lm-utils"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
@@ -2534,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-macros"
-version = "0.25.2"
+version = "1.0.0"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-rs"
-version = "0.25.2"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "dyn-clone",
@@ -2568,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-rs-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "candle-core",
  "mlx-rs",
@@ -2883,7 +2883,7 @@ checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
 name = "ominix-api"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",

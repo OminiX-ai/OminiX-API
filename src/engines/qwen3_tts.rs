@@ -106,6 +106,17 @@ fn split_sentences(text: &str) -> Vec<String> {
     result
 }
 
+fn nonempty_instruct(instruct: Option<&str>) -> Option<&str> {
+    instruct.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
 /// Split an oversized sentence at commas/semicolons, then whitespace.
 fn split_long_sentence(text: &str, out: &mut Vec<String>) {
     let mut current = String::new();
@@ -187,6 +198,7 @@ impl Qwen3TtsEngine {
     pub fn synthesize(&mut self, request: &SpeechRequest) -> Result<Vec<u8>> {
         let speaker = request.voice.as_deref().unwrap_or("vivian");
         let language = request.language.as_deref().unwrap_or("chinese");
+        let instruct = nonempty_instruct(request.instruct.as_deref());
 
         let opts = SynthesizeOptions {
             speaker,
@@ -195,8 +207,15 @@ impl Qwen3TtsEngine {
             ..Default::default()
         };
 
-        let samples = self.synthesizer.synthesize(&request.input, &opts)
-            .map_err(|e| eyre::eyre!("Qwen3-TTS synthesis failed: {e}"))?;
+        let samples = if let Some(instruct) = instruct {
+            self.synthesizer
+                .synthesize_with_speaker_instruct(&request.input, instruct, &opts)
+                .map_err(|e| eyre::eyre!("Qwen3-TTS speaker+instruct synthesis failed: {e}"))?
+        } else {
+            self.synthesizer
+                .synthesize(&request.input, &opts)
+                .map_err(|e| eyre::eyre!("Qwen3-TTS synthesis failed: {e}"))?
+        };
 
         self.samples_to_wav(&samples, self.synthesizer.sample_rate)
     }
@@ -214,8 +233,10 @@ impl Qwen3TtsEngine {
         ref_audio_path: &str,
         language: &str,
         speed: f32,
+        instruct: Option<&str>,
     ) -> Result<Vec<u8>> {
         let expanded = crate::utils::expand_tilde(ref_audio_path);
+        let instruct = nonempty_instruct(instruct);
 
         if !std::path::Path::new(&expanded).exists() {
             return Err(eyre::eyre!("Reference audio not found: {expanded}"));
@@ -246,8 +267,15 @@ impl Qwen3TtsEngine {
 
         let all_samples = if sentences.len() <= 1 {
             // Short text — single pass
-            self.synthesizer.synthesize_voice_clone(text, &ref_samples, language, &opts)
-                .map_err(|e| eyre::eyre!("Voice cloning failed: {e}"))?
+            if let Some(instruct) = instruct {
+                self.synthesizer
+                    .synthesize_voice_clone_instruct(text, &ref_samples, instruct, language, &opts)
+                    .map_err(|e| eyre::eyre!("Voice clone+instruct failed: {e}"))?
+            } else {
+                self.synthesizer
+                    .synthesize_voice_clone(text, &ref_samples, language, &opts)
+                    .map_err(|e| eyre::eyre!("Voice cloning failed: {e}"))?
+            }
         } else {
             // Long text — synthesize each sentence with the same speaker embedding
             tracing::info!(
@@ -258,9 +286,21 @@ impl Qwen3TtsEngine {
 
             let mut all = Vec::new();
             for (i, sentence) in sentences.iter().enumerate() {
-                let samples = self.synthesizer
-                    .synthesize_voice_clone(sentence, &ref_samples, language, &opts)
-                    .map_err(|e| eyre::eyre!("Clone sentence {i} failed: {e}"))?;
+                let samples = if let Some(instruct) = instruct {
+                    self.synthesizer
+                        .synthesize_voice_clone_instruct(
+                            sentence,
+                            &ref_samples,
+                            instruct,
+                            language,
+                            &opts,
+                        )
+                        .map_err(|e| eyre::eyre!("Clone+instruct sentence {i} failed: {e}"))?
+                } else {
+                    self.synthesizer
+                        .synthesize_voice_clone(sentence, &ref_samples, language, &opts)
+                        .map_err(|e| eyre::eyre!("Clone sentence {i} failed: {e}"))?
+                };
 
                 tracing::debug!(
                     "Clone sentence {}/{}: {:.1}s audio, {} chars",
@@ -293,9 +333,11 @@ impl Qwen3TtsEngine {
         ref_audio_path: &str,
         language: &str,
         speed: f32,
+        instruct: Option<&str>,
         mut on_pcm: impl FnMut(&[u8]) -> bool,
     ) -> Result<()> {
         let expanded = crate::utils::expand_tilde(ref_audio_path);
+        let instruct = nonempty_instruct(instruct);
 
         if !std::path::Path::new(&expanded).exists() {
             return Err(eyre::eyre!("Reference audio not found: {expanded}"));
@@ -327,9 +369,21 @@ impl Qwen3TtsEngine {
 
         let mut total_samples = 0usize;
         for (i, sentence) in sentences.iter().enumerate() {
-            let samples = self.synthesizer
-                .synthesize_voice_clone(sentence, &ref_samples, language, &opts)
-                .map_err(|e| eyre::eyre!("Clone sentence {i} failed: {e}"))?;
+            let samples = if let Some(instruct) = instruct {
+                self.synthesizer
+                    .synthesize_voice_clone_instruct(
+                        sentence,
+                        &ref_samples,
+                        instruct,
+                        language,
+                        &opts,
+                    )
+                    .map_err(|e| eyre::eyre!("Clone+instruct sentence {i} failed: {e}"))?
+            } else {
+                self.synthesizer
+                    .synthesize_voice_clone(sentence, &ref_samples, language, &opts)
+                    .map_err(|e| eyre::eyre!("Clone sentence {i} failed: {e}"))?
+            };
 
             total_samples += samples.len();
             let pcm = Self::samples_to_pcm(&samples);
@@ -384,6 +438,7 @@ impl Qwen3TtsEngine {
     ) -> Result<()> {
         let speaker = request.voice.as_deref().unwrap_or("vivian");
         let language = request.language.as_deref().unwrap_or("chinese");
+        let instruct = nonempty_instruct(request.instruct.as_deref());
 
         let opts = SynthesizeOptions {
             speaker,
@@ -401,8 +456,15 @@ impl Qwen3TtsEngine {
 
         let mut total_samples = 0usize;
         for (i, sentence) in sentences.iter().enumerate() {
-            let samples = self.synthesizer.synthesize(sentence, &opts)
-                .map_err(|e| eyre::eyre!("TTS sentence {i} failed: {e}"))?;
+            let samples = if let Some(instruct) = instruct {
+                self.synthesizer
+                    .synthesize_with_speaker_instruct(sentence, instruct, &opts)
+                    .map_err(|e| eyre::eyre!("TTS speaker+instruct sentence {i} failed: {e}"))?
+            } else {
+                self.synthesizer
+                    .synthesize(sentence, &opts)
+                    .map_err(|e| eyre::eyre!("TTS sentence {i} failed: {e}"))?
+            };
 
             total_samples += samples.len();
             let pcm = Self::samples_to_pcm(&samples);

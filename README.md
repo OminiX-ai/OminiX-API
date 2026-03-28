@@ -23,31 +23,36 @@ OpenAI-compatible API server for OminiX-MLX models on Apple Silicon.
 - **Memory efficient** - One model per category, automatic unloading when switching
 - **Pure Rust** - No Python dependencies at runtime
 
-## Prerequisites
-
-- macOS 14.0+ (Sonoma)
-- Apple Silicon (M1/M2/M3/M4)
-- Rust 1.82+
-- Xcode Command Line Tools
-
-## Build
+## Install
 
 ```bash
-# Clone repository
-git clone https://github.com/anthropics/OminiX-API.git
-cd OminiX-API
-
-# Build (requires OminiX-MLX in sibling directory)
-cargo build --release
-
-# The binary is at target/release/ominix-api
+curl -fsSL https://raw.githubusercontent.com/OminiX-ai/OminiX-API/main/install.sh | sh
 ```
+
+Requires macOS 14.0+ on Apple Silicon (M1/M2/M3/M4). To pin a version: `VERSION=0.1.0 curl ... | sh`
+
+## Build from Source
+
+<details>
+<summary>For contributors (requires Rust 1.82+ and Xcode Command Line Tools)</summary>
+
+```bash
+# Clone both repositories
+git clone https://github.com/OminiX-ai/OminiX-API.git
+git clone https://github.com/OminiX-ai/OminiX-MLX.git
+
+cd OminiX-API
+cargo build --release
+# Binary: target/release/ominix-api
+```
+
+</details>
 
 ## Quick Start
 
 ```bash
 # Run with LLM only (downloads model automatically)
-LLM_MODEL=mlx-community/Qwen3-4B-bf16 cargo run --release
+LLM_MODEL=mlx-community/Qwen3-4B-bf16 ominix-api
 
 # Run with all models
 PORT=8080 \
@@ -55,10 +60,10 @@ LLM_MODEL=mlx-community/Qwen3-4B-bf16 \
 ASR_MODEL_DIR=./models/paraformer \
 TTS_REF_AUDIO=./audio/reference.wav \
 IMAGE_MODEL=zimage \
-cargo run --release
+ominix-api
 
 # Run with app manifest validation
-cargo run --release -- --app-manifest my-app.ominix.toml
+ominix-api --app-manifest my-app.ominix.toml
 ```
 
 ## Environment Variables
@@ -200,7 +205,8 @@ Synthesize speech from text. Supports dynamic voice switching per request.
   "voice": "luoxiang",
   "model": "gpt-sovits",
   "response_format": "wav",
-  "speed": 1.0
+  "speed": 1.0,
+  "instruct": "用兴奋激动的语气说话，充满热情和活力"
 }
 ```
 
@@ -213,12 +219,15 @@ Synthesize speech from text. Supports dynamic voice switching per request.
 | `speed` | float | `1.0` | Speaking speed (0.25 - 4.0) |
 | `reference_audio` | string | (none) | Base64-encoded reference audio for voice cloning |
 | `language` | string | (none) | Language: chinese, english, japanese, korean |
+| `instruct` | string | (none) | Optional natural-language style/emotion instruction for Qwen3-TTS |
 
 **Response formats:**
 
 - **Default (PCM streaming):** Raw PCM audio (16-bit signed LE, mono, 24kHz) with `Content-Type: audio/pcm` and `Transfer-Encoding: chunked`. Chunks are sent as they're generated (~800ms per chunk). Headers include `X-Audio-Sample-Rate: 24000`, `X-Audio-Channels: 1`, `X-Audio-Bits-Per-Sample: 16`.
 
 - **WAV (buffered):** Complete WAV file with `Content-Type: audio/wav`. Triggered by `?format=wav` query parameter, `"response_format": "wav"`, or when `reference_audio` is present (voice cloning always returns WAV).
+
+For Qwen3-TTS endpoints, `instruct` enables speaker+instruct mode for preset voices and clone+instruct mode for voice cloning. JSON clients may also send `prompt` as a compatibility alias.
 
 **Examples:**
 

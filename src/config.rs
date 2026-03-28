@@ -112,4 +112,33 @@ impl Config {
 
         config
     }
+
+    /// Clear CLI model fields that are disallowed by server_config.
+    /// This prevents startup-loading models the agent isn't supposed to serve.
+    pub fn apply_server_config(&mut self, sc: &crate::server_config::ServerConfig) {
+        let check = |field: &mut String, category: &str| {
+            if field.is_empty() {
+                return;
+            }
+            // Extract model name from path (last component) for matching
+            let name = std::path::Path::new(field.as_str())
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| field.clone());
+            if !sc.is_model_allowed(category, &name) {
+                tracing::warn!(
+                    "Skipping {} model '{}' — not in server_config allowlist",
+                    category, name
+                );
+                field.clear();
+            }
+        };
+
+        check(&mut self.llm_model, "llm");
+        check(&mut self.asr_model_dir, "asr");
+        check(&mut self.tts_ref_audio, "tts");
+        check(&mut self.qwen3_tts_model_dir, "tts");
+        check(&mut self.image_model, "image");
+        check(&mut self.vlm_model, "vlm");
+    }
 }

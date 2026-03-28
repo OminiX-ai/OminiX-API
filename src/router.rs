@@ -15,6 +15,7 @@ pub fn build_router(state: AppState) -> Router {
         .hoop(affix_state::inject(state))
         .hoop(cors)
         .push(Router::with_path("health").get(handlers::health::health))
+        .push(Router::with_path("version").get(handlers::version::get_version))
         .push(
             Router::with_path("v1")
                 // Version

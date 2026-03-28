@@ -9,7 +9,7 @@ use crate::version::{self, VersionResponse};
 pub async fn get_version(res: &mut Response) {
     let registry = version::capability_registry();
     let response = VersionResponse {
-        ominix_api: version::API_VERSION.to_string(),
+        ominix_api: version::full_version(),
         capabilities: registry,
         models_loaded: vec![], // TODO: populate from AppState when wired
     };

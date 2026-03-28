@@ -63,33 +63,6 @@ pub struct CatalogModel {
 pub fn get_default_models() -> Vec<CatalogModel> {
     vec![
         CatalogModel {
-            id: "flux-klein-4b".to_string(),
-            name: "FLUX.2-klein-4B".to_string(),
-            description: "4B parameter FLUX image generation model. Fast inference with 4-step generation, optimized for Apple Silicon.".to_string(),
-            category: ModelCategory::Image,
-            tags: vec!["image-generation".into(), "flux".into(), "apple-silicon".into(), "mlx".into()],
-            source: CatalogSource {
-                primary_url: "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B".to_string(),
-                backup_urls: vec![
-                    "https://hf-mirror.com/black-forest-labs/FLUX.2-klein-4B".to_string(),
-                ],
-                source_type: SourceType::Huggingface,
-                repo_id: Some("black-forest-labs/FLUX.2-klein-4B".to_string()),
-                revision: "main".to_string(),
-            },
-            storage: CatalogStorage {
-                local_path: "~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B".to_string(),
-                total_size_bytes: 13_958_643_712,
-                total_size_display: "~13 GB".to_string(),
-            },
-            runtime: CatalogRuntime {
-                memory_required_mb: 16384,
-                quantization: Some("bf16".into()),
-                inference_engine: Some("mlx".into()),
-            },
-            status: "not_downloaded".to_string(),
-        },
-        CatalogModel {
             id: "flux-klein-4b-8bit".to_string(),
             name: "FLUX.2-klein-4B 8-bit".to_string(),
             description: "4B parameter FLUX image generation model, 8-bit quantized. Lower memory usage (~12 GB) while maintaining quality.".to_string(),

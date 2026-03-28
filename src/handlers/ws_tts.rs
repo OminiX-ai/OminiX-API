@@ -117,6 +117,7 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
                     speed,
                     reference_audio: None,
                     language: None,
+                    instruct: None,
                 };
 
                 // Route to TTS pool (not inference thread)

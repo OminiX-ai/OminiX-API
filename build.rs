@@ -1,11 +1,44 @@
 //! Build script: reads `ominix.toml` manifests from OminiX-MLX crates
 //! and generates a compiled-in capability registry.
+//!
+//! Also embeds a git-based micro version for accurate build identification.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    // Embed git commit hash for micro-versioning.
+    // Format: "<cargo_version>+<short_hash>" (e.g. "0.1.0+a3f9b2c")
+    // Falls back to cargo version alone if git is unavailable.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    let git_hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=OMINIX_GIT_HASH={git_hash}");
+
     let mlx_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../OminiX-MLX");
+
+    // Version parity check: OminiX-API and OminiX-MLX must share the same version.
+    let api_version = env!("CARGO_PKG_VERSION");
+    println!("cargo:rerun-if-changed=../OminiX-MLX/Cargo.toml");
+    let mlx_cargo = std::fs::read_to_string(mlx_dir.join("Cargo.toml"))
+        .expect("Cannot read OminiX-MLX/Cargo.toml — is it a sibling directory?");
+    let mlx_version = mlx_cargo
+        .lines()
+        .find(|l| l.starts_with("version") && !l.contains('#'))
+        .and_then(|l| l.split_once('='))
+        .map(|(_, v)| v.trim().trim_matches('"').to_string())
+        .expect("Cannot parse version from OminiX-MLX/Cargo.toml");
+    if api_version != mlx_version {
+        panic!(
+            "Version mismatch: OminiX-API={} but OminiX-MLX={}. Both must be the same.",
+            api_version, mlx_version
+        );
+    }
 
     // Find all ominix.toml files
     let mut manifests: BTreeMap<String, ManifestData> = BTreeMap::new();

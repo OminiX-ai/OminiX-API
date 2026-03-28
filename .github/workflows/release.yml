@@ -23,6 +23,21 @@ jobs:
           submodules: true
           token: ${{ secrets.MLX_REPO_TOKEN }}
 
+      - name: Verify version parity
+        run: |
+          API_VER=$(grep '^version' OminiX-API/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          MLX_VER=$(grep '^version' OminiX-MLX/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG_VER=${GITHUB_REF_NAME#v}
+          echo "API=$API_VER  MLX=$MLX_VER  TAG=$TAG_VER"
+          if [ "$API_VER" != "$MLX_VER" ]; then
+            echo "::error::Version mismatch: OminiX-API=$API_VER but OminiX-MLX=$MLX_VER"
+            exit 1
+          fi
+          if [ "$API_VER" != "$TAG_VER" ]; then
+            echo "::error::Tag $TAG_VER does not match Cargo.toml version $API_VER"
+            exit 1
+          fi
+
       - run: sudo xcodes select 16.4
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1

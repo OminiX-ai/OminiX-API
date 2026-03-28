@@ -5,12 +5,13 @@ use crate::inference::{InferenceRequest, ModelStatus};
 
 use super::helpers::get_state;
 
-/// GET /health - Health check
+/// GET /health - Health check (includes version for quick identification)
 #[handler]
 pub async fn health(res: &mut Response) {
     res.render(Json(serde_json::json!({
         "status": "healthy",
-        "service": "ominix-api"
+        "service": "ominix-api",
+        "version": crate::version::full_version()
     })));
 }
 
@@ -98,19 +99,35 @@ pub async fn list_models(depot: &mut Depot, res: &mut Response) -> Result<(), St
 /// Scan standard TTS model directories for a specific variant.
 /// Returns the directory name if found, None otherwise.
 fn find_tts_model_name(variant: &str) -> Option<String> {
+    fn has_qwen3_tts_weights(path: &std::path::Path) -> bool {
+        path.join("model.safetensors").is_file()
+            || path.join("model.safetensors.index.json").is_file()
+    }
+
     let home = dirs::home_dir()?;
     for subdir in &[".OminiX/models", ".ominix/models"] {
         let dir = home.join(subdir);
         if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut candidates = Vec::new();
             for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy().to_lowercase();
-                if entry.path().is_dir()
-                    && name_str.contains("tts")
-                    && name_str.contains(variant)
-                {
-                    return Some(entry.file_name().to_string_lossy().to_string());
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                if path.is_dir() && name.contains("tts") && name.contains(variant) {
+                    candidates.push(path);
                 }
+            }
+
+            candidates.sort_by_key(|path| {
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                (
+                    !has_qwen3_tts_weights(path),
+                    !name.to_lowercase().contains("8bit"),
+                    name.len(),
+                )
+            });
+
+            if let Some(path) = candidates.into_iter().next() {
+                return path.file_name().map(|s| s.to_string_lossy().to_string());
             }
         }
     }

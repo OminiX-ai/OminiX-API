@@ -18,6 +18,7 @@ pub enum ModelCategory {
     Asr,
     Tts,
     Vlm,
+    Ocr,
 }
 
 /// Model source information
@@ -266,7 +267,7 @@ impl LocalModelsConfig {
     pub fn print_status_report(&self) {
         tracing::info!("=== Model Configuration Status ===");
 
-        for category in [ModelCategory::Llm, ModelCategory::Image, ModelCategory::Asr, ModelCategory::Tts, ModelCategory::Vlm] {
+        for category in [ModelCategory::Llm, ModelCategory::Image, ModelCategory::Asr, ModelCategory::Tts, ModelCategory::Vlm, ModelCategory::Ocr] {
             let models = self.find_by_category(category.clone());
             if models.is_empty() {
                 continue;
@@ -278,6 +279,7 @@ impl LocalModelsConfig {
                 ModelCategory::Asr => "ASR",
                 ModelCategory::Tts => "TTS",
                 ModelCategory::Vlm => "VLM",
+                ModelCategory::Ocr => "OCR",
             };
 
             tracing::info!("--- {} Models ---", category_name);
@@ -725,7 +727,7 @@ fn detect_model_category(model_dir: &PathBuf) -> Option<ModelCategory> {
         return Some(ModelCategory::Asr);
     }
 
-    // ASR variant 2: funasr-style or qwen3-asr (config.json with recognized model_type + weight files)
+    // ASR/TTS: config.json with recognized model_type + weight files
     let config_path = model_dir.join("config.json");
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
@@ -736,6 +738,18 @@ fn detect_model_category(model_dir: &PathBuf) -> Option<ModelCategory> {
                     {
                         if has_safetensors_in(model_dir) {
                             return Some(ModelCategory::Asr);
+                        }
+                    }
+                    // TTS: qwen3_tts or cosyvoice model types
+                    if model_type == "qwen3_tts" || model_type.starts_with("cosyvoice") {
+                        if has_safetensors_in(model_dir) {
+                            return Some(ModelCategory::Tts);
+                        }
+                    }
+                    // OCR: deepseek_vl_v2 (DeepSeek OCR-2)
+                    if model_type == "deepseek_vl_v2" {
+                        if has_safetensors_in(model_dir) {
+                            return Some(ModelCategory::Ocr);
                         }
                     }
                 }
@@ -818,6 +832,7 @@ fn category_name(cat: &ModelCategory) -> &'static str {
         ModelCategory::Asr => "asr",
         ModelCategory::Tts => "tts",
         ModelCategory::Vlm => "vlm",
+        ModelCategory::Ocr => "ocr",
     }
 }
 

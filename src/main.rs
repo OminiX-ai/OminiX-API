@@ -51,9 +51,13 @@ async fn main() -> eyre::Result<()> {
         )
         .init();
 
-    let config = Config::from_env();
+    let mut config = Config::from_env();
     let server_config = std::sync::Arc::new(server_config::ServerConfig::load());
-    tracing::info!("Starting OminiX-API v{} on port {}", version::API_VERSION, config.port);
+    tracing::info!("Starting OminiX-API v{} on port {}", version::full_version(), config.port);
+
+    // Apply server_config allowlist to CLI-specified models.
+    // This lets agents serve only a subset of available models.
+    config.apply_server_config(&server_config);
 
     // Validate app manifest if provided
     if let Some(ref manifest_path) = config.app_manifest {

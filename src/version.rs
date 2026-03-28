@@ -12,6 +12,18 @@ use std::collections::HashMap;
 /// API version (from Cargo.toml).
 pub const API_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Git commit hash (short, 7 chars). Empty if built outside a git repo.
+pub const GIT_HASH: &str = env!("OMINIX_GIT_HASH");
+
+/// Full version string: "0.1.0+a3f9b2c" or "0.1.0" if no git hash.
+pub fn full_version() -> String {
+    if GIT_HASH.is_empty() {
+        API_VERSION.to_string()
+    } else {
+        format!("{API_VERSION}+{GIT_HASH}")
+    }
+}
+
 /// A capability provided by the server.
 #[derive(Debug, Clone, Serialize)]
 pub struct CapabilityInfo {

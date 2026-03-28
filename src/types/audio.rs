@@ -59,6 +59,10 @@ pub struct SpeechRequest {
     /// Language for synthesis (used with voice cloning)
     #[serde(default)]
     pub language: Option<String>,
+    /// Natural-language style/emotion instruction.
+    /// `prompt` is accepted as an alias for compatibility with existing clients.
+    #[serde(default, alias = "prompt")]
+    pub instruct: Option<String>,
 }
 
 // ============================================================================
@@ -76,6 +80,8 @@ pub struct SpeechCloneRequest {
     pub language: String,
     /// Speaking speed (0.25 to 4.0)
     pub speed: f32,
+    /// Natural-language style/emotion instruction.
+    pub instruct: Option<String>,
 }
 
 fn default_audio_format() -> String {

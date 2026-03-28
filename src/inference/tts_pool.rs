@@ -112,6 +112,11 @@ struct WorkerHandle {
 
 /// Search standard model directories for a TTS model variant.
 fn find_tts_model(variant: &str) -> Option<String> {
+    fn has_qwen3_tts_weights(path: &std::path::Path) -> bool {
+        path.join("model.safetensors").is_file()
+            || path.join("model.safetensors.index.json").is_file()
+    }
+
     let home = dirs::home_dir()?;
     let search_dirs = [
         home.join(".OminiX").join("models"),
@@ -119,13 +124,26 @@ fn find_tts_model(variant: &str) -> Option<String> {
     ];
     for dir in &search_dirs {
         if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut candidates = Vec::new();
             for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy().to_lowercase();
-                if entry.path().is_dir() && name_str.contains("tts") && name_str.contains(variant)
-                {
-                    return Some(entry.path().to_string_lossy().to_string());
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                if path.is_dir() && name.contains("tts") && name.contains(variant) {
+                    candidates.push(path);
                 }
+            }
+
+            candidates.sort_by_key(|path| {
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                (
+                    !has_qwen3_tts_weights(path),
+                    !name.to_lowercase().contains("8bit"),
+                    name.len(),
+                )
+            });
+
+            if let Some(path) = candidates.into_iter().next() {
+                return Some(path.to_string_lossy().to_string());
             }
         }
     }
@@ -211,7 +229,13 @@ fn worker_main(
                         let engine = ensure_base(&mut base_engine, id)
                             .ok_or_else(|| eyre::eyre!("Base TTS model not found on disk"))?;
                         let lang = request.language.as_deref().unwrap_or("chinese");
-                        engine.synthesize_clone(&request.input, tmp.path().to_str().unwrap(), lang, request.speed)
+                        engine.synthesize_clone(
+                            &request.input,
+                            tmp.path().to_str().unwrap(),
+                            lang,
+                            request.speed,
+                            request.instruct.as_deref(),
+                        )
                     })()
                 } else {
                     let engine = ensure_customvoice(&mut cv_engine, id);
@@ -264,6 +288,7 @@ fn worker_main(
                         tmp.path().to_str().unwrap(),
                         &request.language,
                         request.speed,
+                        request.instruct.as_deref(),
                     )
                 })();
                 let _ = response_tx.send(result);
@@ -288,6 +313,7 @@ fn worker_main(
                         tmp.path().to_str().unwrap(),
                         &request.language,
                         request.speed,
+                        request.instruct.as_deref(),
                         |pcm_bytes| tx.blocking_send(AudioChunk::Pcm(pcm_bytes.to_vec())).is_ok(),
                     );
                     match result {
