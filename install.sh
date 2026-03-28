@@ -30,6 +30,16 @@ if [ "$ARCH" != "arm64" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Check for Xcode Command Line Tools (provides Metal framework)
+# ---------------------------------------------------------------------------
+if ! xcode-select -p >/dev/null 2>&1; then
+  printf "Xcode Command Line Tools not found. Installing...\n"
+  xcode-select --install 2>/dev/null
+  printf "Please complete the Xcode CLT installation prompt, then re-run this script.\n"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Resolve version
 # ---------------------------------------------------------------------------
 if [ -z "${VERSION:-}" ]; then
