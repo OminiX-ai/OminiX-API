@@ -29,7 +29,18 @@ OpenAI-compatible API server for OminiX-MLX models on Apple Silicon.
 curl -fsSL https://raw.githubusercontent.com/OminiX-ai/OminiX-API/main/install.sh | sh
 ```
 
-Requires macOS 14.0+ on Apple Silicon (M1/M2/M3/M4). To pin a version: `VERSION=0.1.0 curl ... | sh`
+Requires macOS 14.0+ on Apple Silicon (M1/M2/M3/M4). The script will:
+
+- Check for Xcode Command Line Tools (needed for Metal GPU acceleration) and prompt to install if missing
+- Download the latest release binary and verify its SHA-256 checksum
+- Install `ominix-api` to `/usr/local/bin`
+- Create `~/.OminiX/` config directory with default settings
+
+To pin a version or change install location:
+
+```bash
+VERSION=1.0.0 INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/OminiX-ai/OminiX-API/main/install.sh | sh
+```
 
 ## Build from Source
 
