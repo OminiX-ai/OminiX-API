@@ -137,7 +137,9 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("HTTP server listening on http://{}", listen_addr);
 
     // Write discovery file so other tools can find us without hardcoded URLs
-    let api_url = format!("http://localhost:{}", config.port);
+    // Use 127.0.0.1 (not localhost) to avoid IPv6 resolution issues.
+    // reqwest resolves localhost to ::1 first, which fails if we only bind IPv4.
+    let api_url = format!("http://127.0.0.1:{}", config.port);
     if let Some(home) = std::env::var_os("HOME") {
         let discovery_dir = std::path::Path::new(&home).join(".ominix");
         let _ = std::fs::create_dir_all(&discovery_dir);

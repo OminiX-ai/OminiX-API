@@ -65,27 +65,11 @@ pub async fn audio_speech(
         StatusError::bad_request()
     })?;
 
-    // Check if client wants WAV format (non-streaming) or has reference_audio (clone)
+    // Always use sentence-level streaming to avoid GPU OOM on long text.
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav")
         || request.response_format == "wav"
         || request.reference_audio.is_some();
 
-    if wants_wav {
-        // Non-streaming: full WAV response → routed to TTS pool
-        let audio_data = send_tts_and_wait(
-            &state.tts_pool_tx,
-            |tx| TtsRequest::Speech { request, response_tx: tx },
-            TTS_TIMEOUT,
-        )
-        .await?;
-
-        res.headers_mut()
-            .insert("Content-Type", "audio/wav".parse().unwrap());
-        res.write_body(audio_data).ok();
-        return Ok(());
-    }
-
-    // Streaming: send PCM chunks as they're generated → routed to TTS pool
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
 
     state
@@ -96,6 +80,15 @@ pub async fn audio_speech(
         })
         .await
         .map_err(|_| StatusError::internal_server_error())?;
+
+    if wants_wav {
+        let pcm_data = collect_pcm_chunks(chunk_rx).await?;
+        let wav_data = pcm_to_wav(&pcm_data, 24000);
+        res.headers_mut()
+            .insert("Content-Type", "audio/wav".parse().unwrap());
+        res.write_body(wav_data).ok();
+        return Ok(());
+    }
 
     // Stream PCM chunks back to client
     let stream = ReceiverStream::new(chunk_rx).filter_map(|chunk| match chunk {
@@ -140,22 +133,7 @@ pub async fn audio_speech_clone(
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav");
     let request = parse_clone_multipart(req).await?;
 
-    if wants_wav {
-        // Non-streaming: complete WAV
-        let audio_data = send_tts_and_wait(
-            &state.tts_pool_tx,
-            |tx| TtsRequest::SpeechClone { request, response_tx: tx },
-            TTS_CLONE_TIMEOUT,
-        )
-        .await?;
-
-        res.headers_mut()
-            .insert("Content-Type", "audio/wav".parse().unwrap());
-        res.write_body(audio_data).ok();
-        return Ok(());
-    }
-
-    // Streaming: send PCM chunks per sentence
+    // Always use sentence-level streaming to avoid GPU OOM on long text.
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
 
     state
@@ -166,6 +144,15 @@ pub async fn audio_speech_clone(
         })
         .await
         .map_err(|_| StatusError::internal_server_error())?;
+
+    if wants_wav {
+        let pcm_data = collect_pcm_chunks(chunk_rx).await?;
+        let wav_data = pcm_to_wav(&pcm_data, 24000);
+        res.headers_mut()
+            .insert("Content-Type", "audio/wav".parse().unwrap());
+        res.write_body(wav_data).ok();
+        return Ok(());
+    }
 
     let stream = ReceiverStream::new(chunk_rx).filter_map(|chunk| match chunk {
         AudioChunk::Pcm(data) => Some(Ok::<_, std::io::Error>(salvo::hyper::body::Bytes::from(data))),
@@ -225,21 +212,8 @@ pub async fn tts_qwen3(
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav")
         || request.response_format == "wav";
 
-    if wants_wav {
-        let audio_data = send_tts_and_wait(
-            &state.tts_pool_tx,
-            |tx| TtsRequest::Speech { request, response_tx: tx },
-            TTS_TIMEOUT,
-        )
-        .await?;
-
-        res.headers_mut()
-            .insert("Content-Type", "audio/wav".parse().unwrap());
-        res.write_body(audio_data).ok();
-        return Ok(());
-    }
-
-    // Streaming PCM
+    // Always use sentence-level streaming to avoid GPU OOM on long text.
+    // For WAV format, we collect all streamed chunks and wrap in a WAV header.
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
 
     state
@@ -248,7 +222,16 @@ pub async fn tts_qwen3(
         .await
         .map_err(|_| StatusError::internal_server_error())?;
 
-    stream_pcm_response(chunk_rx, res);
+    if wants_wav {
+        // Collect streamed PCM chunks into a complete WAV response
+        let pcm_data = collect_pcm_chunks(chunk_rx).await?;
+        let wav_data = pcm_to_wav(&pcm_data, 24000);
+        res.headers_mut()
+            .insert("Content-Type", "audio/wav".parse().unwrap());
+        res.write_body(wav_data).ok();
+    } else {
+        stream_pcm_response(chunk_rx, res);
+    }
     Ok(())
 }
 
@@ -277,21 +260,7 @@ pub async fn tts_clone(
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav");
     let request = parse_clone_multipart(req).await?;
 
-    if wants_wav {
-        let audio_data = send_tts_and_wait(
-            &state.tts_pool_tx,
-            |tx| TtsRequest::SpeechClone { request, response_tx: tx },
-            TTS_CLONE_TIMEOUT,
-        )
-        .await?;
-
-        res.headers_mut()
-            .insert("Content-Type", "audio/wav".parse().unwrap());
-        res.write_body(audio_data).ok();
-        return Ok(());
-    }
-
-    // Streaming PCM per sentence
+    // Always use sentence-level streaming to avoid GPU OOM on long text.
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
 
     state
@@ -300,7 +269,15 @@ pub async fn tts_clone(
         .await
         .map_err(|_| StatusError::internal_server_error())?;
 
-    stream_pcm_response(chunk_rx, res);
+    if wants_wav {
+        let pcm_data = collect_pcm_chunks(chunk_rx).await?;
+        let wav_data = pcm_to_wav(&pcm_data, 24000);
+        res.headers_mut()
+            .insert("Content-Type", "audio/wav".parse().unwrap());
+        res.write_body(wav_data).ok();
+    } else {
+        stream_pcm_response(chunk_rx, res);
+    }
     Ok(())
 }
 
@@ -493,6 +470,44 @@ async fn parse_clone_multipart(req: &mut Request) -> Result<SpeechCloneRequest, 
         speed,
         instruct,
     })
+}
+
+/// Collect all PCM chunks from a streaming channel into a single buffer.
+async fn collect_pcm_chunks(mut chunk_rx: mpsc::Receiver<AudioChunk>) -> Result<Vec<u8>, StatusError> {
+    let mut pcm = Vec::new();
+    while let Some(chunk) = chunk_rx.recv().await {
+        match chunk {
+            AudioChunk::Pcm(data) => pcm.extend_from_slice(&data),
+            AudioChunk::Done { .. } => break,
+            AudioChunk::Error(e) => {
+                tracing::error!("TTS error during WAV collection: {e}");
+                return Err(StatusError::internal_server_error());
+            }
+        }
+    }
+    Ok(pcm)
+}
+
+/// Wrap raw PCM bytes (16-bit signed LE, mono) in a WAV header.
+fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+    let data_len = pcm.len() as u32;
+    let file_len = 36 + data_len;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&file_len.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    wav
 }
 
 /// Set PCM streaming response headers and stream audio chunks.
