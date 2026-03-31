@@ -330,7 +330,7 @@ impl Qwen3TtsEngine {
                             sentences.len(),
                             sentence.chars().count(),
                         );
-                        unsafe { mlx_sys::mlx_clear_cache() };
+
                         skipped += 1;
                         continue;
                     }
@@ -362,7 +362,7 @@ impl Qwen3TtsEngine {
             all
         };
 
-        unsafe { mlx_sys::mlx_clear_cache() };
+
         self.samples_to_wav(&all_samples, self.synthesizer.sample_rate)
     }
 
@@ -434,7 +434,7 @@ impl Qwen3TtsEngine {
                         sentence.chars().count(),
                     );
                     // Clear GPU cache to recover memory after OOM
-                    unsafe { mlx_sys::mlx_clear_cache() };
+            
                     skipped += 1;
                     continue;
                 }
@@ -469,7 +469,7 @@ impl Qwen3TtsEngine {
             duration
         );
         // Flush GPU cache after each request to prevent memory buildup across requests.
-        unsafe { mlx_sys::mlx_clear_cache() };
+
         Ok(())
     }
 
@@ -536,7 +536,7 @@ impl Qwen3TtsEngine {
                         sentences.len(),
                         sentence.chars().count(),
                     );
-                    unsafe { mlx_sys::mlx_clear_cache() };
+            
                     skipped += 1;
                     continue;
                 }
@@ -566,7 +566,7 @@ impl Qwen3TtsEngine {
 
         let duration = total_samples as f32 / self.synthesizer.sample_rate as f32;
         tracing::info!("Sentence streaming complete: {:.1}s audio ({total_samples} samples)", duration);
-        unsafe { mlx_sys::mlx_clear_cache() };
+
         Ok(())
     }
 
