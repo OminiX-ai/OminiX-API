@@ -18,6 +18,21 @@ const MAX_SENTENCE_CHARS: usize = 200;
 /// overhead and improve prosody continuity.
 const MIN_SENTENCE_CHARS: usize = 20;
 
+/// Estimate a safe `max_new_tokens` cap for a text segment.
+///
+/// At 12Hz codec rate, 1 frame ≈ 83ms of audio. Chinese text averages ~250ms
+/// per character; English ~100ms per word. We use a generous 4x multiplier on
+/// the estimated frames so the model has room to breathe (pauses, prosody)
+/// but can't run away to 8192 frames for a short sentence.
+/// Minimum 256 frames (~21s) to handle short text with long pauses.
+fn max_tokens_for_text(text: &str) -> i32 {
+    let char_count = text.chars().count();
+    // ~3 codec frames per CJK character, ~1.5 per ASCII char, at 12Hz.
+    // 4x headroom to avoid premature cutoff.
+    let estimated_frames = (char_count as f32 * 3.0 * 4.0) as i32;
+    estimated_frames.max(256).min(4096)
+}
+
 /// Split text into sentences suitable for independent TTS synthesis.
 ///
 /// Uses CJK sentence-ending punctuation (。！？) unconditionally. For ASCII
@@ -256,17 +271,17 @@ impl Qwen3TtsEngine {
         let duration_secs = ref_samples.len() as f32 / 24000.0;
         tracing::info!("Reference audio: {duration_secs:.1}s ({} samples)", ref_samples.len());
 
-        let opts = SynthesizeOptions {
-            language,
-            speed_factor: if speed != 1.0 { Some(speed) } else { None },
-            ..Default::default()
-        };
-
         // Split into sentences for long text to avoid per-call token limits
         let sentences = split_sentences(text);
 
         let all_samples = if sentences.len() <= 1 {
             // Short text — single pass
+            let opts = SynthesizeOptions {
+                language,
+                speed_factor: if speed != 1.0 { Some(speed) } else { None },
+                max_new_tokens: Some(max_tokens_for_text(text)),
+                ..Default::default()
+            };
             if let Some(instruct) = instruct {
                 self.synthesizer
                     .synthesize_voice_clone_instruct(text, &ref_samples, instruct, language, &opts)
@@ -285,8 +300,15 @@ impl Qwen3TtsEngine {
             );
 
             let mut all = Vec::new();
+            let mut skipped = 0usize;
             for (i, sentence) in sentences.iter().enumerate() {
-                let samples = if let Some(instruct) = instruct {
+                let opts = SynthesizeOptions {
+                    language,
+                    speed_factor: if speed != 1.0 { Some(speed) } else { None },
+                    max_new_tokens: Some(max_tokens_for_text(sentence)),
+                    ..Default::default()
+                };
+                let result = if let Some(instruct) = instruct {
                     self.synthesizer
                         .synthesize_voice_clone_instruct(
                             sentence,
@@ -295,11 +317,23 @@ impl Qwen3TtsEngine {
                             language,
                             &opts,
                         )
-                        .map_err(|e| eyre::eyre!("Clone+instruct sentence {i} failed: {e}"))?
                 } else {
                     self.synthesizer
                         .synthesize_voice_clone(sentence, &ref_samples, language, &opts)
-                        .map_err(|e| eyre::eyre!("Clone sentence {i} failed: {e}"))?
+                };
+
+                let samples = match result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Clone sentence {i}/{} failed ({}chars), skipping: {e}",
+                            sentences.len(),
+                            sentence.chars().count(),
+                        );
+                        unsafe { mlx_sys::mlx_clear_cache() };
+                        skipped += 1;
+                        continue;
+                    }
                 };
 
                 tracing::debug!(
@@ -312,6 +346,12 @@ impl Qwen3TtsEngine {
 
                 all.extend_from_slice(&samples);
             }
+            if skipped > 0 {
+                tracing::warn!(
+                    "Clone chunking: {skipped}/{} sentences skipped due to errors",
+                    sentences.len()
+                );
+            }
 
             let duration = all.len() as f32 / self.synthesizer.sample_rate as f32;
             tracing::info!(
@@ -322,6 +362,7 @@ impl Qwen3TtsEngine {
             all
         };
 
+        unsafe { mlx_sys::mlx_clear_cache() };
         self.samples_to_wav(&all_samples, self.synthesizer.sample_rate)
     }
 
@@ -354,12 +395,6 @@ impl Qwen3TtsEngine {
             samples
         };
 
-        let opts = SynthesizeOptions {
-            language,
-            speed_factor: if speed != 1.0 { Some(speed) } else { None },
-            ..Default::default()
-        };
-
         let sentences = split_sentences(text);
         tracing::info!(
             "Clone sentence streaming: {} sentences from {} chars",
@@ -368,8 +403,15 @@ impl Qwen3TtsEngine {
         );
 
         let mut total_samples = 0usize;
+        let mut skipped = 0usize;
         for (i, sentence) in sentences.iter().enumerate() {
-            let samples = if let Some(instruct) = instruct {
+            let opts = SynthesizeOptions {
+                language,
+                speed_factor: if speed != 1.0 { Some(speed) } else { None },
+                max_new_tokens: Some(max_tokens_for_text(sentence)),
+                ..Default::default()
+            };
+            let result = if let Some(instruct) = instruct {
                 self.synthesizer
                     .synthesize_voice_clone_instruct(
                         sentence,
@@ -378,15 +420,33 @@ impl Qwen3TtsEngine {
                         language,
                         &opts,
                     )
-                    .map_err(|e| eyre::eyre!("Clone+instruct sentence {i} failed: {e}"))?
             } else {
                 self.synthesizer
                     .synthesize_voice_clone(sentence, &ref_samples, language, &opts)
-                    .map_err(|e| eyre::eyre!("Clone sentence {i} failed: {e}"))?
+            };
+
+            let samples = match result {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "Clone sentence {i}/{} failed ({}chars), skipping: {e}",
+                        sentences.len(),
+                        sentence.chars().count(),
+                    );
+                    // Clear GPU cache to recover memory after OOM
+                    unsafe { mlx_sys::mlx_clear_cache() };
+                    skipped += 1;
+                    continue;
+                }
             };
 
             total_samples += samples.len();
             let pcm = Self::samples_to_pcm(&samples);
+
+            // Clear GPU cache between sentences to prevent memory buildup.
+            // Clone+instruct uses significant GPU memory per sentence; without
+            // clearing, accumulated cache can push the next sentence over limits.
+            unsafe { mlx_sys::mlx_clear_cache() };
 
             tracing::debug!(
                 "Clone sentence {}/{}: {:.1}s audio, {} chars",
@@ -401,12 +461,20 @@ impl Qwen3TtsEngine {
                 break;
             }
         }
+        if skipped > 0 {
+            tracing::warn!(
+                "Clone streaming: {skipped}/{} sentences skipped due to errors",
+                sentences.len()
+            );
+        }
 
         let duration = total_samples as f32 / self.synthesizer.sample_rate as f32;
         tracing::info!(
             "Clone sentence streaming complete: {:.1}s audio ({total_samples} samples)",
             duration
         );
+        // Flush GPU cache after each request to prevent memory buildup across requests.
+        unsafe { mlx_sys::mlx_clear_cache() };
         Ok(())
     }
 
@@ -440,13 +508,6 @@ impl Qwen3TtsEngine {
         let language = request.language.as_deref().unwrap_or("chinese");
         let instruct = nonempty_instruct(request.instruct.as_deref());
 
-        let opts = SynthesizeOptions {
-            speaker,
-            language,
-            speed_factor: if request.speed != 1.0 { Some(request.speed) } else { None },
-            ..Default::default()
-        };
-
         let sentences = split_sentences(&request.input);
         tracing::info!(
             "Sentence-level streaming: {} sentences from {} chars",
@@ -455,15 +516,35 @@ impl Qwen3TtsEngine {
         );
 
         let mut total_samples = 0usize;
+        let mut skipped = 0usize;
         for (i, sentence) in sentences.iter().enumerate() {
-            let samples = if let Some(instruct) = instruct {
+            let opts = SynthesizeOptions {
+                speaker,
+                language,
+                speed_factor: if request.speed != 1.0 { Some(request.speed) } else { None },
+                max_new_tokens: Some(max_tokens_for_text(sentence)),
+                ..Default::default()
+            };
+            let result = if let Some(instruct) = instruct {
                 self.synthesizer
                     .synthesize_with_speaker_instruct(sentence, instruct, &opts)
-                    .map_err(|e| eyre::eyre!("TTS speaker+instruct sentence {i} failed: {e}"))?
             } else {
                 self.synthesizer
                     .synthesize(sentence, &opts)
-                    .map_err(|e| eyre::eyre!("TTS sentence {i} failed: {e}"))?
+            };
+
+            let samples = match result {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "TTS sentence {i}/{} failed ({}chars), skipping: {e}",
+                        sentences.len(),
+                        sentence.chars().count(),
+                    );
+                    unsafe { mlx_sys::mlx_clear_cache() };
+                    skipped += 1;
+                    continue;
+                }
             };
 
             total_samples += samples.len();
@@ -481,9 +562,16 @@ impl Qwen3TtsEngine {
                 break;
             }
         }
+        if skipped > 0 {
+            tracing::warn!(
+                "TTS streaming: {skipped}/{} sentences skipped due to errors",
+                sentences.len()
+            );
+        }
 
         let duration = total_samples as f32 / self.synthesizer.sample_rate as f32;
         tracing::info!("Sentence streaming complete: {:.1}s audio ({total_samples} samples)", duration);
+        unsafe { mlx_sys::mlx_clear_cache() };
         Ok(())
     }
 
