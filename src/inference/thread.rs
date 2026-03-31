@@ -2,6 +2,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
 use crate::engines::{asr, image, llm, tts, vlm};
+use crate::inference::tts_pool::{Qwen3TtsEngines, TtsPoolConfig};
 
 use super::{InferenceRequest, ModelStatus};
 
@@ -30,19 +31,24 @@ fn normalize_image_model(model: &str) -> &'static str {
     image::ImageModelType::from_model_id(model).normalized_name()
 }
 
-/// Inference thread that owns all models except TTS (models are not Send/Sync).
-/// TTS is handled by the separate TTS worker pool (see `tts_pool.rs`).
+/// Single inference thread that owns ALL models (models are not Send/Sync).
+///
+/// All GPU work — LLM, ASR, TTS, image, VLM — is serialized through this
+/// thread's queue. This prevents Metal command buffer conflicts that crash
+/// the process when MLX inference runs concurrently on separate threads.
 pub fn inference_thread(
     config: Config,
+    tts_pool_config: TtsPoolConfig,
     mut rx: mpsc::Receiver<InferenceRequest>,
     ready_tx: oneshot::Sender<()>,
 ) {
-    // Model slots (TTS/Qwen3-TTS handled by tts_pool, not here)
+    // Model slots — ALL models owned by this thread
     let mut llm_engine: Option<llm::LlmEngine> = None;
     let mut asr_engine: Option<asr::AsrEngine> = None;
     let mut tts_engine: Option<tts::TtsEngine> = None;
     let mut image_engine: Option<image::ImageEngine> = None;
     let mut vlm_engine: Option<vlm::VlmEngine> = None;
+    let mut qwen3_tts = Qwen3TtsEngines::new(tts_pool_config.eager_load);
 
     // Name tracking
     let mut current_llm_model: Option<String> = None;
@@ -92,7 +98,7 @@ pub fn inference_thread(
             tracing::warn!("Failed to load VLM model: {}", e);
         }
     }
-    // Qwen3-TTS is now managed by the TTS pool (tts_pool.rs), not this thread.
+    // Qwen3-TTS engines are eager-loaded above via Qwen3TtsEngines::new().
 
     // Signal that models are loaded
     let _ = ready_tx.send(());
@@ -241,8 +247,7 @@ pub fn inference_thread(
                 let _ = response_tx.send(result);
             }
             InferenceRequest::LoadQwen3TtsModel { response_tx, .. } => {
-                // Qwen3-TTS is managed by the TTS pool, not this thread.
-                let _ = response_tx.send(Ok("Qwen3-TTS is managed by the TTS pool (auto-loads on demand)".to_string()));
+                let _ = response_tx.send(Ok("Qwen3-TTS auto-loads on demand".to_string()));
             }
             InferenceRequest::LoadImageModel { model_id, response_tx } => {
                 let normalized = normalize_image_model(&model_id);
@@ -293,8 +298,7 @@ pub fn inference_thread(
                         Ok(format!("Unloaded VLM model: {:?}", prev))
                     }
                     "qwen3_tts" => {
-                        // Qwen3-TTS is managed by the TTS pool — idle workers are auto-reclaimed
-                        Ok("Qwen3-TTS is managed by the TTS pool (idle workers auto-reclaimed)".to_string())
+                        Ok("Qwen3-TTS auto-loads on demand".to_string())
                     }
                     "all" => {
                         llm_engine = None;
@@ -307,8 +311,7 @@ pub fn inference_thread(
                         current_tts_model = None;
                         current_image_model = None;
                         current_vlm_model = None;
-                        // Note: Qwen3-TTS is managed by the TTS pool, not unloaded here
-                        Ok("Unloaded all models (Qwen3-TTS managed by TTS pool)".to_string())
+                        Ok("Unloaded all models".to_string())
                     }
                     _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, qwen3_tts, image, vlm, or all", model_type)),
                 };
@@ -320,7 +323,7 @@ pub fn inference_thread(
                     llm: current_llm_model.clone(),
                     asr: current_asr_model.clone(),
                     tts: current_tts_model.clone(),
-                    qwen3_tts: Some("managed by TTS pool".to_string()),
+                    qwen3_tts: Some("inline".to_string()),
                     image: current_image_model.clone(),
                     vlm: current_vlm_model.clone(),
                 };
@@ -333,6 +336,11 @@ pub fn inference_thread(
                     engine.reload_voices();
                 }
                 let _ = response_tx.send(Ok(()));
+            }
+
+            // Qwen3-TTS (serialized through the same queue as ASR/LLM)
+            InferenceRequest::Qwen3Tts(tts_request) => {
+                qwen3_tts.handle(tts_request);
             }
         }
     }

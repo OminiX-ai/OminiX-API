@@ -91,6 +91,8 @@ pub enum InferenceRequest {
     ReloadVoices {
         response_tx: oneshot::Sender<eyre::Result<()>>,
     },
+    /// Qwen3-TTS request (routed through inference queue to serialize GPU access)
+    Qwen3Tts(super::tts_pool::TtsRequest),
 }
 
 /// Current status of all models

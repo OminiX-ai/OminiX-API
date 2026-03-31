@@ -1,27 +1,10 @@
-//! TTS worker pool.
+//! Qwen3-TTS engine management and request types.
 //!
-//! Runs TTS inference on a dedicated thread to avoid blocking the main
-//! inference thread (LLM/ASR/image).
+//! TTS requests are handled inline by the inference thread (not a separate pool)
+//! to serialize all GPU access through a single thread. This prevents Metal
+//! command buffer crashes when ASR and TTS run concurrently on separate threads.
 //!
-//! ## Why single-worker only (no dynamic scaling)
-//!
-//! Metal's `MTLCommandQueue` is thread-safe and supports encoding command
-//! buffers from multiple CPU threads. However, **MLX does not support
-//! concurrent inference from separate threads** — its Metal backend has
-//! thread-safety issues where multiple threads race on shared
-//! `DeviceStream::buffer` and `DeviceStream::encoder` fields, causing
-//! crashes or undefined behavior.
-//!
-//! See:
-//! - <https://github.com/ml-explore/mlx/issues/3078> (concurrent inference)
-//! - <https://github.com/ml-explore/mlx/issues/2133> (thread safety tracking)
-//! - <https://github.com/ml-explore/mlx/pull/2104>  (partial Metal fix)
-//!
-//! Once MLX adds proper multi-stream thread safety, the scaling code below
-//! (currently commented out) can be re-enabled to spawn additional workers.
-
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+//! See: <https://github.com/ml-explore/mlx/issues/3078> (MLX thread safety)
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -97,18 +80,7 @@ impl TtsPoolConfig {
     }
 }
 
-// ── Pool internals ──────────────────────────────────────────────────
-
-struct WorkerHandle {
-    tx: std::sync::mpsc::Sender<TtsRequest>,
-    /// Number of requests queued + in-flight for this worker.
-    /// Incremented by pool manager on dispatch, decremented by worker on completion.
-    queued: Arc<AtomicU64>,
-    /// Epoch seconds of last completed request.
-    last_active: Arc<AtomicU64>,
-    #[allow(dead_code)]
-    thread: Option<std::thread::JoinHandle<()>>,
-}
+// ── Model discovery ────────────────────────────────────────────────
 
 /// Search standard model directories for a TTS model variant.
 fn find_tts_model(variant: &str) -> Option<String> {
@@ -150,197 +122,6 @@ fn find_tts_model(variant: &str) -> Option<String> {
     None
 }
 
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-// NOTE: available_ram_gb() and parse_vm_stat_value() removed — they were
-// only used by the multi-worker scaling logic. Re-add from git history
-// when MLX supports concurrent inference.
-
-// ── Worker thread ───────────────────────────────────────────────────
-
-fn spawn_worker(id: usize, eager_load: bool) -> WorkerHandle {
-    let queued = Arc::new(AtomicU64::new(0));
-    let last_active = Arc::new(AtomicU64::new(now_epoch_secs()));
-
-    let (tx, rx) = std::sync::mpsc::channel::<TtsRequest>();
-
-    let queued_clone = queued.clone();
-    let last_active_clone = last_active.clone();
-
-    let thread = std::thread::Builder::new()
-        .name(format!("tts-worker-{id}"))
-        .spawn(move || {
-            worker_main(id, rx, queued_clone, last_active_clone, eager_load);
-        })
-        .expect("failed to spawn TTS worker thread");
-
-    WorkerHandle {
-        tx,
-        queued,
-        last_active,
-        thread: Some(thread),
-    }
-}
-
-fn worker_main(
-    id: usize,
-    rx: std::sync::mpsc::Receiver<TtsRequest>,
-    queued: Arc<AtomicU64>,
-    last_active: Arc<AtomicU64>,
-    eager_load: bool,
-) {
-    tracing::info!("TTS worker {id} started (eager_load={eager_load})");
-
-    let mut cv_engine: Option<qwen3_tts::Qwen3TtsEngine> = None;
-    let mut base_engine: Option<qwen3_tts::Qwen3TtsEngine> = None;
-
-    if eager_load {
-        tracing::info!("TTS worker {id}: eager-loading models at startup...");
-        ensure_customvoice(&mut cv_engine, id);
-        ensure_base(&mut base_engine, id);
-        let cv_ok = cv_engine.is_some();
-        let base_ok = base_engine.is_some();
-        tracing::info!(
-            "TTS worker {id}: eager load complete (CustomVoice={cv_ok}, Base={base_ok})"
-        );
-    }
-
-    while let Ok(request) = rx.recv() {
-
-        match request {
-            TtsRequest::Speech {
-                request,
-                response_tx,
-            } => {
-                let needs_clone = request.reference_audio.is_some();
-                let result = if needs_clone {
-                    (|| -> eyre::Result<Vec<u8>> {
-                        let b64 = request.reference_audio.as_deref().unwrap();
-                        use base64::Engine;
-                        let raw = base64::engine::general_purpose::STANDARD
-                            .decode(b64)
-                            .map_err(|e| eyre::eyre!("Invalid base64 in reference_audio: {e}"))?;
-                        let tmp = ref_audio_to_tempfile(&raw)?;
-                        let engine = ensure_base(&mut base_engine, id)
-                            .ok_or_else(|| eyre::eyre!("Base TTS model not found on disk"))?;
-                        let lang = request.language.as_deref().unwrap_or("chinese");
-                        engine.synthesize_clone(
-                            &request.input,
-                            tmp.path().to_str().unwrap(),
-                            lang,
-                            request.speed,
-                            request.instruct.as_deref(),
-                        )
-                    })()
-                } else {
-                    let engine = ensure_customvoice(&mut cv_engine, id);
-                    match engine {
-                        Some(e) => e.synthesize(&request),
-                        None => Err(eyre::eyre!("CustomVoice TTS model not found on disk")),
-                    }
-                };
-                let _ = response_tx.send(result);
-            }
-
-            TtsRequest::SpeechStream { request, chunk_tx } => {
-                // Sentence-level streaming: split text into sentences, synthesize
-                // each independently (full decode per sentence = no artifacts),
-                // and send PCM as each sentence completes. Client receives first
-                // audio after ~2-3s instead of waiting for full synthesis.
-                let engine = ensure_customvoice(&mut cv_engine, id);
-                if let Some(engine) = engine {
-                    let tx = chunk_tx.clone();
-                    let result = engine.synthesize_sentences(&request, |pcm_bytes| {
-                        tx.blocking_send(AudioChunk::Pcm(pcm_bytes.to_vec())).is_ok()
-                    });
-                    match result {
-                        Ok(()) => {
-                            let _ = chunk_tx.blocking_send(AudioChunk::Done {
-                                total_samples: 0,
-                                duration_secs: 0.0,
-                            });
-                        }
-                        Err(e) => {
-                            let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
-                        }
-                    }
-                } else {
-                    let _ = chunk_tx
-                        .blocking_send(AudioChunk::Error("TTS model not loaded".to_string()));
-                }
-            }
-
-            TtsRequest::SpeechClone {
-                request,
-                response_tx,
-            } => {
-                let result = (|| -> eyre::Result<Vec<u8>> {
-                    let tmp = ref_audio_to_tempfile(&request.reference_audio)?;
-                    let engine = ensure_base(&mut base_engine, id)
-                        .ok_or_else(|| eyre::eyre!("Base TTS model not found for voice cloning"))?;
-                    engine.synthesize_clone(
-                        &request.input,
-                        tmp.path().to_str().unwrap(),
-                        &request.language,
-                        request.speed,
-                        request.instruct.as_deref(),
-                    )
-                })();
-                let _ = response_tx.send(result);
-            }
-
-            TtsRequest::SpeechCloneStream {
-                request,
-                chunk_tx,
-            } => {
-                let tmp = match ref_audio_to_tempfile(&request.reference_audio) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
-                        continue;
-                    }
-                };
-                let engine = ensure_base(&mut base_engine, id);
-                if let Some(engine) = engine {
-                    let tx = chunk_tx.clone();
-                    let result = engine.synthesize_clone_sentences(
-                        &request.input,
-                        tmp.path().to_str().unwrap(),
-                        &request.language,
-                        request.speed,
-                        request.instruct.as_deref(),
-                        |pcm_bytes| tx.blocking_send(AudioChunk::Pcm(pcm_bytes.to_vec())).is_ok(),
-                    );
-                    match result {
-                        Ok(()) => {
-                            let _ = chunk_tx.blocking_send(AudioChunk::Done {
-                                total_samples: 0,
-                                duration_secs: 0.0,
-                            });
-                        }
-                        Err(e) => {
-                            let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
-                        }
-                    }
-                } else {
-                    let _ = chunk_tx.blocking_send(AudioChunk::Error(
-                        "Base TTS model not found for voice cloning".to_string(),
-                    ));
-                }
-            }
-        }
-
-        queued.fetch_sub(1, Ordering::Release);
-        last_active.store(now_epoch_secs(), Ordering::Release);
-    }
-
-    tracing::info!("TTS worker {id} shutting down");
-}
 
 /// Ensure CustomVoice engine is loaded, return mutable ref.
 fn ensure_customvoice(
@@ -397,65 +178,142 @@ fn ensure_base(
     }
 }
 
-// ── Pool manager ────────────────────────────────────────────────────
+// ── Qwen3-TTS engine holder (used by inference thread) ─────────────
 
-/// Run the TTS pool manager on a dedicated thread.
-/// Receives `TtsRequest`s and dispatches to a single worker thread.
-///
-/// Only one worker is used because MLX lacks thread-safe concurrent
-/// inference (see module docs). All requests queue to worker 0.
-pub fn run_pool(mut rx: mpsc::Receiver<TtsRequest>, config: TtsPoolConfig) {
-    tracing::info!("TTS pool started (single worker — MLX is not thread-safe for concurrent inference)");
-
-    let worker = spawn_worker(0, config.eager_load);
-
-    while let Some(request) = rx.blocking_recv() {
-        worker.queued.fetch_add(1, Ordering::Release);
-        if worker.tx.send(request).is_err() {
-            tracing::error!("TTS worker 0 died — no recovery, dropping request");
-        }
-    }
-
-    tracing::info!("TTS pool shutting down");
-    drop(worker);
+/// Holds both Qwen3-TTS engine variants for use by the inference thread.
+pub struct Qwen3TtsEngines {
+    cv_engine: Option<qwen3_tts::Qwen3TtsEngine>,
+    base_engine: Option<qwen3_tts::Qwen3TtsEngine>,
 }
 
-// ── Commented-out scaling code ─────────────────────────────────────
-// Re-enable when MLX supports concurrent inference from multiple
-// threads (see https://github.com/ml-explore/mlx/issues/3078).
-//
-// fn can_spawn_worker(config: &TtsPoolConfig) -> bool {
-//     let free = available_ram_gb();
-//     let needed = config.min_free_ram_gb + config.ram_per_instance_gb;
-//     if free < needed {
-//         tracing::info!(
-//             "TTS pool: not enough RAM to spawn worker (free: {free:.1}GB, need: {needed:.1}GB)"
-//         );
-//         return false;
-//     }
-//     true
-// }
-//
-// fn reap_idle_workers(workers: &mut Vec<WorkerHandle>, config: &TtsPoolConfig) {
-//     if workers.len() <= 1 {
-//         return;
-//     }
-//     let now = now_epoch_secs();
-//     let timeout = config.idle_timeout_secs;
-//     let mut i = workers.len();
-//     while i > 1 {
-//         i -= 1;
-//         let w = &workers[i];
-//         if w.queued.load(Ordering::Acquire) == 0 {
-//             let idle_secs = now.saturating_sub(w.last_active.load(Ordering::Acquire));
-//             if idle_secs >= timeout {
-//                 tracing::info!(
-//                     "TTS pool: reaping idle worker {i} (idle {idle_secs}s, pool: {} -> {})",
-//                     workers.len(),
-//                     workers.len() - 1
-//                 );
-//                 workers.remove(i);
-//             }
-//         }
-//     }
-// }
+impl Qwen3TtsEngines {
+    /// Create and optionally eager-load both engine variants.
+    pub fn new(eager_load: bool) -> Self {
+        let mut engines = Self {
+            cv_engine: None,
+            base_engine: None,
+        };
+        if eager_load {
+            tracing::info!("Qwen3-TTS: eager-loading models...");
+            ensure_customvoice(&mut engines.cv_engine, 0);
+            ensure_base(&mut engines.base_engine, 0);
+            let cv_ok = engines.cv_engine.is_some();
+            let base_ok = engines.base_engine.is_some();
+            tracing::info!("Qwen3-TTS: eager load complete (CustomVoice={cv_ok}, Base={base_ok})");
+        }
+        engines
+    }
+
+    /// Handle a TTS request inline (called from the inference thread).
+    pub fn handle(&mut self, request: TtsRequest) {
+        match request {
+            TtsRequest::Speech { request, response_tx } => {
+                let needs_clone = request.reference_audio.is_some();
+                let result = if needs_clone {
+                    (|| -> eyre::Result<Vec<u8>> {
+                        let b64 = request.reference_audio.as_deref().unwrap();
+                        use base64::Engine;
+                        let raw = base64::engine::general_purpose::STANDARD
+                            .decode(b64)
+                            .map_err(|e| eyre::eyre!("Invalid base64 in reference_audio: {e}"))?;
+                        let tmp = ref_audio_to_tempfile(&raw)?;
+                        let engine = ensure_base(&mut self.base_engine, 0)
+                            .ok_or_else(|| eyre::eyre!("Base TTS model not found on disk"))?;
+                        let lang = request.language.as_deref().unwrap_or("chinese");
+                        engine.synthesize_clone(
+                            &request.input,
+                            tmp.path().to_str().unwrap(),
+                            lang,
+                            request.speed,
+                            request.instruct.as_deref(),
+                        )
+                    })()
+                } else {
+                    let engine = ensure_customvoice(&mut self.cv_engine, 0);
+                    match engine {
+                        Some(e) => e.synthesize(&request),
+                        None => Err(eyre::eyre!("CustomVoice TTS model not found on disk")),
+                    }
+                };
+                let _ = response_tx.send(result);
+            }
+
+            TtsRequest::SpeechStream { request, chunk_tx } => {
+                let engine = ensure_customvoice(&mut self.cv_engine, 0);
+                if let Some(engine) = engine {
+                    let tx = chunk_tx.clone();
+                    let result = engine.synthesize_sentences(&request, |pcm_bytes| {
+                        tx.blocking_send(AudioChunk::Pcm(pcm_bytes.to_vec())).is_ok()
+                    });
+                    match result {
+                        Ok(()) => {
+                            let _ = chunk_tx.blocking_send(AudioChunk::Done {
+                                total_samples: 0,
+                                duration_secs: 0.0,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = chunk_tx
+                        .blocking_send(AudioChunk::Error("TTS model not loaded".to_string()));
+                }
+            }
+
+            TtsRequest::SpeechClone { request, response_tx } => {
+                let result = (|| -> eyre::Result<Vec<u8>> {
+                    let tmp = ref_audio_to_tempfile(&request.reference_audio)?;
+                    let engine = ensure_base(&mut self.base_engine, 0)
+                        .ok_or_else(|| eyre::eyre!("Base TTS model not found for voice cloning"))?;
+                    engine.synthesize_clone(
+                        &request.input,
+                        tmp.path().to_str().unwrap(),
+                        &request.language,
+                        request.speed,
+                        request.instruct.as_deref(),
+                    )
+                })();
+                let _ = response_tx.send(result);
+            }
+
+            TtsRequest::SpeechCloneStream { request, chunk_tx } => {
+                let tmp = match ref_audio_to_tempfile(&request.reference_audio) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
+                        return;
+                    }
+                };
+                let engine = ensure_base(&mut self.base_engine, 0);
+                if let Some(engine) = engine {
+                    let tx = chunk_tx.clone();
+                    let result = engine.synthesize_clone_sentences(
+                        &request.input,
+                        tmp.path().to_str().unwrap(),
+                        &request.language,
+                        request.speed,
+                        request.instruct.as_deref(),
+                        |pcm_bytes| tx.blocking_send(AudioChunk::Pcm(pcm_bytes.to_vec())).is_ok(),
+                    );
+                    match result {
+                        Ok(()) => {
+                            let _ = chunk_tx.blocking_send(AudioChunk::Done {
+                                total_samples: 0,
+                                duration_secs: 0.0,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = chunk_tx.blocking_send(AudioChunk::Error(
+                        "Base TTS model not found for voice cloning".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+}

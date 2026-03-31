@@ -2,7 +2,7 @@ use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocket, WebSocketUpgrade};
 use tokio::sync::mpsc;
 
-use crate::inference::{AudioChunk, TtsRequest};
+use crate::inference::{AudioChunk, InferenceRequest, TtsRequest};
 use crate::state::AppState;
 use crate::types::SpeechRequest;
 
@@ -120,15 +120,14 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
                     instruct: None,
                 };
 
-                // Route to TTS pool (not inference thread)
                 let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(32);
 
                 if state
-                    .tts_pool_tx
-                    .send(TtsRequest::SpeechStream {
+                    .inference_tx
+                    .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechStream {
                         request: speech_req,
                         chunk_tx,
-                    })
+                    }))
                     .await
                     .is_err()
                 {

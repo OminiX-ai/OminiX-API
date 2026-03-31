@@ -37,7 +37,7 @@ mod utils;
 mod version;
 
 use config::Config;
-use inference::{InferenceRequest, TtsPoolConfig, TtsRequest};
+use inference::{InferenceRequest, TtsPoolConfig};
 use state::AppState;
 use types::{DownloadProgressEvent, TrainingProgressEvent};
 
@@ -74,10 +74,11 @@ async fn main() -> eyre::Result<()> {
     let (progress_tx, _) = broadcast::channel::<TrainingProgressEvent>(256);
     let (ready_tx, ready_rx) = oneshot::channel();
 
-    // Spawn inference thread (owns all models)
+    // Spawn inference thread (owns ALL models — single thread serializes GPU access)
     let config_clone = config.clone();
+    let tts_pool_config = TtsPoolConfig::from_env();
     std::thread::spawn(move || {
-        inference::inference_thread(config_clone, inference_rx, ready_tx);
+        inference::inference_thread(config_clone, tts_pool_config, inference_rx, ready_tx);
     });
 
     // Spawn training thread (owns training models, separate from inference)
@@ -94,12 +95,9 @@ async fn main() -> eyre::Result<()> {
         );
     });
 
-    // Spawn TTS worker pool (handles Speech, SpeechStream, SpeechClone)
-    let tts_pool_config = TtsPoolConfig::from_env();
-    let (tts_pool_tx, tts_pool_rx) = mpsc::channel::<TtsRequest>(64);
-    std::thread::spawn(move || {
-        inference::run_pool(tts_pool_rx, tts_pool_config);
-    });
+    // Qwen3-TTS is now handled inline by the inference thread (no separate pool).
+    // This serializes all GPU access through a single thread, preventing Metal
+    // command buffer crashes when ASR and TTS run concurrently.
 
     // Create download channels and thread
     let (download_tx, download_rx) = mpsc::channel::<download::DownloadRequest>(16);
@@ -119,7 +117,6 @@ async fn main() -> eyre::Result<()> {
 
     let state = AppState {
         inference_tx,
-        tts_pool_tx,
         training_tx,
         progress_tx,
         cancel_flag,

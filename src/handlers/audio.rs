@@ -9,7 +9,7 @@ use crate::error::render_error;
 use crate::inference::{AudioChunk, InferenceRequest, TtsRequest};
 use crate::types::{SpeechCloneRequest, SpeechRequest, TranscriptionRequest};
 
-use super::helpers::{get_state, send_and_wait, send_tts_and_wait};
+use super::helpers::{get_state, send_and_wait};
 
 /// Timeout for audio transcription
 const TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(1800); // 30 minutes
@@ -73,11 +73,11 @@ pub async fn audio_speech(
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
 
     state
-        .tts_pool_tx
-        .send(TtsRequest::SpeechStream {
+        .inference_tx
+        .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechStream {
             request,
             chunk_tx,
-        })
+        }))
         .await
         .map_err(|_| StatusError::internal_server_error())?;
 
@@ -137,11 +137,11 @@ pub async fn audio_speech_clone(
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
 
     state
-        .tts_pool_tx
-        .send(TtsRequest::SpeechCloneStream {
+        .inference_tx
+        .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechCloneStream {
             request,
             chunk_tx,
-        })
+        }))
         .await
         .map_err(|_| StatusError::internal_server_error())?;
 
@@ -217,8 +217,8 @@ pub async fn tts_qwen3(
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
 
     state
-        .tts_pool_tx
-        .send(TtsRequest::SpeechStream { request, chunk_tx })
+        .inference_tx
+        .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechStream { request, chunk_tx }))
         .await
         .map_err(|_| StatusError::internal_server_error())?;
 
@@ -264,8 +264,8 @@ pub async fn tts_clone(
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
 
     state
-        .tts_pool_tx
-        .send(TtsRequest::SpeechCloneStream { request, chunk_tx })
+        .inference_tx
+        .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechCloneStream { request, chunk_tx }))
         .await
         .map_err(|_| StatusError::internal_server_error())?;
 
