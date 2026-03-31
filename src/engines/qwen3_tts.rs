@@ -443,11 +443,6 @@ impl Qwen3TtsEngine {
             total_samples += samples.len();
             let pcm = Self::samples_to_pcm(&samples);
 
-            // Clear GPU cache between sentences to prevent memory buildup.
-            // Clone+instruct uses significant GPU memory per sentence; without
-            // clearing, accumulated cache can push the next sentence over limits.
-            unsafe { mlx_sys::mlx_clear_cache() };
-
             tracing::debug!(
                 "Clone sentence {}/{}: {:.1}s audio, {} chars",
                 i + 1,
