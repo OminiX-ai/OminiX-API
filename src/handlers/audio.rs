@@ -17,8 +17,6 @@ use super::helpers::{get_state, send_and_wait};
 const TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(1800); // 30 minutes
 /// Timeout for text-to-speech (non-streaming WAV fallback)
 const TTS_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes (pool handles long text)
-/// Timeout for voice cloning (loading ref audio + synthesis)
-const TTS_CLONE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
 /// POST /v1/audio/transcriptions - Speech-to-text
 #[handler]
@@ -67,60 +65,18 @@ pub async fn audio_speech(
         StatusError::bad_request()
     })?;
 
-    // Always use sentence-level streaming to avoid GPU OOM on long text.
-    // Each sentence is submitted as a separate queue item so other tasks
-    // (especially ASR) can be processed between TTS sentences.
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav")
         || request.response_format == "wav"
         || request.reference_audio.is_some();
 
-    let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
-    let inference_tx = state.inference_tx.clone();
-
-    let voice = request.voice.clone().unwrap_or_else(|| "vivian".to_string());
-    let language = request.language.clone().unwrap_or_else(|| "chinese".to_string());
-    let speed = request.speed;
-    let instruct = request.instruct.clone();
-    let sentences = qwen3_tts::split_sentences(&request.input);
-
-    tokio::spawn(async move {
-        for sentence in &sentences {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let send_ok = inference_tx
-                .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechOneSentence {
-                    sentence: sentence.clone(),
-                    voice: voice.clone(),
-                    language: language.clone(),
-                    speed,
-                    instruct: instruct.clone(),
-                    response_tx: tx,
-                }))
-                .await;
-            if send_ok.is_err() {
-                let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
-                return;
-            }
-            match rx.await {
-                Ok(Ok(pcm)) => {
-                    if chunk_tx.send(AudioChunk::Pcm(pcm)).await.is_err() {
-                        tracing::info!("Client disconnected during TTS streaming");
-                        return;
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("TTS sentence failed, skipping: {e}");
-                    continue;
-                }
-                Err(_) => {
-                    let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
-                    return;
-                }
-            }
-        }
-        let _ = chunk_tx
-            .send(AudioChunk::Done { total_samples: 0, duration_secs: 0.0 })
-            .await;
-    });
+    let chunk_rx = spawn_per_sentence_tts(
+        state.inference_tx.clone(),
+        qwen3_tts::split_sentences(&request.input),
+        request.voice.unwrap_or_else(|| "vivian".to_string()),
+        request.language.unwrap_or_else(|| "chinese".to_string()),
+        request.speed,
+        request.instruct,
+    );
 
     if wants_wav {
         let pcm_data = collect_pcm_chunks(chunk_rx).await?;
@@ -153,80 +109,14 @@ pub async fn audio_speech_clone(
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav");
     let request = parse_clone_multipart(req).await?;
 
-    // Per-sentence scheduling: prepare clone ref once, then submit each
-    // sentence as a separate queue item so ASR can interleave.
-    let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
-    let inference_tx = state.inference_tx.clone();
-
-    let sentences = qwen3_tts::split_sentences(&request.input);
-    let language = request.language.clone();
-    let speed = request.speed;
-    let instruct = request.instruct.clone();
-    let audio_bytes = request.reference_audio;
-
-    tokio::spawn(async move {
-        // Step 1: Prepare clone reference (load + resample + cache)
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if inference_tx
-            .send(InferenceRequest::Qwen3Tts(TtsRequest::PrepareCloneRef {
-                audio_bytes,
-                response_tx: tx,
-            }))
-            .await
-            .is_err()
-        {
-            let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
-            return;
-        }
-        match rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let _ = chunk_tx.send(AudioChunk::Error(e.to_string())).await;
-                return;
-            }
-            Err(_) => {
-                let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
-                return;
-            }
-        }
-
-        // Step 2: Submit each sentence individually
-        for sentence in &sentences {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let send_ok = inference_tx
-                .send(InferenceRequest::Qwen3Tts(TtsRequest::CloneOneSentence {
-                    sentence: sentence.clone(),
-                    language: language.clone(),
-                    speed,
-                    instruct: instruct.clone(),
-                    response_tx: tx,
-                }))
-                .await;
-            if send_ok.is_err() {
-                let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
-                return;
-            }
-            match rx.await {
-                Ok(Ok(pcm)) => {
-                    if chunk_tx.send(AudioChunk::Pcm(pcm)).await.is_err() {
-                        tracing::info!("Client disconnected during clone TTS streaming");
-                        return;
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Clone TTS sentence failed, skipping: {e}");
-                    continue;
-                }
-                Err(_) => {
-                    let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
-                    return;
-                }
-            }
-        }
-        let _ = chunk_tx
-            .send(AudioChunk::Done { total_samples: 0, duration_secs: 0.0 })
-            .await;
-    });
+    let chunk_rx = spawn_per_sentence_clone(
+        state.inference_tx.clone(),
+        qwen3_tts::split_sentences(&request.input),
+        request.reference_audio,
+        request.language,
+        request.speed,
+        request.instruct,
+    );
 
     if wants_wav {
         let pcm_data = collect_pcm_chunks(chunk_rx).await?;
@@ -275,55 +165,14 @@ pub async fn tts_qwen3(
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav")
         || request.response_format == "wav";
 
-    // Per-sentence scheduling: each sentence goes through the queue individually
-    // so ASR and other tasks can be processed between TTS sentences.
-    let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
-    let inference_tx = state.inference_tx.clone();
-
-    let voice = request.voice.clone().unwrap_or_else(|| "vivian".to_string());
-    let language = request.language.clone().unwrap_or_else(|| "chinese".to_string());
-    let speed = request.speed;
-    let instruct = request.instruct.clone();
-    let sentences = qwen3_tts::split_sentences(&request.input);
-
-    tokio::spawn(async move {
-        for sentence in &sentences {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let send_ok = inference_tx
-                .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechOneSentence {
-                    sentence: sentence.clone(),
-                    voice: voice.clone(),
-                    language: language.clone(),
-                    speed,
-                    instruct: instruct.clone(),
-                    response_tx: tx,
-                }))
-                .await;
-            if send_ok.is_err() {
-                let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
-                return;
-            }
-            match rx.await {
-                Ok(Ok(pcm)) => {
-                    if chunk_tx.send(AudioChunk::Pcm(pcm)).await.is_err() {
-                        tracing::info!("Client disconnected during TTS streaming");
-                        return;
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("TTS sentence failed, skipping: {e}");
-                    continue;
-                }
-                Err(_) => {
-                    let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
-                    return;
-                }
-            }
-        }
-        let _ = chunk_tx
-            .send(AudioChunk::Done { total_samples: 0, duration_secs: 0.0 })
-            .await;
-    });
+    let chunk_rx = spawn_per_sentence_tts(
+        state.inference_tx.clone(),
+        qwen3_tts::split_sentences(&request.input),
+        request.voice.unwrap_or_else(|| "vivian".to_string()),
+        request.language.unwrap_or_else(|| "chinese".to_string()),
+        request.speed,
+        request.instruct,
+    );
 
     if wants_wav {
         let pcm_data = collect_pcm_chunks(chunk_rx).await?;
@@ -362,80 +211,14 @@ pub async fn tts_clone(
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav");
     let request = parse_clone_multipart(req).await?;
 
-    // Per-sentence scheduling for voice cloning: prepare ref once, then
-    // submit each sentence individually so ASR can interleave.
-    let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
-    let inference_tx = state.inference_tx.clone();
-
-    let sentences = qwen3_tts::split_sentences(&request.input);
-    let language = request.language.clone();
-    let speed = request.speed;
-    let instruct = request.instruct.clone();
-    let audio_bytes = request.reference_audio;
-
-    tokio::spawn(async move {
-        // Step 1: Prepare clone reference
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if inference_tx
-            .send(InferenceRequest::Qwen3Tts(TtsRequest::PrepareCloneRef {
-                audio_bytes,
-                response_tx: tx,
-            }))
-            .await
-            .is_err()
-        {
-            let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
-            return;
-        }
-        match rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let _ = chunk_tx.send(AudioChunk::Error(e.to_string())).await;
-                return;
-            }
-            Err(_) => {
-                let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
-                return;
-            }
-        }
-
-        // Step 2: Submit each sentence individually
-        for sentence in &sentences {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let send_ok = inference_tx
-                .send(InferenceRequest::Qwen3Tts(TtsRequest::CloneOneSentence {
-                    sentence: sentence.clone(),
-                    language: language.clone(),
-                    speed,
-                    instruct: instruct.clone(),
-                    response_tx: tx,
-                }))
-                .await;
-            if send_ok.is_err() {
-                let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
-                return;
-            }
-            match rx.await {
-                Ok(Ok(pcm)) => {
-                    if chunk_tx.send(AudioChunk::Pcm(pcm)).await.is_err() {
-                        tracing::info!("Client disconnected during clone TTS streaming");
-                        return;
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Clone TTS sentence failed, skipping: {e}");
-                    continue;
-                }
-                Err(_) => {
-                    let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
-                    return;
-                }
-            }
-        }
-        let _ = chunk_tx
-            .send(AudioChunk::Done { total_samples: 0, duration_secs: 0.0 })
-            .await;
-    });
+    let chunk_rx = spawn_per_sentence_clone(
+        state.inference_tx.clone(),
+        qwen3_tts::split_sentences(&request.input),
+        request.reference_audio,
+        request.language,
+        request.speed,
+        request.instruct,
+    );
 
     if wants_wav {
         let pcm_data = collect_pcm_chunks(chunk_rx).await?;
@@ -798,6 +581,141 @@ pub async fn tts_outetts(
         .insert("Content-Type", "audio/wav".parse().unwrap());
     res.write_body(wav_data).ok();
     Ok(())
+}
+
+// ============================================================================
+// Per-sentence scheduling helpers
+// ============================================================================
+
+/// Spawn a task that submits each sentence as a separate queue item for preset TTS.
+/// Returns a receiver that yields PCM chunks as they complete.
+fn spawn_per_sentence_tts(
+    inference_tx: mpsc::Sender<InferenceRequest>,
+    sentences: Vec<String>,
+    voice: String,
+    language: String,
+    speed: f32,
+    instruct: Option<String>,
+) -> mpsc::Receiver<AudioChunk> {
+    let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
+    tokio::spawn(async move {
+        for sentence in &sentences {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if inference_tx
+                .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechOneSentence {
+                    sentence: sentence.clone(),
+                    voice: voice.clone(),
+                    language: language.clone(),
+                    speed,
+                    instruct: instruct.clone(),
+                    response_tx: tx,
+                }))
+                .await
+                .is_err()
+            {
+                let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
+                return;
+            }
+            match rx.await {
+                Ok(Ok(pcm)) => {
+                    if chunk_tx.send(AudioChunk::Pcm(pcm)).await.is_err() {
+                        tracing::info!("Client disconnected during TTS streaming");
+                        return;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("TTS sentence failed, skipping: {e}");
+                    continue;
+                }
+                Err(_) => {
+                    let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
+                    return;
+                }
+            }
+        }
+        let _ = chunk_tx
+            .send(AudioChunk::Done { total_samples: 0, duration_secs: 0.0 })
+            .await;
+    });
+    chunk_rx
+}
+
+/// Spawn a task that prepares clone ref then submits each sentence individually.
+/// Returns a receiver that yields PCM chunks as they complete.
+fn spawn_per_sentence_clone(
+    inference_tx: mpsc::Sender<InferenceRequest>,
+    sentences: Vec<String>,
+    audio_bytes: Vec<u8>,
+    language: String,
+    speed: f32,
+    instruct: Option<String>,
+) -> mpsc::Receiver<AudioChunk> {
+    let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
+    tokio::spawn(async move {
+        // Step 1: Prepare clone reference (load + resample + cache)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if inference_tx
+            .send(InferenceRequest::Qwen3Tts(TtsRequest::PrepareCloneRef {
+                audio_bytes,
+                response_tx: tx,
+            }))
+            .await
+            .is_err()
+        {
+            let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
+            return;
+        }
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = chunk_tx.send(AudioChunk::Error(e.to_string())).await;
+                return;
+            }
+            Err(_) => {
+                let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
+                return;
+            }
+        }
+
+        // Step 2: Submit each sentence individually
+        for sentence in &sentences {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if inference_tx
+                .send(InferenceRequest::Qwen3Tts(TtsRequest::CloneOneSentence {
+                    sentence: sentence.clone(),
+                    language: language.clone(),
+                    speed,
+                    instruct: instruct.clone(),
+                    response_tx: tx,
+                }))
+                .await
+                .is_err()
+            {
+                let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
+                return;
+            }
+            match rx.await {
+                Ok(Ok(pcm)) => {
+                    if chunk_tx.send(AudioChunk::Pcm(pcm)).await.is_err() {
+                        tracing::info!("Client disconnected during clone TTS streaming");
+                        return;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Clone TTS sentence failed, skipping: {e}");
+                    continue;
+                }
+                Err(_) => {
+                    let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
+                    return;
+                }
+            }
+        }
+        let _ = chunk_tx
+            .send(AudioChunk::Done { total_samples: 0, duration_secs: 0.0 })
+            .await;
+    });
+    chunk_rx
 }
 
 // ============================================================================

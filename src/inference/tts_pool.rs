@@ -40,20 +40,10 @@ pub enum TtsRequest {
         request: SpeechRequest,
         response_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
     },
-    /// Streaming speech — yields PCM chunks via channel.
-    SpeechStream {
-        request: SpeechRequest,
-        chunk_tx: mpsc::Sender<AudioChunk>,
-    },
     /// Voice cloning (returns complete WAV).
     SpeechClone {
         request: SpeechCloneRequest,
         response_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
-    },
-    /// Streaming voice cloning — yields PCM chunks per sentence.
-    SpeechCloneStream {
-        request: SpeechCloneRequest,
-        chunk_tx: mpsc::Sender<AudioChunk>,
     },
     /// Synthesize a single sentence with a preset speaker. Returns PCM bytes.
     /// Used by per-sentence scheduling to avoid blocking the queue for all sentences.
@@ -265,30 +255,6 @@ impl Qwen3TtsEngines {
                 let _ = response_tx.send(result);
             }
 
-            TtsRequest::SpeechStream { request, chunk_tx } => {
-                let engine = ensure_customvoice(&mut self.cv_engine, 0);
-                if let Some(engine) = engine {
-                    let tx = chunk_tx.clone();
-                    let result = engine.synthesize_sentences(&request, |pcm_bytes| {
-                        tx.blocking_send(AudioChunk::Pcm(pcm_bytes.to_vec())).is_ok()
-                    });
-                    match result {
-                        Ok(()) => {
-                            let _ = chunk_tx.blocking_send(AudioChunk::Done {
-                                total_samples: 0,
-                                duration_secs: 0.0,
-                            });
-                        }
-                        Err(e) => {
-                            let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
-                        }
-                    }
-                } else {
-                    let _ = chunk_tx
-                        .blocking_send(AudioChunk::Error("TTS model not loaded".to_string()));
-                }
-            }
-
             TtsRequest::SpeechClone { request, response_tx } => {
                 let result = (|| -> eyre::Result<Vec<u8>> {
                     let tmp = ref_audio_to_tempfile(&request.reference_audio)?;
@@ -303,43 +269,6 @@ impl Qwen3TtsEngines {
                     )
                 })();
                 let _ = response_tx.send(result);
-            }
-
-            TtsRequest::SpeechCloneStream { request, chunk_tx } => {
-                let tmp = match ref_audio_to_tempfile(&request.reference_audio) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
-                        return;
-                    }
-                };
-                let engine = ensure_base(&mut self.base_engine, 0);
-                if let Some(engine) = engine {
-                    let tx = chunk_tx.clone();
-                    let result = engine.synthesize_clone_sentences(
-                        &request.input,
-                        tmp.path().to_str().unwrap(),
-                        &request.language,
-                        request.speed,
-                        request.instruct.as_deref(),
-                        |pcm_bytes| tx.blocking_send(AudioChunk::Pcm(pcm_bytes.to_vec())).is_ok(),
-                    );
-                    match result {
-                        Ok(()) => {
-                            let _ = chunk_tx.blocking_send(AudioChunk::Done {
-                                total_samples: 0,
-                                duration_secs: 0.0,
-                            });
-                        }
-                        Err(e) => {
-                            let _ = chunk_tx.blocking_send(AudioChunk::Error(e.to_string()));
-                        }
-                    }
-                } else {
-                    let _ = chunk_tx.blocking_send(AudioChunk::Error(
-                        "Base TTS model not found for voice cloning".to_string(),
-                    ));
-                }
             }
 
             TtsRequest::SpeechOneSentence { sentence, voice, language, speed, instruct, response_tx } => {

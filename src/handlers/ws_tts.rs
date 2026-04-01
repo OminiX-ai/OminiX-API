@@ -41,6 +41,7 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
     // Session state from task_start
     let mut voice: Option<String> = None;
     let mut speed: f32 = 1.0;
+    let mut language: String = "chinese".to_string();
     let mut _audio_format = "wav".to_string();
 
     while let Some(msg) = ws.recv().await {
@@ -78,6 +79,9 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
                         .get("speed")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(1.0) as f32;
+                    if let Some(lang) = vs.get("language").and_then(|v| v.as_str()) {
+                        language = lang.to_string();
+                    }
                 }
                 if let Some(audio_s) = event.get("audio_setting") {
                     _audio_format = audio_s
@@ -123,7 +127,7 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
                         .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechOneSentence {
                             sentence: sentence.clone(),
                             voice: ws_voice.clone(),
-                            language: "chinese".to_string(),
+                            language: language.clone(),
                             speed,
                             instruct: None,
                             response_tx: tx,
