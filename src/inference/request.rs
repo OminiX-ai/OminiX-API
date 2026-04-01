@@ -104,4 +104,18 @@ pub struct ModelStatus {
     pub qwen3_tts: Option<String>,
     pub image: Option<String>,
     pub vlm: Option<String>,
+    /// Ascend NPU backend availability
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ascend: Option<AscendStatus>,
+}
+
+/// Status of Ascend NPU backend models
+#[derive(Clone, serde::Serialize)]
+pub struct AscendStatus {
+    pub llm: bool,
+    pub vlm: bool,
+    pub asr: bool,
+    pub tts: bool,
+    pub outetts: bool,
+    pub image: bool,
 }

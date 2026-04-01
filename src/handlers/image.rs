@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use salvo::prelude::*;
 
+use crate::engines::ascend;
 use crate::error::render_error;
 use crate::inference::InferenceRequest;
 use crate::types::ImageGenerationRequest;
@@ -35,6 +36,59 @@ pub async fn images_generations(
         IMAGE_TIMEOUT,
     )
     .await?;
+
+    res.render(Json(response));
+    Ok(())
+}
+
+/// POST /v1/images/generations/ascend — Image generation on Ascend NPU
+///
+/// Routes directly to the Ascend backend (ominix-diffusion-cli).
+#[handler]
+pub async fn images_generations_ascend(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+
+    let ascend_cfg = state.ascend_config.as_ref().ok_or_else(|| {
+        tracing::error!("Ascend backend not configured");
+        StatusError::internal_server_error()
+    })?;
+
+    if !ascend_cfg.has_diffusion() {
+        render_error(
+            res,
+            salvo::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Ascend diffusion not available",
+            "unavailable",
+        );
+        return Ok(());
+    }
+
+    let request: ImageGenerationRequest = req
+        .parse_json_with_max_size(10 * 1024 * 1024)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to parse request: {}", e);
+            StatusError::bad_request()
+        })?;
+
+    let cfg = ascend_cfg.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        let engine = ascend::AscendImageEngine::new((*cfg).clone())?;
+        engine.generate(&request)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Ascend image task failed: {}", e);
+        StatusError::internal_server_error()
+    })?
+    .map_err(|e| {
+        tracing::error!("Ascend image error: {}", e);
+        StatusError::internal_server_error()
+    })?;
 
     res.render(Json(response));
     Ok(())

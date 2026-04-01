@@ -1,3 +1,4 @@
+pub mod ascend;
 pub mod asr;
 pub mod image;
 pub mod llm;

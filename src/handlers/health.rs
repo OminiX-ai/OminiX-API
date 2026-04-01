@@ -153,9 +153,21 @@ pub async fn model_status(depot: &mut Depot, res: &mut Response) -> Result<(), S
         .await
         .map_err(|_| StatusError::internal_server_error())?;
 
-    let status: ModelStatus = response_rx
+    let mut status: ModelStatus = response_rx
         .await
         .map_err(|_| StatusError::internal_server_error())?;
+
+    // Augment with Ascend backend status
+    if let Some(ref cfg) = state.ascend_config {
+        status.ascend = Some(crate::inference::AscendStatus {
+            llm: cfg.has_llm(),
+            vlm: cfg.has_vlm(),
+            asr: cfg.has_asr(),
+            tts: cfg.has_tts(),
+            outetts: cfg.has_outetts(),
+            image: cfg.has_diffusion(),
+        });
+    }
 
     res.render(Json(serde_json::json!({
         "status": "success",

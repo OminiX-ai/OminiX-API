@@ -3393,12 +3393,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwen3-tts-core"
+version = "1.0.0"
+dependencies = [
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "qwen3-tts-mlx"
 version = "1.0.0"
 dependencies = [
  "mlx-rs",
  "mlx-rs-core",
  "mlx-sys",
+ "qwen3-tts-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

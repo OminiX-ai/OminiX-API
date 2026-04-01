@@ -115,6 +115,18 @@ async fn main() -> eyre::Result<()> {
         .context("Failed to receive ready signal from inference thread")?;
     tracing::info!("Inference thread ready");
 
+    // Initialize Ascend backend if configured via environment
+    let ascend_config = engines::ascend::AscendConfig::from_env().map(|cfg| {
+        tracing::info!("Ascend backend configured: bin_dir={}", cfg.bin_dir.display());
+        if cfg.has_llm() { tracing::info!("  LLM: {:?}", cfg.llm_model); }
+        if cfg.has_vlm() { tracing::info!("  VLM: {:?} + {:?}", cfg.vlm_model, cfg.vlm_mmproj); }
+        if cfg.has_asr() { tracing::info!("  ASR: {:?}", cfg.asr_model_dir); }
+        if cfg.has_tts() { tracing::info!("  TTS: {:?}", cfg.tts_model_dir); }
+        if cfg.has_outetts() { tracing::info!("  OuteTTS: {:?}", cfg.outetts_model); }
+        if cfg.has_diffusion() { tracing::info!("  Diffusion: {:?}", cfg.diffusion_model); }
+        std::sync::Arc::new(cfg)
+    });
+
     let state = AppState {
         inference_tx,
         training_tx,
@@ -124,6 +136,7 @@ async fn main() -> eyre::Result<()> {
         download_progress_tx,
         download_cancel_flags,
         server_config,
+        ascend_config,
     };
 
     let router = router::build_router(state);
@@ -177,6 +190,14 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("  POST /v1/audio/speech            (legacy TTS)");
     tracing::info!("  POST /v1/audio/speech/clone      (legacy clone)");
     tracing::info!("  POST /v1/audio/transcriptions    (legacy ASR)");
+    tracing::info!("  --- Ascend NPU ---");
+    tracing::info!("  POST /v1/chat/completions/ascend (LLM on Ascend)");
+    tracing::info!("  POST /v1/vlm/completions/ascend  (VLM on Ascend)");
+    tracing::info!("  POST /v1/audio/asr/ascend        (Qwen3-ASR on Ascend)");
+    tracing::info!("  POST /v1/audio/tts/ascend        (Qwen3-TTS on Ascend)");
+    tracing::info!("  POST /v1/audio/tts/ascend/clone  (Voice clone on Ascend)");
+    tracing::info!("  POST /v1/audio/tts/outetts       (OuteTTS on Ascend)");
+    tracing::info!("  POST /v1/images/generations/ascend (Image gen on Ascend)");
     tracing::info!("  --- Other ---");
     tracing::info!("  POST /v1/images/generations");
     tracing::info!("  POST /v1/vlm/completions");

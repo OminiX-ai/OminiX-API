@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -31,7 +31,7 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: String,
@@ -41,14 +41,14 @@ pub struct ChatCompletionResponse {
     pub usage: ChatUsage,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessage,
     pub finish_reason: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ChatUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,

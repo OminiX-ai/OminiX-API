@@ -2,6 +2,7 @@ use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocket, WebSocketUpgrade};
 use tokio::sync::mpsc;
 
+use crate::engines::qwen3_tts;
 use crate::inference::{AudioChunk, InferenceRequest, TtsRequest};
 use crate::state::AppState;
 use crate::types::SpeechRequest;
@@ -109,38 +110,34 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
                     .map(String::from)
                     .or_else(|| voice.clone());
 
-                let speech_req = SpeechRequest {
-                    model: None,
-                    input: input_text,
-                    voice: msg_voice,
-                    response_format: "pcm".to_string(),
-                    speed,
-                    reference_audio: None,
-                    language: None,
-                    instruct: None,
-                };
+                // Per-sentence scheduling: split text, submit each sentence
+                // individually so ASR can interleave between sentences.
+                let ws_voice = msg_voice.unwrap_or_else(|| "vivian".to_string());
+                let sentences = qwen3_tts::split_sentences(&input_text);
 
-                let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(32);
-
-                if state
-                    .inference_tx
-                    .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechStream {
-                        request: speech_req,
-                        chunk_tx,
-                    }))
-                    .await
-                    .is_err()
-                {
-                    let err = serde_json::json!({"event": "error", "message": "TTS pool unavailable"});
-                    let _ = ws.send(Message::text(err.to_string())).await;
-                    break;
-                }
-
-                // Stream chunks to WebSocket as they arrive
                 let mut errored = false;
-                while let Some(chunk) = chunk_rx.recv().await {
-                    match chunk {
-                        AudioChunk::Pcm(pcm_data) => {
+                for sentence in &sentences {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    if state
+                        .inference_tx
+                        .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechOneSentence {
+                            sentence: sentence.clone(),
+                            voice: ws_voice.clone(),
+                            language: "chinese".to_string(),
+                            speed,
+                            instruct: None,
+                            response_tx: tx,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        let err = serde_json::json!({"event": "error", "message": "TTS pool unavailable"});
+                        let _ = ws.send(Message::text(err.to_string())).await;
+                        errored = true;
+                        break;
+                    }
+                    match rx.await {
+                        Ok(Ok(pcm_data)) => {
                             let hex_audio = hex::encode(&pcm_data);
                             let resp = serde_json::json!({
                                 "event": "task_progress",
@@ -151,26 +148,30 @@ async fn handle_tts_websocket(mut ws: WebSocket, state: AppState) {
                                 return; // client disconnected
                             }
                         }
-                        AudioChunk::Done { .. } => {
-                            // Send final empty chunk
-                            let resp = serde_json::json!({
-                                "event": "task_progress",
-                                "data": {"audio": ""},
-                                "is_final": true
-                            });
-                            let _ = ws.send(Message::text(resp.to_string())).await;
-                            break;
+                        Ok(Err(e)) => {
+                            tracing::warn!("WS TTS sentence failed, skipping: {e}");
+                            continue;
                         }
-                        AudioChunk::Error(e) => {
+                        Err(_) => {
                             let err = serde_json::json!({
                                 "event": "error",
-                                "message": format!("TTS error: {}", e)
+                                "message": "TTS inference dropped"
                             });
                             let _ = ws.send(Message::text(err.to_string())).await;
                             errored = true;
                             break;
                         }
                     }
+                }
+
+                if !errored {
+                    // Send final empty chunk
+                    let resp = serde_json::json!({
+                        "event": "task_progress",
+                        "data": {"audio": ""},
+                        "is_final": true
+                    });
+                    let _ = ws.send(Message::text(resp.to_string())).await;
                 }
 
                 if errored {

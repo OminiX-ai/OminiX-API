@@ -5,6 +5,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
+use crate::engines::ascend;
+use crate::engines::qwen3_tts;
 use crate::error::render_error;
 use crate::inference::{AudioChunk, InferenceRequest, TtsRequest};
 use crate::types::{SpeechCloneRequest, SpeechRequest, TranscriptionRequest};
@@ -66,20 +68,59 @@ pub async fn audio_speech(
     })?;
 
     // Always use sentence-level streaming to avoid GPU OOM on long text.
+    // Each sentence is submitted as a separate queue item so other tasks
+    // (especially ASR) can be processed between TTS sentences.
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav")
         || request.response_format == "wav"
         || request.reference_audio.is_some();
 
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
+    let inference_tx = state.inference_tx.clone();
 
-    state
-        .inference_tx
-        .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechStream {
-            request,
-            chunk_tx,
-        }))
-        .await
-        .map_err(|_| StatusError::internal_server_error())?;
+    let voice = request.voice.clone().unwrap_or_else(|| "vivian".to_string());
+    let language = request.language.clone().unwrap_or_else(|| "chinese".to_string());
+    let speed = request.speed;
+    let instruct = request.instruct.clone();
+    let sentences = qwen3_tts::split_sentences(&request.input);
+
+    tokio::spawn(async move {
+        for sentence in &sentences {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let send_ok = inference_tx
+                .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechOneSentence {
+                    sentence: sentence.clone(),
+                    voice: voice.clone(),
+                    language: language.clone(),
+                    speed,
+                    instruct: instruct.clone(),
+                    response_tx: tx,
+                }))
+                .await;
+            if send_ok.is_err() {
+                let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
+                return;
+            }
+            match rx.await {
+                Ok(Ok(pcm)) => {
+                    if chunk_tx.send(AudioChunk::Pcm(pcm)).await.is_err() {
+                        tracing::info!("Client disconnected during TTS streaming");
+                        return;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("TTS sentence failed, skipping: {e}");
+                    continue;
+                }
+                Err(_) => {
+                    let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
+                    return;
+                }
+            }
+        }
+        let _ = chunk_tx
+            .send(AudioChunk::Done { total_samples: 0, duration_secs: 0.0 })
+            .await;
+    });
 
     if wants_wav {
         let pcm_data = collect_pcm_chunks(chunk_rx).await?;
@@ -90,28 +131,7 @@ pub async fn audio_speech(
         return Ok(());
     }
 
-    // Stream PCM chunks back to client
-    let stream = ReceiverStream::new(chunk_rx).filter_map(|chunk| match chunk {
-        AudioChunk::Pcm(data) => Some(Ok::<_, std::io::Error>(salvo::hyper::body::Bytes::from(data))),
-        AudioChunk::Done { .. } => None,
-        AudioChunk::Error(e) => {
-            tracing::error!("Streaming TTS error: {e}");
-            None
-        }
-    });
-
-    res.headers_mut()
-        .insert("Content-Type", "audio/pcm".parse().unwrap());
-    res.headers_mut()
-        .insert("X-Audio-Sample-Rate", "24000".parse().unwrap());
-    res.headers_mut()
-        .insert("X-Audio-Channels", "1".parse().unwrap());
-    res.headers_mut()
-        .insert("X-Audio-Bits-Per-Sample", "16".parse().unwrap());
-    res.headers_mut()
-        .insert("Transfer-Encoding", "chunked".parse().unwrap());
-
-    res.stream(stream);
+    stream_pcm_response(chunk_rx, res);
     Ok(())
 }
 
@@ -133,17 +153,80 @@ pub async fn audio_speech_clone(
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav");
     let request = parse_clone_multipart(req).await?;
 
-    // Always use sentence-level streaming to avoid GPU OOM on long text.
+    // Per-sentence scheduling: prepare clone ref once, then submit each
+    // sentence as a separate queue item so ASR can interleave.
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
+    let inference_tx = state.inference_tx.clone();
 
-    state
-        .inference_tx
-        .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechCloneStream {
-            request,
-            chunk_tx,
-        }))
-        .await
-        .map_err(|_| StatusError::internal_server_error())?;
+    let sentences = qwen3_tts::split_sentences(&request.input);
+    let language = request.language.clone();
+    let speed = request.speed;
+    let instruct = request.instruct.clone();
+    let audio_bytes = request.reference_audio;
+
+    tokio::spawn(async move {
+        // Step 1: Prepare clone reference (load + resample + cache)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if inference_tx
+            .send(InferenceRequest::Qwen3Tts(TtsRequest::PrepareCloneRef {
+                audio_bytes,
+                response_tx: tx,
+            }))
+            .await
+            .is_err()
+        {
+            let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
+            return;
+        }
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = chunk_tx.send(AudioChunk::Error(e.to_string())).await;
+                return;
+            }
+            Err(_) => {
+                let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
+                return;
+            }
+        }
+
+        // Step 2: Submit each sentence individually
+        for sentence in &sentences {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let send_ok = inference_tx
+                .send(InferenceRequest::Qwen3Tts(TtsRequest::CloneOneSentence {
+                    sentence: sentence.clone(),
+                    language: language.clone(),
+                    speed,
+                    instruct: instruct.clone(),
+                    response_tx: tx,
+                }))
+                .await;
+            if send_ok.is_err() {
+                let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
+                return;
+            }
+            match rx.await {
+                Ok(Ok(pcm)) => {
+                    if chunk_tx.send(AudioChunk::Pcm(pcm)).await.is_err() {
+                        tracing::info!("Client disconnected during clone TTS streaming");
+                        return;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Clone TTS sentence failed, skipping: {e}");
+                    continue;
+                }
+                Err(_) => {
+                    let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
+                    return;
+                }
+            }
+        }
+        let _ = chunk_tx
+            .send(AudioChunk::Done { total_samples: 0, duration_secs: 0.0 })
+            .await;
+    });
 
     if wants_wav {
         let pcm_data = collect_pcm_chunks(chunk_rx).await?;
@@ -154,27 +237,7 @@ pub async fn audio_speech_clone(
         return Ok(());
     }
 
-    let stream = ReceiverStream::new(chunk_rx).filter_map(|chunk| match chunk {
-        AudioChunk::Pcm(data) => Some(Ok::<_, std::io::Error>(salvo::hyper::body::Bytes::from(data))),
-        AudioChunk::Done { .. } => None,
-        AudioChunk::Error(e) => {
-            tracing::error!("Streaming clone TTS error: {e}");
-            None
-        }
-    });
-
-    res.headers_mut()
-        .insert("Content-Type", "audio/pcm".parse().unwrap());
-    res.headers_mut()
-        .insert("X-Audio-Sample-Rate", "24000".parse().unwrap());
-    res.headers_mut()
-        .insert("X-Audio-Channels", "1".parse().unwrap());
-    res.headers_mut()
-        .insert("X-Audio-Bits-Per-Sample", "16".parse().unwrap());
-    res.headers_mut()
-        .insert("Transfer-Encoding", "chunked".parse().unwrap());
-
-    res.stream(stream);
+    stream_pcm_response(chunk_rx, res);
     Ok(())
 }
 
@@ -212,18 +275,57 @@ pub async fn tts_qwen3(
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav")
         || request.response_format == "wav";
 
-    // Always use sentence-level streaming to avoid GPU OOM on long text.
-    // For WAV format, we collect all streamed chunks and wrap in a WAV header.
+    // Per-sentence scheduling: each sentence goes through the queue individually
+    // so ASR and other tasks can be processed between TTS sentences.
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
+    let inference_tx = state.inference_tx.clone();
 
-    state
-        .inference_tx
-        .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechStream { request, chunk_tx }))
-        .await
-        .map_err(|_| StatusError::internal_server_error())?;
+    let voice = request.voice.clone().unwrap_or_else(|| "vivian".to_string());
+    let language = request.language.clone().unwrap_or_else(|| "chinese".to_string());
+    let speed = request.speed;
+    let instruct = request.instruct.clone();
+    let sentences = qwen3_tts::split_sentences(&request.input);
+
+    tokio::spawn(async move {
+        for sentence in &sentences {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let send_ok = inference_tx
+                .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechOneSentence {
+                    sentence: sentence.clone(),
+                    voice: voice.clone(),
+                    language: language.clone(),
+                    speed,
+                    instruct: instruct.clone(),
+                    response_tx: tx,
+                }))
+                .await;
+            if send_ok.is_err() {
+                let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
+                return;
+            }
+            match rx.await {
+                Ok(Ok(pcm)) => {
+                    if chunk_tx.send(AudioChunk::Pcm(pcm)).await.is_err() {
+                        tracing::info!("Client disconnected during TTS streaming");
+                        return;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("TTS sentence failed, skipping: {e}");
+                    continue;
+                }
+                Err(_) => {
+                    let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
+                    return;
+                }
+            }
+        }
+        let _ = chunk_tx
+            .send(AudioChunk::Done { total_samples: 0, duration_secs: 0.0 })
+            .await;
+    });
 
     if wants_wav {
-        // Collect streamed PCM chunks into a complete WAV response
         let pcm_data = collect_pcm_chunks(chunk_rx).await?;
         let wav_data = pcm_to_wav(&pcm_data, 24000);
         res.headers_mut()
@@ -260,14 +362,80 @@ pub async fn tts_clone(
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav");
     let request = parse_clone_multipart(req).await?;
 
-    // Always use sentence-level streaming to avoid GPU OOM on long text.
+    // Per-sentence scheduling for voice cloning: prepare ref once, then
+    // submit each sentence individually so ASR can interleave.
     let (chunk_tx, chunk_rx) = mpsc::channel::<AudioChunk>(32);
+    let inference_tx = state.inference_tx.clone();
 
-    state
-        .inference_tx
-        .send(InferenceRequest::Qwen3Tts(TtsRequest::SpeechCloneStream { request, chunk_tx }))
-        .await
-        .map_err(|_| StatusError::internal_server_error())?;
+    let sentences = qwen3_tts::split_sentences(&request.input);
+    let language = request.language.clone();
+    let speed = request.speed;
+    let instruct = request.instruct.clone();
+    let audio_bytes = request.reference_audio;
+
+    tokio::spawn(async move {
+        // Step 1: Prepare clone reference
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if inference_tx
+            .send(InferenceRequest::Qwen3Tts(TtsRequest::PrepareCloneRef {
+                audio_bytes,
+                response_tx: tx,
+            }))
+            .await
+            .is_err()
+        {
+            let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
+            return;
+        }
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = chunk_tx.send(AudioChunk::Error(e.to_string())).await;
+                return;
+            }
+            Err(_) => {
+                let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
+                return;
+            }
+        }
+
+        // Step 2: Submit each sentence individually
+        for sentence in &sentences {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let send_ok = inference_tx
+                .send(InferenceRequest::Qwen3Tts(TtsRequest::CloneOneSentence {
+                    sentence: sentence.clone(),
+                    language: language.clone(),
+                    speed,
+                    instruct: instruct.clone(),
+                    response_tx: tx,
+                }))
+                .await;
+            if send_ok.is_err() {
+                let _ = chunk_tx.send(AudioChunk::Error("Inference channel closed".into())).await;
+                return;
+            }
+            match rx.await {
+                Ok(Ok(pcm)) => {
+                    if chunk_tx.send(AudioChunk::Pcm(pcm)).await.is_err() {
+                        tracing::info!("Client disconnected during clone TTS streaming");
+                        return;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Clone TTS sentence failed, skipping: {e}");
+                    continue;
+                }
+                Err(_) => {
+                    let _ = chunk_tx.send(AudioChunk::Error("Inference dropped".into())).await;
+                    return;
+                }
+            }
+        }
+        let _ = chunk_tx
+            .send(AudioChunk::Done { total_samples: 0, duration_secs: 0.0 })
+            .await;
+    });
 
     if wants_wav {
         let pcm_data = collect_pcm_chunks(chunk_rx).await?;
@@ -412,6 +580,223 @@ pub async fn asr_paraformer(
     .await?;
 
     res.render(Json(response));
+    Ok(())
+}
+
+// ============================================================================
+// Ascend backend endpoints
+// ============================================================================
+
+/// POST /v1/audio/asr/ascend — Qwen3-ASR on Ascend NPU
+///
+/// Routes directly to the Ascend backend (bypasses MLX inference thread).
+#[handler]
+pub async fn asr_ascend(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+
+    if state.server_config.is_category_disabled("asr") {
+        render_error(res, salvo::http::StatusCode::FORBIDDEN, "ASR is disabled", "forbidden");
+        return Ok(());
+    }
+
+    let ascend_cfg = state.ascend_config.as_ref().ok_or_else(|| {
+        tracing::error!("Ascend backend not configured");
+        StatusError::internal_server_error()
+    })?;
+
+    if !ascend_cfg.has_asr() {
+        render_error(res, salvo::http::StatusCode::SERVICE_UNAVAILABLE, "Ascend ASR not available", "unavailable");
+        return Ok(());
+    }
+
+    let request: TranscriptionRequest = req
+        .parse_json_with_max_size(10 * 1024 * 1024)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to parse request: {}", e);
+            StatusError::bad_request()
+        })?;
+
+    // Run Ascend ASR in a blocking task (subprocess I/O)
+    let cfg = ascend_cfg.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        let engine = ascend::AscendAsrEngine::new((*cfg).clone())?;
+        engine.transcribe(&request)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Ascend ASR task failed: {}", e);
+        StatusError::internal_server_error()
+    })?
+    .map_err(|e| {
+        tracing::error!("Ascend ASR error: {}", e);
+        StatusError::internal_server_error()
+    })?;
+
+    res.render(Json(response));
+    Ok(())
+}
+
+/// POST /v1/audio/tts/ascend — Qwen3-TTS on Ascend NPU (preset voices)
+///
+/// Routes directly to the Ascend backend.
+#[handler]
+pub async fn tts_ascend(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+
+    if state.server_config.is_category_disabled("tts") {
+        render_error(res, salvo::http::StatusCode::FORBIDDEN, "TTS is disabled", "forbidden");
+        return Ok(());
+    }
+
+    let ascend_cfg = state.ascend_config.as_ref().ok_or_else(|| {
+        tracing::error!("Ascend backend not configured");
+        StatusError::internal_server_error()
+    })?;
+
+    if !ascend_cfg.has_tts() {
+        render_error(res, salvo::http::StatusCode::SERVICE_UNAVAILABLE, "Ascend TTS not available", "unavailable");
+        return Ok(());
+    }
+
+    let request: SpeechRequest = req.parse_json_with_max_size(10 * 1024 * 1024).await.map_err(|e| {
+        tracing::error!("Failed to parse request: {}", e);
+        StatusError::bad_request()
+    })?;
+
+    let cfg = ascend_cfg.clone();
+    let wav_data = tokio::task::spawn_blocking(move || {
+        let engine = ascend::AscendTtsEngine::new((*cfg).clone())?;
+        engine.synthesize(&request)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Ascend TTS task failed: {}", e);
+        StatusError::internal_server_error()
+    })?
+    .map_err(|e| {
+        tracing::error!("Ascend TTS error: {}", e);
+        StatusError::internal_server_error()
+    })?;
+
+    res.headers_mut()
+        .insert("Content-Type", "audio/wav".parse().unwrap());
+    res.write_body(wav_data).ok();
+    Ok(())
+}
+
+/// POST /v1/audio/tts/ascend/clone — Qwen3-TTS voice cloning on Ascend NPU
+///
+/// Accepts multipart form with reference audio. Routes to Ascend backend.
+#[handler]
+pub async fn tts_ascend_clone(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+
+    if state.server_config.is_category_disabled("tts") {
+        render_error(res, salvo::http::StatusCode::FORBIDDEN, "TTS is disabled", "forbidden");
+        return Ok(());
+    }
+
+    let ascend_cfg = state.ascend_config.as_ref().ok_or_else(|| {
+        tracing::error!("Ascend backend not configured");
+        StatusError::internal_server_error()
+    })?;
+
+    if !ascend_cfg.has_tts() {
+        render_error(res, salvo::http::StatusCode::SERVICE_UNAVAILABLE, "Ascend TTS not available", "unavailable");
+        return Ok(());
+    }
+
+    let request = parse_clone_multipart(req).await?;
+
+    let cfg = ascend_cfg.clone();
+    let wav_data = tokio::task::spawn_blocking(move || {
+        let engine = ascend::AscendTtsEngine::new((*cfg).clone())?;
+        engine.synthesize_clone(
+            &request.input,
+            &request.reference_audio,
+            &request.language,
+            request.speed,
+            request.instruct.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Ascend TTS clone task failed: {}", e);
+        StatusError::internal_server_error()
+    })?
+    .map_err(|e| {
+        tracing::error!("Ascend TTS clone error: {}", e);
+        StatusError::internal_server_error()
+    })?;
+
+    res.headers_mut()
+        .insert("Content-Type", "audio/wav".parse().unwrap());
+    res.write_body(wav_data).ok();
+    Ok(())
+}
+
+/// POST /v1/audio/tts/outetts — OuteTTS on Ascend NPU
+///
+/// Alternative TTS using OuteTTS-0.2 model via llama-tts binary.
+#[handler]
+pub async fn tts_outetts(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+
+    if state.server_config.is_category_disabled("tts") {
+        render_error(res, salvo::http::StatusCode::FORBIDDEN, "TTS is disabled", "forbidden");
+        return Ok(());
+    }
+
+    let ascend_cfg = state.ascend_config.as_ref().ok_or_else(|| {
+        tracing::error!("Ascend backend not configured");
+        StatusError::internal_server_error()
+    })?;
+
+    if !ascend_cfg.has_outetts() {
+        render_error(res, salvo::http::StatusCode::SERVICE_UNAVAILABLE, "OuteTTS not available", "unavailable");
+        return Ok(());
+    }
+
+    let request: SpeechRequest = req.parse_json_with_max_size(10 * 1024 * 1024).await.map_err(|e| {
+        tracing::error!("Failed to parse request: {}", e);
+        StatusError::bad_request()
+    })?;
+
+    let cfg = ascend_cfg.clone();
+    let wav_data = tokio::task::spawn_blocking(move || {
+        let engine = ascend::AscendOuteTtsEngine::new((*cfg).clone())?;
+        engine.synthesize(&request.input)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("OuteTTS task failed: {}", e);
+        StatusError::internal_server_error()
+    })?
+    .map_err(|e| {
+        tracing::error!("OuteTTS error: {}", e);
+        StatusError::internal_server_error()
+    })?;
+
+    res.headers_mut()
+        .insert("Content-Type", "audio/wav".parse().unwrap());
+    res.write_body(wav_data).ok();
     Ok(())
 }
 

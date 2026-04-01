@@ -55,6 +55,30 @@ pub enum TtsRequest {
         request: SpeechCloneRequest,
         chunk_tx: mpsc::Sender<AudioChunk>,
     },
+    /// Synthesize a single sentence with a preset speaker. Returns PCM bytes.
+    /// Used by per-sentence scheduling to avoid blocking the queue for all sentences.
+    SpeechOneSentence {
+        sentence: String,
+        voice: String,
+        language: String,
+        speed: f32,
+        instruct: Option<String>,
+        response_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
+    },
+    /// Prepare reference audio for voice cloning (load + resample + cache).
+    /// Must be called before `CloneOneSentence` requests.
+    PrepareCloneRef {
+        audio_bytes: Vec<u8>,
+        response_tx: oneshot::Sender<eyre::Result<()>>,
+    },
+    /// Synthesize a single sentence using cached clone reference. Returns PCM bytes.
+    CloneOneSentence {
+        sentence: String,
+        language: String,
+        speed: f32,
+        instruct: Option<String>,
+        response_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
+    },
 }
 
 /// Configuration for the TTS worker pool.
@@ -184,6 +208,8 @@ fn ensure_base(
 pub struct Qwen3TtsEngines {
     cv_engine: Option<qwen3_tts::Qwen3TtsEngine>,
     base_engine: Option<qwen3_tts::Qwen3TtsEngine>,
+    /// Cached reference audio samples for per-sentence voice cloning.
+    cached_clone_ref: Option<Vec<f32>>,
 }
 
 impl Qwen3TtsEngines {
@@ -192,6 +218,7 @@ impl Qwen3TtsEngines {
         let mut engines = Self {
             cv_engine: None,
             base_engine: None,
+            cached_clone_ref: None,
         };
         if eager_load {
             tracing::info!("Qwen3-TTS: eager-loading models...");
@@ -313,6 +340,50 @@ impl Qwen3TtsEngines {
                         "Base TTS model not found for voice cloning".to_string(),
                     ));
                 }
+            }
+
+            TtsRequest::SpeechOneSentence { sentence, voice, language, speed, instruct, response_tx } => {
+                let result = match ensure_customvoice(&mut self.cv_engine, 0) {
+                    Some(engine) => engine.synthesize_one_sentence(
+                        &sentence,
+                        &voice,
+                        &language,
+                        speed,
+                        instruct.as_deref(),
+                    ),
+                    None => Err(eyre::eyre!("CustomVoice TTS model not found")),
+                };
+                let _ = response_tx.send(result);
+            }
+
+            TtsRequest::PrepareCloneRef { audio_bytes, response_tx } => {
+                let result = (|| -> eyre::Result<()> {
+                    let tmp = ref_audio_to_tempfile(&audio_bytes)?;
+                    let ref_samples = qwen3_tts::Qwen3TtsEngine::load_ref_audio(
+                        tmp.path().to_str().unwrap(),
+                    )?;
+                    self.cached_clone_ref = Some(ref_samples);
+                    // Ensure base engine is loaded
+                    ensure_base(&mut self.base_engine, 0)
+                        .ok_or_else(|| eyre::eyre!("Base TTS model not found for voice cloning"))?;
+                    Ok(())
+                })();
+                let _ = response_tx.send(result);
+            }
+
+            TtsRequest::CloneOneSentence { sentence, language, speed, instruct, response_tx } => {
+                let result = match (&mut self.base_engine, &self.cached_clone_ref) {
+                    (Some(engine), Some(ref_samples)) => engine.synthesize_clone_one_sentence(
+                        &sentence,
+                        ref_samples,
+                        &language,
+                        speed,
+                        instruct.as_deref(),
+                    ),
+                    (None, _) => Err(eyre::eyre!("Base TTS model not loaded")),
+                    (_, None) => Err(eyre::eyre!("No cached clone reference — call PrepareCloneRef first")),
+                };
+                let _ = response_tx.send(result);
             }
         }
     }

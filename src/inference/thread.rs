@@ -326,6 +326,7 @@ pub fn inference_thread(
                     qwen3_tts: Some("inline".to_string()),
                     image: current_image_model.clone(),
                     vlm: current_vlm_model.clone(),
+                    ascend: None, // Populated by handler from AppState
                 };
                 let _ = response_tx.send(status);
             }

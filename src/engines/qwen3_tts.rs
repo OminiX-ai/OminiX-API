@@ -25,7 +25,7 @@ const MIN_SENTENCE_CHARS: usize = 20;
 /// the estimated frames so the model has room to breathe (pauses, prosody)
 /// but can't run away to 8192 frames for a short sentence.
 /// Minimum 256 frames (~21s) to handle short text with long pauses.
-fn max_tokens_for_text(text: &str) -> i32 {
+pub fn max_tokens_for_text(text: &str) -> i32 {
     let char_count = text.chars().count();
     // ~3 codec frames per CJK character, ~1.5 per ASCII char, at 12Hz.
     // 4x headroom to avoid premature cutoff.
@@ -40,7 +40,7 @@ fn max_tokens_for_text(text: &str) -> i32 {
 /// on abbreviations like "Dr." or decimals like "3.14"). Tiny sentences are
 /// merged with the next. Oversized sentences are further split at clause
 /// boundaries or whitespace.
-fn split_sentences(text: &str) -> Vec<String> {
+pub fn split_sentences(text: &str) -> Vec<String> {
     let text = text.trim();
     if text.is_empty() {
         return vec![];
@@ -121,7 +121,7 @@ fn split_sentences(text: &str) -> Vec<String> {
     result
 }
 
-fn nonempty_instruct(instruct: Option<&str>) -> Option<&str> {
+pub fn nonempty_instruct(instruct: Option<&str>) -> Option<&str> {
     instruct.and_then(|value| {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -568,6 +568,99 @@ impl Qwen3TtsEngine {
         tracing::info!("Sentence streaming complete: {:.1}s audio ({total_samples} samples)", duration);
 
         Ok(())
+    }
+
+    /// Load and resample reference audio to 24kHz f32 samples.
+    /// Call once per clone request; reuse the returned samples for each sentence.
+    pub fn load_ref_audio(ref_audio_path: &str) -> Result<Vec<f32>> {
+        let expanded = crate::utils::expand_tilde(ref_audio_path);
+        if !std::path::Path::new(&expanded).exists() {
+            return Err(eyre::eyre!("Reference audio not found: {expanded}"));
+        }
+        let (samples, sr) = mlx_rs_core::audio::load_wav(&expanded)
+            .context("Failed to load reference audio")?;
+        let ref_samples = if sr != 24000 {
+            tracing::info!("Resampling reference audio from {sr}Hz to 24000Hz");
+            mlx_rs_core::audio::resample(&samples, sr, 24000)
+        } else {
+            samples
+        };
+        let duration_secs = ref_samples.len() as f32 / 24000.0;
+        tracing::info!("Reference audio: {duration_secs:.1}s ({} samples)", ref_samples.len());
+        Ok(ref_samples)
+    }
+
+    /// Synthesize a single sentence with a preset speaker. Returns raw PCM i16 bytes.
+    pub fn synthesize_one_sentence(
+        &mut self,
+        sentence: &str,
+        speaker: &str,
+        language: &str,
+        speed: f32,
+        instruct: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let instruct = nonempty_instruct(instruct);
+        let opts = SynthesizeOptions {
+            speaker,
+            language,
+            speed_factor: if speed != 1.0 { Some(speed) } else { None },
+            max_new_tokens: Some(max_tokens_for_text(sentence)),
+            ..Default::default()
+        };
+        let result = if let Some(instruct) = instruct {
+            self.synthesizer
+                .synthesize_with_speaker_instruct(sentence, instruct, &opts)
+        } else {
+            self.synthesizer.synthesize(sentence, &opts)
+        };
+        match result {
+            Ok(samples) => {
+                tracing::debug!(
+                    "Single sentence: {:.1}s audio, {} chars",
+                    samples.len() as f32 / self.synthesizer.sample_rate as f32,
+                    sentence.chars().count()
+                );
+                Ok(Self::samples_to_pcm(&samples))
+            }
+            Err(e) => Err(eyre::eyre!("TTS sentence synthesis failed: {e}")),
+        }
+    }
+
+    /// Synthesize a single sentence with voice cloning. Returns raw PCM i16 bytes.
+    /// `ref_samples` should be pre-loaded via `load_ref_audio()`.
+    pub fn synthesize_clone_one_sentence(
+        &mut self,
+        sentence: &str,
+        ref_samples: &[f32],
+        language: &str,
+        speed: f32,
+        instruct: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let instruct = nonempty_instruct(instruct);
+        let opts = SynthesizeOptions {
+            language,
+            speed_factor: if speed != 1.0 { Some(speed) } else { None },
+            max_new_tokens: Some(max_tokens_for_text(sentence)),
+            ..Default::default()
+        };
+        let result = if let Some(instruct) = instruct {
+            self.synthesizer
+                .synthesize_voice_clone_instruct(sentence, ref_samples, instruct, language, &opts)
+        } else {
+            self.synthesizer
+                .synthesize_voice_clone(sentence, ref_samples, language, &opts)
+        };
+        match result {
+            Ok(samples) => {
+                tracing::debug!(
+                    "Clone single sentence: {:.1}s audio, {} chars",
+                    samples.len() as f32 / self.synthesizer.sample_rate as f32,
+                    sentence.chars().count()
+                );
+                Ok(Self::samples_to_pcm(&samples))
+            }
+            Err(e) => Err(eyre::eyre!("Clone sentence synthesis failed: {e}")),
+        }
     }
 
     /// Convert f32 samples to raw PCM i16 bytes (no header, for streaming).

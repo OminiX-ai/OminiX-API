@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use salvo::prelude::*;
 
+use crate::engines::ascend;
 use crate::inference::InferenceRequest;
 use crate::types::ChatCompletionRequest;
 
@@ -105,5 +106,56 @@ pub async fn chat_completions(
     } else {
         res.render(Json(response));
     }
+    Ok(())
+}
+
+/// POST /v1/chat/completions/ascend — LLM chat on Ascend NPU
+///
+/// Proxies to a llama-server instance running on the Ascend NPU.
+/// Supports the full OpenAI chat completions API (100+ model architectures).
+#[handler]
+pub async fn chat_completions_ascend(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+
+    let ascend_cfg = state.ascend_config.as_ref().ok_or_else(|| {
+        tracing::error!("Ascend backend not configured");
+        StatusError::internal_server_error()
+    })?;
+
+    if !ascend_cfg.has_llm() {
+        crate::error::render_error(
+            res,
+            salvo::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Ascend LLM not available. Set ASCEND_LLM_MODEL.",
+            "unavailable",
+        );
+        return Ok(());
+    }
+
+    let request: ChatCompletionRequest = req.parse_json().await.map_err(|e| {
+        tracing::error!("Failed to parse request: {}", e);
+        StatusError::bad_request()
+    })?;
+
+    let cfg = ascend_cfg.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        let server = ascend::AscendLlmServer::new((*cfg).clone())?;
+        server.chat_completions(&request)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Ascend LLM task failed: {}", e);
+        StatusError::internal_server_error()
+    })?
+    .map_err(|e| {
+        tracing::error!("Ascend LLM error: {}", e);
+        StatusError::internal_server_error()
+    })?;
+
+    res.render(Json(response));
     Ok(())
 }

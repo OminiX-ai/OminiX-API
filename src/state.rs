@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::download;
+use crate::engines::ascend::AscendConfig;
 use crate::inference::InferenceRequest;
 use crate::server_config::ServerConfig;
 use crate::training;
@@ -27,4 +28,6 @@ pub struct AppState {
     pub download_cancel_flags: download::DownloadCancelFlags,
     /// Server config (model gatekeeper)
     pub server_config: Arc<ServerConfig>,
+    /// Optional Ascend NPU backend configuration
+    pub ascend_config: Option<Arc<AscendConfig>>,
 }
