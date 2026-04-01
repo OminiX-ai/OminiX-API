@@ -11,7 +11,9 @@ use crate::types::SpeechRequest;
 
 /// Maximum characters (Unicode) per sentence chunk. Sentences longer than this
 /// are force-split at clause boundaries or whitespace.
-const MAX_SENTENCE_CHARS: usize = 200;
+/// Kept small (~80 chars) so that each TTS segment finishes in ~1-2s, allowing
+/// ASR and other tasks to interleave with low latency via per-sentence scheduling.
+const MAX_SENTENCE_CHARS: usize = 80;
 
 /// Minimum characters to accumulate before emitting a sentence. Tiny fragments
 /// like "Yes." or "OK!" are merged with the next sentence to reduce per-call
