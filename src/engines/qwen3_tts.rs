@@ -28,13 +28,33 @@ pub fn max_tokens_for_text(text: &str) -> i32 {
     estimated_frames.max(256).min(4096)
 }
 
+/// Strip characters that are not speakable text — brackets, special symbols, etc.
+/// Keeps letters, digits, whitespace, and common punctuation that TTS can handle.
+fn strip_non_speech(text: &str) -> String {
+    text.chars()
+        .filter(|ch| {
+            // Keep: letters, digits, whitespace, common punctuation
+            ch.is_alphanumeric()
+                || ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '。' | '！' | '？' | '…' | '，' | '；' | '：' | '、'
+                        | '.' | '!' | '?' | ',' | ';' | ':' | '\'' | '"'
+                        | '\u{201c}' | '\u{201d}' | '\u{2018}' | '\u{2019}' | '—' | '–' | '-'
+                        | '(' | ')' | '（' | '）'
+                )
+        })
+        .collect()
+}
+
 /// Split text at punctuation marks into segments for independent TTS synthesis.
 ///
-/// Splits at all common punctuation: CJK (。！？…，；：、) and ASCII
-/// (. ! ? , ; :) when followed by whitespace. Segments shorter than
+/// First strips non-speech characters (brackets 【】, special symbols, etc.),
+/// then splits at all common punctuation. Segments shorter than
 /// `MIN_SENTENCE_CHARS` are merged with the next to avoid tiny fragments.
 /// No force-splitting of long segments — only natural punctuation boundaries.
 pub fn split_sentences(text: &str) -> Vec<String> {
+    let text = strip_non_speech(text.trim());
     let text = text.trim();
     if text.is_empty() {
         return vec![];
