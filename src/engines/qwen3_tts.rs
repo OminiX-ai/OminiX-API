@@ -379,10 +379,7 @@ impl Qwen3TtsEngine {
                     samples.len() as f32 / self.synthesizer.sample_rate as f32,
                     sentence.chars().count()
                 );
-                let pcm = Self::samples_to_pcm(&samples);
-                drop(samples);
-                unsafe { mlx_sys::mlx_clear_cache() };
-                Ok(pcm)
+                Ok(Self::samples_to_pcm(&samples))
             }
             Err(e) => Err(eyre::eyre!("TTS sentence synthesis failed: {e}")),
         }
@@ -419,10 +416,7 @@ impl Qwen3TtsEngine {
                     samples.len() as f32 / self.synthesizer.sample_rate as f32,
                     sentence.chars().count()
                 );
-                let pcm = Self::samples_to_pcm(&samples);
-                drop(samples);
-                unsafe { mlx_sys::mlx_clear_cache() };
-                Ok(pcm)
+                Ok(Self::samples_to_pcm(&samples))
             }
             Err(e) => Err(eyre::eyre!("Clone sentence synthesis failed: {e}")),
         }
