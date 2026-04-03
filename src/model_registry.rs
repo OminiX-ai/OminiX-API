@@ -189,15 +189,15 @@ pub fn get_default_models() -> Vec<CatalogModel> {
         },
         CatalogModel {
             id: "qwen3-tts".to_string(),
-            name: "Qwen3-TTS 1.7B 8-bit (CustomVoice)".to_string(),
+            name: "Qwen3-TTS 1.7B 5-bit (CustomVoice)".to_string(),
             description: "Qwen3-TTS 1.7B text-to-speech with preset voices. Supports Chinese/English, optimized for built-in speaker presets (vivian, serena, ryan, etc.).".to_string(),
             category: ModelCategory::Tts,
-            tags: vec!["tts".into(), "text-to-speech".into(), "preset-voices".into(), "qwen3".into(), "8bit".into()],
+            tags: vec!["tts".into(), "text-to-speech".into(), "preset-voices".into(), "qwen3".into(), "5bit".into()],
             source: CatalogSource {
-                primary_url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit".to_string(),
+                primary_url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-5bit".to_string(),
                 backup_urls: vec![],
                 source_type: SourceType::Huggingface,
-                repo_id: Some("mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit".to_string()),
+                repo_id: Some("mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-5bit".to_string()),
                 revision: "main".to_string(),
             },
             storage: CatalogStorage {
@@ -207,22 +207,22 @@ pub fn get_default_models() -> Vec<CatalogModel> {
             },
             runtime: CatalogRuntime {
                 memory_required_mb: 4096,
-                quantization: Some("8bit".into()),
+                quantization: Some("5bit".into()),
                 inference_engine: Some("mlx".into()),
             },
             status: "not_downloaded".to_string(),
         },
         CatalogModel {
             id: "qwen3-tts-base".to_string(),
-            name: "Qwen3-TTS 1.7B 8-bit (Base)".to_string(),
+            name: "Qwen3-TTS 1.7B 5-bit (Base)".to_string(),
             description: "Qwen3-TTS 1.7B Base variant with zero-shot voice cloning via ECAPA-TDNN x-vector speaker embedding. Supports Chinese/English. Required for voice_clone tool.".to_string(),
             category: ModelCategory::Tts,
-            tags: vec!["tts".into(), "text-to-speech".into(), "voice-cloning".into(), "zero-shot".into(), "qwen3".into(), "8bit".into()],
+            tags: vec!["tts".into(), "text-to-speech".into(), "voice-cloning".into(), "zero-shot".into(), "qwen3".into(), "5bit".into()],
             source: CatalogSource {
-                primary_url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit".to_string(),
+                primary_url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-Base-5bit".to_string(),
                 backup_urls: vec![],
                 source_type: SourceType::Huggingface,
-                repo_id: Some("mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit".to_string()),
+                repo_id: Some("mlx-community/Qwen3-TTS-12Hz-1.7B-Base-5bit".to_string()),
                 revision: "main".to_string(),
             },
             storage: CatalogStorage {
@@ -232,7 +232,7 @@ pub fn get_default_models() -> Vec<CatalogModel> {
             },
             runtime: CatalogRuntime {
                 memory_required_mb: 4096,
-                quantization: Some("8bit".into()),
+                quantization: Some("5bit".into()),
                 inference_engine: Some("mlx".into()),
             },
             status: "not_downloaded".to_string(),
