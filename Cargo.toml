@@ -1,11 +1,23 @@
 [package]
 name = "ominix-api"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "OpenAI-compatible API server for OminiX-MLX models"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = ["mlx"]
+mlx = []   # Apple Silicon MLX backend (macOS only)
+ggml = []  # GGML/Ascend backend (Linux/Ascend, requires llama-sys + ggml-sys)
+
 [dependencies]
+# Backend-agnostic TTS core
+qwen3-tts-core = { path = "../OminiX-MLX/qwen3-tts-core" }
+
+# GGML/Ascend backend (enabled via feature flag)
+# qwen3-tts-ggml = { path = "../OminiX-MLX/qwen3-tts-ggml", optional = true }
+# llama-sys = { path = "../OminiX-MLX/llama-sys", optional = true }
+
 # HTTP Server
 salvo = { version = "0.81.0", default-features = false, features = [
     "affix-state", "cors", "server", "http1", "http2", "websocket", "sse"
