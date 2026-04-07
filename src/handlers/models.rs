@@ -95,16 +95,32 @@ pub async fn load_model(
             response_rx
         }
         "tts" => {
-            let (response_tx, response_rx) = oneshot::channel();
-            state
-                .inference_tx
-                .send(InferenceRequest::LoadTtsModel {
-                    ref_audio: request.model.clone(),
-                    response_tx,
-                })
-                .await
-                .map_err(|_| StatusError::internal_server_error())?;
-            response_rx
+            // Route Qwen3-TTS model IDs to the Qwen3-TTS engine.
+            // GPT-SoVITS uses ref audio paths; Qwen3-TTS uses model IDs.
+            let lower = request.model.to_lowercase();
+            if lower.contains("qwen3-tts") || lower.contains("qwen3_tts") {
+                let (response_tx, response_rx) = oneshot::channel();
+                state
+                    .inference_tx
+                    .send(InferenceRequest::LoadQwen3TtsModel {
+                        model_dir: request.model.clone(),
+                        response_tx,
+                    })
+                    .await
+                    .map_err(|_| StatusError::internal_server_error())?;
+                response_rx
+            } else {
+                let (response_tx, response_rx) = oneshot::channel();
+                state
+                    .inference_tx
+                    .send(InferenceRequest::LoadTtsModel {
+                        ref_audio: request.model.clone(),
+                        response_tx,
+                    })
+                    .await
+                    .map_err(|_| StatusError::internal_server_error())?;
+                response_rx
+            }
         }
         "image" => {
             let (response_tx, response_rx) = oneshot::channel();

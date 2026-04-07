@@ -4,7 +4,7 @@ use salvo::prelude::*;
 
 use crate::engines::ascend;
 use crate::inference::InferenceRequest;
-use crate::types::ChatCompletionRequest;
+use crate::types::{ChatCompletionRequest, MessageContent, VlmCompletionRequest};
 
 use super::helpers::{get_state, send_and_wait};
 
@@ -20,12 +20,77 @@ pub async fn chat_completions(
 ) -> Result<(), StatusError> {
     let state = get_state(depot)?;
 
-    let request: ChatCompletionRequest = req.parse_json().await.map_err(|e| {
-        tracing::error!("Failed to parse request: {}", e);
-        StatusError::bad_request()
-    })?;
+    let request: ChatCompletionRequest = req
+        .parse_json_with_max_size(20 * 1024 * 1024)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to parse request: {}", e);
+            StatusError::bad_request()
+        })?;
 
     let is_streaming = request.stream.unwrap_or(false);
+
+    // Detect multimodal (image) content → route to VLM engine
+    let image_b64 = request.messages.iter().rev().find_map(|m| {
+        m.content.as_ref().and_then(|c| c.image_base64())
+    });
+    if let Some(image) = image_b64 {
+        let prompt = request.messages.iter().rev().find_map(|m| {
+            m.content.as_ref().map(|c| c.as_text().to_string()).filter(|t| !t.is_empty())
+        }).unwrap_or_default();
+
+        let vlm_req = VlmCompletionRequest {
+            model: request.model.clone(),
+            image,
+            prompt,
+            temperature: request.temperature,
+            max_tokens: request.max_tokens,
+        };
+
+        let vlm_response = send_and_wait(
+            &state.inference_tx,
+            |tx| InferenceRequest::VlmCompletion { request: vlm_req, response_tx: tx },
+            CHAT_TIMEOUT,
+        )
+        .await?;
+
+        // Wrap VLM response in OpenAI chat completions format
+        let chat_response = serde_json::json!({
+            "id": vlm_response.id,
+            "object": "chat.completion",
+            "created": vlm_response.created,
+            "model": vlm_response.model,
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": vlm_response.content },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": vlm_response.usage.prompt_tokens,
+                "completion_tokens": vlm_response.usage.completion_tokens,
+                "total_tokens": vlm_response.usage.total_tokens
+            }
+        });
+
+        if is_streaming {
+            let content = vlm_response.content;
+            let sse = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "id": vlm_response.id,
+                    "object": "chat.completion.chunk",
+                    "created": vlm_response.created,
+                    "model": vlm_response.model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": "stop"}]
+                })
+            );
+            res.headers_mut().insert("Content-Type", "text/event-stream".parse().unwrap());
+            res.write_body(sse).ok();
+        } else {
+            res.render(Json(chat_response));
+        }
+        return Ok(());
+    }
 
     let response = send_and_wait(
         &state.inference_tx,
@@ -37,7 +102,7 @@ pub async fn chat_completions(
     if is_streaming {
         // Convert non-streaming response to SSE format for clients that expect streaming
         let content = response.choices.first()
-            .and_then(|c| c.message.content.clone())
+            .and_then(|c| c.message.content.as_ref().map(|mc| mc.as_text().to_string()))
             .unwrap_or_default();
         let tool_calls = response.choices.first()
             .and_then(|c| c.message.tool_calls.clone());

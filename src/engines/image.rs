@@ -1,12 +1,9 @@
-//! Image generation engine supporting FLUX.2-klein and Z-Image-Turbo
+//! Image generation engine supporting FLUX.2-klein, Z-Image-Turbo, and Qwen-Image
 //!
 //! Supported models:
 //! - FLUX.2-klein-4B: 4-step denoising, ~13GB VRAM (or ~3GB with INT8)
 //! - Z-Image-Turbo: 9-step denoising, ~12GB VRAM (or ~3GB with 4-bit)
-//!
-//! Both models support:
-//! - Text-to-image generation
-//! - Image-to-image generation (img2img) with reference image
+//! - Qwen-Image-2512: flow-matching generation with Qwen3 text encoder, 4-bit or 8-bit
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,6 +32,12 @@ use zimage_mlx::{
     QuantizedQwen3TextEncoder, sanitize_quantized_qwen3_weights,
 };
 
+use qwen_image_mlx::{
+    QwenQuantizedTransformer, QwenConfig, QwenVAE, QwenTextEncoder,
+    load_text_encoder, load_vae_from_dir, load_transformer_weights,
+    FlowMatchEulerScheduler,
+};
+
 use crate::types::{ImageGenerationRequest, ImageGenerationResponse, ImageData};
 
 /// Image generation model type
@@ -42,6 +45,7 @@ use crate::types::{ImageGenerationRequest, ImageGenerationResponse, ImageData};
 pub enum ImageModelType {
     FluxKlein,
     ZImageTurbo,
+    QwenImage,
 }
 
 impl ImageModelType {
@@ -50,6 +54,7 @@ impl ImageModelType {
         match self {
             ImageModelType::FluxKlein => &["flux-klein-4b", "flux-klein-4b-8bit"],
             ImageModelType::ZImageTurbo => &["zimage-turbo"],
+            ImageModelType::QwenImage => &["qwen-image-2512-4bit", "qwen-image-2512-8bit"],
         }
     }
 
@@ -58,6 +63,8 @@ impl ImageModelType {
         let lower = model_id.to_lowercase();
         if lower.contains("zimage") || lower.contains("z-image") {
             ImageModelType::ZImageTurbo
+        } else if lower.contains("qwen-image") || lower.contains("qwen_image") {
+            ImageModelType::QwenImage
         } else {
             // Default to FLUX for anything else (including "flux", "flux-klein-4b", etc.)
             ImageModelType::FluxKlein
@@ -69,21 +76,25 @@ impl ImageModelType {
         match self {
             ImageModelType::FluxKlein => "flux",
             ImageModelType::ZImageTurbo => "zimage",
+            ImageModelType::QwenImage => "qwen-image",
         }
     }
 }
 
-/// Transformer variant (FLUX or Z-Image)
+/// Transformer variant (FLUX, Z-Image, or Qwen-Image)
 enum TransformerVariant {
     Flux(FluxKlein, FluxKleinParams),
     FluxQuantized(QuantizedFluxKlein, FluxKleinParams),
     ZImage(ZImageTransformerQuantized, ZImageConfig),
+    QwenImage(QwenQuantizedTransformer, QwenConfig),
 }
 
-/// Text encoder variant (quantized or non-quantized)
+/// Text encoder variant
 enum TextEncoderVariant {
     Standard(Qwen3TextEncoder),
     Quantized(QuantizedQwen3TextEncoder),
+    /// Qwen2.5-VL based text encoder for Qwen-Image
+    QwenImage(QwenTextEncoder),
 }
 
 /// Image generation engine
@@ -91,10 +102,14 @@ pub struct ImageEngine {
     model_type: ImageModelType,
     text_encoder: Option<TextEncoderVariant>,
     transformer: TransformerVariant,
-    vae_decoder: Decoder,
-    vae_encoder: Encoder,
+    /// FLUX / Z-Image VAE decoder (None for Qwen-Image)
+    vae_decoder: Option<Decoder>,
+    /// FLUX / Z-Image VAE encoder for img2img (None for Qwen-Image)
+    vae_encoder: Option<Encoder>,
     tokenizer: Tokenizer,
     vae_config: AutoEncoderConfig,
+    /// Qwen-Image VAE (None for FLUX / Z-Image)
+    qwen_vae: Option<QwenVAE>,
     /// Model directory for lazy-reloading text encoder (quantized FLUX only)
     model_dir: Option<std::path::PathBuf>,
     is_quantized_flux: bool,
@@ -114,9 +129,17 @@ impl ImageEngine {
         tracing::info!("Image model type: {:?}", model_type);
 
         // Build config lookup IDs: known aliases, then original model_id,
-        // then the registry repo_id (e.g. "moxin-org/FLUX.2-klein-4B-8bit-mlx")
-        let registry_repo_id = crate::model_registry::get_download_spec(model_id)
-            .and_then(|s| s.source.repo_id);
+        // then the registry repo_id (e.g. "moxin-org/FLUX.2-klein-4B-8bit-mlx").
+        // Search all aliases + original model_id to find the registry repo_id,
+        // since the registry may use a different ID than what the caller passed.
+        let registry_repo_id = model_type.config_aliases()
+            .iter()
+            .copied()
+            .chain(std::iter::once(model_id))
+            .find_map(|id| {
+                crate::model_registry::get_download_spec(id)
+                    .and_then(|s| s.source.repo_id)
+            });
         let config_model_ids: Vec<&str> = model_type.config_aliases()
             .iter()
             .copied()
@@ -175,6 +198,11 @@ impl ImageEngine {
                 )),
             }
         };
+
+        // ── Qwen-Image: dedicated loading path ───────────────────────────────
+        if model_type == ImageModelType::QwenImage {
+            return Self::new_qwen_image(model_id, model_type, model_dir);
+        }
 
         // Check if this is a quantized FLUX model (determines text encoder precision)
         let is_quantized_flux = model_type == ImageModelType::FluxKlein
@@ -249,6 +277,7 @@ impl ImageEngine {
 
                 (trans, vec![te], vae, tok, config)
             }
+            ImageModelType::QwenImage => unreachable!("QwenImage is handled by new_qwen_image()"),
         };
 
         // Load Qwen3 text encoder (same config for both models)
@@ -305,6 +334,7 @@ impl ImageEngine {
                 encoder.update_flattened(weights_rc);
                 TextEncoderVariant::Quantized(encoder)
             }
+            ImageModelType::QwenImage => unreachable!("QwenImage is handled by new_qwen_image()"),
         };
         tracing::info!("Text encoder loaded");
 
@@ -358,6 +388,7 @@ impl ImageEngine {
                 tracing::info!("Z-Image transformer loaded (quantized)");
                 TransformerVariant::ZImage(trans, config)
             }
+            ImageModelType::QwenImage => unreachable!("QwenImage is handled by new_qwen_image()"),
         };
 
         // Load VAE (decoder and encoder)
@@ -401,10 +432,11 @@ impl ImageEngine {
             model_type,
             text_encoder: Some(text_encoder),
             transformer,
-            vae_decoder,
-            vae_encoder,
+            vae_decoder: Some(vae_decoder),
+            vae_encoder: Some(vae_encoder),
             tokenizer,
             vae_config,
+            qwen_vae: None,
             model_dir: Some(model_dir.to_path_buf()),
             is_quantized_flux,
         })
@@ -452,7 +484,7 @@ impl ImageEngine {
             .collect();
         encoder.update_flattened(weights_rc);
         self.text_encoder = Some(TextEncoderVariant::Standard(encoder));
-        tracing::info!("Text encoder reloaded");
+        tracing::info!("FLUX text encoder reloaded");
         Ok(())
     }
 
@@ -528,7 +560,9 @@ impl ImageEngine {
         let input = Array::from_slice(&pixels, &[1, height as i32, width as i32, 3]);
 
         // Encode through VAE
-        let latents = self.vae_encoder.encode_deterministic(&input)?;
+        let vae_encoder = self.vae_encoder.as_mut()
+            .ok_or_else(|| eyre::eyre!("VAE encoder not available for this model type"))?;
+        let latents = vae_encoder.encode_deterministic(&input)?;
         latents.eval()?;
 
         tracing::debug!("Encoded reference image to latents: {:?}", latents.shape());
@@ -541,6 +575,7 @@ impl ImageEngine {
         match self.model_type {
             ImageModelType::FluxKlein => self.generate_flux(prompt, width, height, Some(ref_latents), strength),
             ImageModelType::ZImageTurbo => self.generate_zimage(prompt, width, height, Some(ref_latents), strength),
+            ImageModelType::QwenImage => Err(eyre::eyre!("img2img not supported for Qwen-Image")),
         }
     }
 
@@ -549,6 +584,7 @@ impl ImageEngine {
         match self.model_type {
             ImageModelType::FluxKlein => self.generate_flux(prompt, width, height, None, 1.0),
             ImageModelType::ZImageTurbo => self.generate_zimage(prompt, width, height, None, 1.0),
+            ImageModelType::QwenImage => self.generate_qwen_image(prompt, width, height),
         }
     }
 
@@ -654,6 +690,7 @@ impl ImageEngine {
         let txt_embed = match self.text_encoder.as_mut().unwrap() {
             TextEncoderVariant::Standard(enc) => enc.encode(&input_ids, Some(&attention_mask))?,
             TextEncoderVariant::Quantized(enc) => enc.encode_flux(&input_ids, Some(&attention_mask))?,
+            TextEncoderVariant::QwenImage(_) => return Err(eyre::eyre!("Expected FLUX text encoder, got Qwen-Image encoder")),
         };
         let txt_embed = txt_embed.as_dtype(mlx_rs::Dtype::Float32)?;
         txt_embed.eval()?;
@@ -733,11 +770,224 @@ impl ImageEngine {
         let vae_width = patch_w * patch_size;
         let latent_for_vae = latent.reshape(&[batch_size, vae_height, vae_width, z_channels])?;
 
-        let image = self.vae_decoder.forward(&latent_for_vae)?;
+        let vae_decoder = self.vae_decoder.as_mut().expect("FLUX VAE decoder must be present");
+        let image = vae_decoder.forward(&latent_for_vae)?;
         image.eval()?;
         tracing::info!("VAE decode complete, shape: {:?}", image.shape());
 
         self.vae_to_png_flux(&image)
+    }
+
+    // ── Qwen-Image ──────────────────────────────────────────────────────────
+
+    /// Load Qwen-Image model from the resolved model directory.
+    fn new_qwen_image(model_id: &str, model_type: ImageModelType, model_dir: std::path::PathBuf) -> Result<Self> {
+        tracing::info!("Loading Qwen-Image from: {:?}", model_dir);
+
+        // Detect quantization bits from model ID
+        let lower = model_id.to_lowercase();
+        let qwen_config = if lower.contains("8bit") {
+            tracing::info!("Qwen-Image: using 8-bit quantized config");
+            QwenConfig::with_8bit()
+        } else {
+            tracing::info!("Qwen-Image: using 4-bit quantized config");
+            QwenConfig::default()
+        };
+
+        // Load text encoder (Qwen2.5-VL 7B, 28 layers, hidden=3584)
+        tracing::info!("Loading Qwen-Image text encoder...");
+        let text_encoder = load_text_encoder(&model_dir)
+            .map_err(|e| eyre::eyre!("Failed to load Qwen-Image text encoder: {e}"))?;
+        tracing::info!("Qwen-Image text encoder loaded");
+
+        // Load transformer from sharded safetensors
+        tracing::info!("Loading Qwen-Image transformer ({}-bit)...", qwen_config.quantization_bits);
+        let transformer_dir = model_dir.join("transformer");
+        let index_path = transformer_dir.join("model.safetensors.index.json");
+        if !index_path.exists() {
+            return Err(eyre::eyre!("Qwen-Image transformer index not found: {:?}", index_path));
+        }
+        let index_content = std::fs::read_to_string(&index_path)
+            .context("Failed to read transformer index")?;
+        let index: serde_json::Value = serde_json::from_str(&index_content)
+            .context("Failed to parse transformer index")?;
+        let weight_map = index["weight_map"].as_object()
+            .ok_or_else(|| eyre::eyre!("Invalid transformer index format"))?;
+        let mut shard_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for file in weight_map.values() {
+            if let Some(f) = file.as_str() {
+                shard_files.insert(f.to_string());
+            }
+        }
+        let mut all_weights: HashMap<String, Array> = HashMap::new();
+        for shard in &shard_files {
+            let shard_path = transformer_dir.join(shard);
+            tracing::info!("  Loading transformer shard: {}", shard);
+            let weights = load_safetensors(&shard_path)
+                .map_err(|e| eyre::eyre!("Failed to load transformer shard {}: {}", shard, e))?;
+            all_weights.extend(weights);
+        }
+        let mut transformer = QwenQuantizedTransformer::new(qwen_config.clone())
+            .map_err(|e| eyre::eyre!("Failed to create Qwen-Image transformer: {e}"))?;
+        load_transformer_weights(&mut transformer, all_weights)
+            .map_err(|e| eyre::eyre!("Failed to load Qwen-Image transformer weights: {e}"))?;
+        tracing::info!("Qwen-Image transformer loaded ({} blocks)", qwen_config.num_layers);
+
+        // Load VAE
+        tracing::info!("Loading Qwen-Image VAE...");
+        let qwen_vae = load_vae_from_dir(&model_dir)
+            .map_err(|e| eyre::eyre!("Failed to load Qwen-Image VAE: {e}"))?;
+        tracing::info!("Qwen-Image VAE loaded");
+
+        // Load tokenizer from tokenizer/tokenizer.json
+        let tok_path = model_dir.join("tokenizer/tokenizer.json");
+        if !tok_path.exists() {
+            return Err(eyre::eyre!("Qwen-Image tokenizer not found at {:?}", tok_path));
+        }
+        let tokenizer = Tokenizer::from_file(&tok_path)
+            .map_err(|e| eyre::eyre!("Failed to load Qwen-Image tokenizer: {e}"))?;
+        tracing::info!("Qwen-Image tokenizer loaded");
+
+        tracing::info!("Qwen-Image engine ready");
+
+        Ok(Self {
+            model_type,
+            text_encoder: Some(TextEncoderVariant::QwenImage(text_encoder)),
+            transformer: TransformerVariant::QwenImage(transformer, qwen_config),
+            vae_decoder: None,
+            vae_encoder: None,
+            tokenizer,
+            vae_config: AutoEncoderConfig::flux2(), // placeholder, unused for QwenImage
+            qwen_vae: Some(qwen_vae),
+            model_dir: Some(model_dir),
+            is_quantized_flux: false,
+        })
+    }
+
+    /// Generate an image using the Qwen-Image flow-matching pipeline.
+    fn generate_qwen_image(&mut self, prompt: &str, width: u32, height: u32) -> Result<Vec<u8>> {
+        use mlx_rs::ops;
+
+        let batch = 1i32;
+        let num_steps = 20i32;
+        let latent_channels = 16i32;
+        let frames = 1i32;
+        let latent_h = height as i32 / 8;
+        let latent_w = width as i32 / 8;
+        let patch_size = 2i32;
+
+        // Tokenize prompt with Qwen3 chat template
+        let chat_prompt = format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            prompt
+        );
+        let encoding = self.tokenizer.encode(chat_prompt.as_str(), true)
+            .map_err(|e| eyre::eyre!("Qwen-Image tokenization failed: {e}"))?;
+        let ids: Vec<i32> = encoding.get_ids().iter().map(|&x| x as i32).collect();
+        let seq_len = ids.len() as i32;
+        let input_ids = Array::from_slice(&ids, &[batch, seq_len]);
+
+        // Encode text
+        tracing::info!("Encoding text prompt ({} tokens)...", seq_len);
+        let encoder_hidden_states = match self.text_encoder.as_mut() {
+            Some(TextEncoderVariant::QwenImage(enc)) => {
+                enc.forward(&input_ids)
+                    .map_err(|e| eyre::eyre!("Qwen-Image text encoding failed: {e}"))?
+            }
+            _ => return Err(eyre::eyre!("Expected QwenImage text encoder")),
+        };
+        let encoder_hidden_states = encoder_hidden_states.as_dtype(mlx_rs::Dtype::Float32)
+            .map_err(|e| eyre::eyre!("Failed to cast text embeddings: {e}"))?;
+        encoder_hidden_states.eval()
+            .map_err(|e| eyre::eyre!("Failed to eval text embeddings: {e}"))?;
+        tracing::info!("Text encoding complete, shape: {:?}", encoder_hidden_states.shape());
+
+        // Flow-matching scheduler
+        let scheduler = FlowMatchEulerScheduler::new(num_steps, 3.0);
+
+        // Initialize noise latents: [B, C, F, H, W]
+        let noise = mlx_rs::random::normal::<f32>(
+            &[batch, latent_channels, frames, latent_h, latent_w], None, None, None,
+        ).map_err(|e| eyre::eyre!("Failed to init noise: {e}"))?;
+        let mut latents = scheduler.scale_noise(&noise)
+            .map_err(|e| eyre::eyre!("Failed to scale noise: {e}"))?;
+
+        // Denoising loop
+        tracing::info!("Running Qwen-Image denoising ({} steps)...", num_steps);
+        for (idx, &t) in scheduler.timesteps().iter().enumerate() {
+            let timestep = Array::from_slice(&[t * 1000.0], &[batch]);
+
+            unsafe { mlx_sys::mlx_clear_cache(); }
+
+            // Patchify: [B, C, F, H, W] -> [B, F*pH*pW, C*p*p]
+            let hidden_states = qwen_patchify(&latents, patch_size)
+                .map_err(|e| eyre::eyre!("Patchify failed: {e}"))?;
+
+            // Forward through quantized transformer
+            let v_pred_patches = match &mut self.transformer {
+                TransformerVariant::QwenImage(t, _) => {
+                    t.forward(&hidden_states, &encoder_hidden_states, &timestep, None, None, None)
+                        .map_err(|e| eyre::eyre!("Qwen-Image transformer forward failed: {e}"))?
+                }
+                _ => return Err(eyre::eyre!("Expected QwenImage transformer")),
+            };
+
+            // Unpatchify: [B, seq, C*p*p] -> [B, C, F, H, W]
+            let v_pred = qwen_unpatchify(&v_pred_patches, frames, latent_h, latent_w, patch_size)
+                .map_err(|e| eyre::eyre!("Unpatchify failed: {e}"))?;
+
+            // Euler step
+            latents = scheduler.step(&v_pred, idx, &latents)
+                .map_err(|e| eyre::eyre!("Scheduler step failed: {e}"))?;
+            latents.eval()
+                .map_err(|e| eyre::eyre!("Eval after step failed: {e}"))?;
+
+            tracing::info!("  Step {}/{}: t={:.3}", idx + 1, num_steps, t);
+        }
+
+        // Collapse frame dim: [B, C, F, H, W] -> [B, C, H, W]
+        let latents_2d = {
+            use mlx_rs::ops::indexing::IndexOp;
+            let indexed = latents.index((.., .., 0i32, .., ..));
+            let numel = indexed.shape().iter().map(|&d| d as usize).product::<usize>();
+            let flat = indexed.reshape(&[numel as i32])
+                .map_err(|e| eyre::eyre!("Reshape failed: {e}"))?;
+            flat.reshape(&[batch, latent_channels, latent_h, latent_w])
+                .map_err(|e| eyre::eyre!("Reshape to 2d failed: {e}"))?
+        };
+
+        // Decode with QwenVAE: output [B, 3, H, W]
+        tracing::info!("Decoding Qwen-Image latents...");
+        let image = self.qwen_vae.as_mut()
+            .ok_or_else(|| eyre::eyre!("Qwen VAE not loaded"))?
+            .decode(&latents_2d)
+            .map_err(|e| eyre::eyre!("Qwen-Image VAE decode failed: {e}"))?;
+        image.eval().map_err(|e| eyre::eyre!("Eval after decode failed: {e}"))?;
+        tracing::info!("Qwen-Image decode complete, shape: {:?}", image.shape());
+
+        // Convert [B, 3, H, W] in [-1, 1] range to PNG
+        let image = ops::add(&image, &Array::from_slice(&[1.0f32], &[1]))
+            .map_err(|e| eyre::eyre!("Image post-proc failed: {e}"))?;
+        let image = ops::multiply(&image, &Array::from_slice(&[127.5f32], &[1]))
+            .map_err(|e| eyre::eyre!("Image scale failed: {e}"))?;
+        let image = ops::maximum(&image, &Array::from_slice(&[0.0f32], &[1]))
+            .map_err(|e| eyre::eyre!("Image clip min failed: {e}"))?;
+        let image = ops::minimum(&image, &Array::from_slice(&[255.0f32], &[1]))
+            .map_err(|e| eyre::eyre!("Image clip max failed: {e}"))?;
+        // Transpose [B, 3, H, W] -> [B, H, W, 3] for row-major pixel output
+        let image = image.transpose_axes(&[0, 2, 3, 1])
+            .map_err(|e| eyre::eyre!("Image transpose failed: {e}"))?;
+        image.eval().map_err(|e| eyre::eyre!("Image eval failed: {e}"))?;
+
+        let shape = image.shape();
+        let out_height = shape[1] as u32;
+        let out_width = shape[2] as u32;
+        let image_flat = image.reshape(&[-1])
+            .map_err(|e| eyre::eyre!("Flatten failed: {e}"))?;
+        let image_data: Vec<f32> = image_flat.as_slice().to_vec();
+        let rgb_bytes: Vec<u8> = image_data.iter().map(|&v| v.round() as u8).collect();
+
+        rgb_to_png(&rgb_bytes, out_width, out_height)
     }
 
     /// Unified Z-Image-Turbo generation (txt2img and img2img)
@@ -767,6 +1017,7 @@ impl ImageEngine {
         let txt_embed = match self.text_encoder.as_mut().unwrap() {
             TextEncoderVariant::Standard(enc) => enc.encode_zimage(&input_ids, Some(&attention_mask))?,
             TextEncoderVariant::Quantized(enc) => enc.encode_zimage(&input_ids, Some(&attention_mask))?,
+            TextEncoderVariant::QwenImage(_) => return Err(eyre::eyre!("Expected ZImage text encoder, got Qwen-Image encoder")),
         };
         let txt_embed = txt_embed.as_dtype(mlx_rs::Dtype::Float32)?;
         txt_embed.eval()?;
@@ -851,11 +1102,58 @@ impl ImageEngine {
         tracing::debug!("Decoding latents...");
         let latents = latents.transpose_axes(&[0, 2, 3, 1])?;
 
-        let image = self.vae_decoder.forward(&latents)?;
+        let vae_decoder = self.vae_decoder.as_mut().expect("Z-Image VAE decoder must be present");
+        let image = vae_decoder.forward(&latents)?;
         image.eval()?;
 
         self.vae_to_png_zimage(&image)
     }
+}
+
+// ── Qwen-Image helpers ──────────────────────────────────────────────────────
+
+/// Patchify latents for Qwen-Image: [B, C, F, H, W] -> [B, F*pH*pW, C*p*p]
+fn qwen_patchify(x: &Array, patch_size: i32) -> Result<Array, mlx_rs::error::Exception> {
+    let batch = x.dim(0);
+    let channels = x.dim(1);
+    let frames = x.dim(2);
+    let height = x.dim(3);
+    let width = x.dim(4);
+    let p = patch_size;
+    let patch_h = height / p;
+    let patch_w = width / p;
+
+    // [B, C, F, H, W] -> [B, C, F, pH, p, pW, p]
+    let x = x.reshape(&[batch, channels, frames, patch_h, p, patch_w, p])?;
+    // -> [B, F, pH, pW, C, p, p]
+    let x = x.transpose_axes(&[0, 2, 3, 5, 1, 4, 6])?;
+    // -> [B, F*pH*pW, C*p*p]
+    let num_patches = frames * patch_h * patch_w;
+    let patch_dim = channels * p * p;
+    x.reshape(&[batch, num_patches, patch_dim])
+}
+
+/// Unpatchify for Qwen-Image: [B, seq, out_ch*p*p] -> [B, out_ch, F, H, W]
+fn qwen_unpatchify(
+    x: &Array,
+    frames: i32,
+    height: i32,
+    width: i32,
+    patch_size: i32,
+) -> Result<Array, mlx_rs::error::Exception> {
+    let batch = x.dim(0);
+    let patch_dim = x.dim(2);
+    let p = patch_size;
+    let out_channels = patch_dim / (p * p);
+    let patch_h = height / p;
+    let patch_w = width / p;
+
+    // [B, F*pH*pW, C*p*p] -> [B, F, pH, pW, C, p, p]
+    let x = x.reshape(&[batch, frames, patch_h, patch_w, out_channels, p, p])?;
+    // -> [B, C, F, pH, p, pW, p]
+    let x = x.transpose_axes(&[0, 4, 1, 2, 5, 3, 6])?;
+    // -> [B, C, F, H, W]
+    x.reshape(&[batch, out_channels, frames, height, width])
 }
 
 /// Maximum allowed image dimension

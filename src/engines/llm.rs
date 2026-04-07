@@ -147,7 +147,7 @@ impl LlmEngine {
         let mut has_system = false;
 
         for msg in messages {
-            let content = msg.content.as_deref().unwrap_or("");
+            let content = msg.content.as_ref().map(|c| c.as_text()).unwrap_or("");
             match msg.role.as_str() {
                 "system" => {
                     prompt.push_str("<|im_start|>system\n");
@@ -226,7 +226,7 @@ impl LlmEngine {
         prompt.push_str("[gMASK]<sop>");
 
         for msg in messages {
-            let content = msg.content.as_deref().unwrap_or("");
+            let content = msg.content.as_ref().map(|c| c.as_text()).unwrap_or("");
             match msg.role.as_str() {
                 "system" => {
                     prompt.push_str("<|system|>");
@@ -388,7 +388,7 @@ impl LlmEngine {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content: if content.is_empty() { None } else { Some(content) },
+                    content: if content.is_empty() { None } else { Some(crate::types::MessageContent::Text(content)) },
                     tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
                     tool_call_id: None,
                 },

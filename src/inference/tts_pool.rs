@@ -97,6 +97,7 @@ impl TtsPoolConfig {
 // ── Model discovery ────────────────────────────────────────────────
 
 /// Search standard model directories for a TTS model variant.
+/// Searches both first-level and second-level subdirectories under each base dir.
 fn find_tts_model(variant: &str) -> Option<String> {
     fn has_qwen3_tts_weights(path: &std::path::Path) -> bool {
         path.join("model.safetensors").is_file()
@@ -114,8 +115,27 @@ fn find_tts_model(variant: &str) -> Option<String> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_lowercase();
-                if path.is_dir() && name.contains("tts") && name.contains(variant) {
-                    candidates.push(path);
+                if !path.is_dir() {
+                    continue;
+                }
+                // Direct match (first level)
+                if name.contains("tts") && name.contains(variant) {
+                    candidates.push(path.clone());
+                }
+                // Search one level deeper (e.g. ~/.OminiX/models/qwen3-tts-mlx/<variant-dir>)
+                if name.contains("tts") {
+                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                        for sub in sub_entries.flatten() {
+                            let sub_path = sub.path();
+                            let sub_name = sub.file_name().to_string_lossy().to_lowercase();
+                            if sub_path.is_dir()
+                                && sub_name.contains(variant)
+                                && has_qwen3_tts_weights(&sub_path)
+                            {
+                                candidates.push(sub_path);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -219,6 +239,22 @@ impl Qwen3TtsEngines {
             tracing::info!("Qwen3-TTS: eager load complete (CustomVoice={cv_ok}, Base={base_ok})");
         }
         engines
+    }
+
+    /// Explicitly load the appropriate engine for a model ID.
+    /// Returns Ok if the engine was loaded (or was already loaded), Err if not found.
+    pub fn load_model(&mut self, model_id: &str) -> eyre::Result<String> {
+        if model_id.contains("base") {
+            match ensure_base(&mut self.base_engine, 0) {
+                Some(_) => Ok("Qwen3-TTS Base loaded".to_string()),
+                None => Err(eyre::eyre!("Qwen3-TTS Base model not found on disk. Expected a directory containing 'tts' and 'base' under ~/.OminiX/models/")),
+            }
+        } else {
+            match ensure_customvoice(&mut self.cv_engine, 0) {
+                Some(_) => Ok("Qwen3-TTS CustomVoice loaded".to_string()),
+                None => Err(eyre::eyre!("Qwen3-TTS CustomVoice model not found on disk. Expected a directory containing 'tts' and 'customvoice' under ~/.OminiX/models/")),
+            }
+        }
     }
 
     /// Handle a TTS request inline (called from the inference thread).

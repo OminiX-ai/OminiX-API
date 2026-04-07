@@ -39,7 +39,9 @@ gpt-sovits-mlx = { path = "../OminiX-MLX/gpt-sovits-mlx" }
 qwen3-tts-mlx = { path = "../OminiX-MLX/qwen3-tts-mlx" }
 flux-klein-mlx = { path = "../OminiX-MLX/flux-klein-mlx" }
 zimage-mlx = { path = "../OminiX-MLX/zimage-mlx" }
+qwen-image-mlx = { path = "../OminiX-MLX/qwen-image-mlx" }
 moxin-vlm-mlx = { path = "../OminiX-MLX/moxin-vlm-mlx" }
+qwen3-vl-mlx = { path = "../OminiX-MLX/qwen3-vl-mlx" }
 qwen3-asr-mlx = { path = "../OminiX-MLX/qwen3-asr-mlx" }
 minicpm-sala-mlx = { path = "../OminiX-MLX/minicpm-sala-mlx" }
 

@@ -2511,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-internal-macros"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2534,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-macros"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-rs"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytemuck",
  "dyn-clone",
@@ -2883,7 +2883,7 @@ checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
 name = "ominix-api"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2902,9 +2902,12 @@ dependencies = [
  "mlx-rs-core",
  "mlx-sys",
  "moxin-vlm-mlx",
+ "qwen-image-mlx",
  "qwen3-asr-mlx",
  "qwen3-mlx",
+ "qwen3-tts-core",
  "qwen3-tts-mlx",
+ "qwen3-vl-mlx",
  "reqwest",
  "salvo",
  "semver",
@@ -3363,6 +3366,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwen-image-mlx"
+version = "1.0.1"
+dependencies = [
+ "bytemuck",
+ "memmap2",
+ "mlx-macros",
+ "mlx-rs",
+ "mlx-rs-core",
+ "mlx-sys",
+ "safetensors 0.6.2",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
 name = "qwen3-asr-mlx"
 version = "1.0.0"
 dependencies = [
@@ -3416,6 +3435,19 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
  "tracing",
+]
+
+[[package]]
+name = "qwen3-vl-mlx"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "mlx-rs",
+ "mlx-rs-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers 0.21.4",
 ]
 
 [[package]]

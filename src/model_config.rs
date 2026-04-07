@@ -757,13 +757,16 @@ fn detect_model_category(model_dir: &PathBuf) -> Option<ModelCategory> {
         }
     }
 
-    // VLM: config.json containing "vision_backbone" or model_type containing "prismatic"/"moxin"
+    // VLM: config.json containing "vision_backbone" or model_type containing "prismatic"/"moxin"/"qwen3_vl"
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if content.contains("vision_backbone") || content.contains("prismatic") || content.contains("moxin") {
-                if has_safetensors_in(model_dir) {
-                    return Some(ModelCategory::Vlm);
-                }
+            let is_vlm = content.contains("vision_backbone")
+                || content.contains("prismatic")
+                || content.contains("moxin")
+                || content.contains("\"qwen3_vl\"")
+                || content.contains("\"qwen2_vl\"");
+            if is_vlm && has_safetensors_in(model_dir) {
+                return Some(ModelCategory::Vlm);
             }
         }
     }

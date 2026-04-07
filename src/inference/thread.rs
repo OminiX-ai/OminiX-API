@@ -246,8 +246,10 @@ pub fn inference_thread(
                 let result = load_model_slot(&mut vlm_engine, &mut current_vlm_model, &model_id, vlm::VlmEngine::new);
                 let _ = response_tx.send(result);
             }
-            InferenceRequest::LoadQwen3TtsModel { response_tx, .. } => {
-                let _ = response_tx.send(Ok("Qwen3-TTS auto-loads on demand".to_string()));
+            InferenceRequest::LoadQwen3TtsModel { model_dir, response_tx } => {
+                tracing::info!("Loading Qwen3-TTS model: {}", model_dir);
+                let result = qwen3_tts.load_model(&model_dir);
+                let _ = response_tx.send(result);
             }
             InferenceRequest::LoadImageModel { model_id, response_tx } => {
                 let normalized = normalize_image_model(&model_id);
