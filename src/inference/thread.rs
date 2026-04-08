@@ -325,7 +325,7 @@ pub fn inference_thread(
                     llm: current_llm_model.clone(),
                     asr: current_asr_model.clone(),
                     tts: current_tts_model.clone(),
-                    qwen3_tts: Some("inline".to_string()),
+                    qwen3_tts: qwen3_tts.current_variant_name().map(|s| s.to_string()),
                     image: current_image_model.clone(),
                     vlm: current_vlm_model.clone(),
                     ascend: None, // Populated by handler from AppState

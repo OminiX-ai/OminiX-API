@@ -314,6 +314,18 @@ impl Qwen3TtsEngine {
         self.samples_to_wav(&all_samples, self.synthesizer.sample_rate)
     }
 
+    /// Swap the underlying model to a different variant (CustomVoice ↔ Base).
+    /// Reuses the shared decoder and tokenizer; only reloads the talker weights.
+    pub fn swap_model(&mut self, model_dir: &str) -> Result<()> {
+        let expanded = crate::utils::expand_tilde(model_dir);
+        self.synthesizer
+            .swap_talker(&expanded)
+            .map_err(|e| eyre::eyre!("Failed to swap TTS model: {e}"))?;
+        let model_type = self.synthesizer.model_type();
+        tracing::info!("Qwen3-TTS model swapped (type: {model_type})");
+        Ok(())
+    }
+
     /// Whether voice cloning is supported (requires Base model with speaker encoder).
     pub fn supports_voice_cloning(&self) -> bool {
         self.synthesizer.supports_voice_cloning()

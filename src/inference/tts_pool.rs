@@ -4,14 +4,17 @@
 //! to serialize all GPU access through a single thread. This prevents Metal
 //! command buffer crashes when ASR and TTS run concurrently on separate threads.
 //!
+//! Only one model variant (CustomVoice or Base) is loaded at a time. When a
+//! request requires the other variant, the engine swaps the talker weights
+//! in-place — reusing the shared decoder and tokenizer to cut swap time.
+//!
 //! See: <https://github.com/ml-explore/mlx/issues/3078> (MLX thread safety)
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::engines::qwen3_tts;
 use crate::types::{SpeechCloneRequest, SpeechRequest};
 
-use super::AudioChunk;
 
 /// Write raw audio bytes to a temp file for engine consumption.
 /// The caller must keep the `NamedTempFile` alive until inference completes.
@@ -74,7 +77,7 @@ pub enum TtsRequest {
 /// Configuration for the TTS worker pool.
 #[derive(Debug, Clone)]
 pub struct TtsPoolConfig {
-    /// When true (default), load both CustomVoice and Base models at startup
+    /// When true (default), load the default model (CustomVoice) at startup
     /// instead of on first request. Set `TTS_LAZY_LOAD=1` to use lazy loading.
     pub eager_load: bool,
 }
@@ -91,6 +94,23 @@ impl TtsPoolConfig {
             .map(|v| v != "1" && v.to_lowercase() != "true")
             .unwrap_or(true);
         Self { eager_load }
+    }
+}
+
+// ── Which variant is loaded ───────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TtsVariant {
+    CustomVoice,
+    Base,
+}
+
+impl std::fmt::Display for TtsVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TtsVariant::CustomVoice => write!(f, "customvoice"),
+            TtsVariant::Base => write!(f, "base"),
+        }
     }
 }
 
@@ -156,87 +176,115 @@ fn find_tts_model(variant: &str) -> Option<String> {
     None
 }
 
+// ── Engine ensure helpers ─────────────────────────────────────────
 
-/// Ensure CustomVoice engine is loaded, return mutable ref.
-fn ensure_customvoice(
-    engine: &mut Option<qwen3_tts::Qwen3TtsEngine>,
-    worker_id: usize,
-) -> Option<&mut qwen3_tts::Qwen3TtsEngine> {
-    if engine.as_ref().is_some_and(|e| e.supports_preset_speakers()) {
+/// Ensure the engine is loaded with CustomVoice variant. Swaps if needed.
+fn ensure_customvoice<'a>(
+    engine: &'a mut Option<qwen3_tts::Qwen3TtsEngine>,
+    variant: &mut Option<TtsVariant>,
+) -> Option<&'a mut qwen3_tts::Qwen3TtsEngine> {
+    if *variant == Some(TtsVariant::CustomVoice) && engine.is_some() {
         return engine.as_mut();
     }
-    // Need to load or switch
-    if let Some(path) = find_tts_model("customvoice") {
-        tracing::info!("TTS worker {worker_id}: loading CustomVoice model: {path}");
-        match qwen3_tts::Qwen3TtsEngine::new(&path) {
-            Ok(e) => {
-                *engine = Some(e);
-                engine.as_mut()
+
+    let path = find_tts_model("customvoice")?;
+
+    if let Some(ref mut e) = engine {
+        // Swap talker in-place (reuse decoder + tokenizer)
+        tracing::info!("TTS: swapping to CustomVoice model: {path}");
+        match e.swap_model(&path) {
+            Ok(()) => {
+                *variant = Some(TtsVariant::CustomVoice);
+                return engine.as_mut();
             }
             Err(e) => {
-                tracing::error!("TTS worker {worker_id}: failed to load CustomVoice: {e}");
-                None
+                tracing::error!("TTS: failed to swap to CustomVoice: {e}");
+                return None;
             }
         }
-    } else {
-        // Fall back to whatever is loaded
-        engine.as_mut()
+    }
+
+    // Cold start — load from scratch
+    tracing::info!("TTS: loading CustomVoice model: {path}");
+    match qwen3_tts::Qwen3TtsEngine::new(&path) {
+        Ok(e) => {
+            *engine = Some(e);
+            *variant = Some(TtsVariant::CustomVoice);
+            engine.as_mut()
+        }
+        Err(e) => {
+            tracing::error!("TTS: failed to load CustomVoice: {e}");
+            None
+        }
     }
 }
 
-/// Ensure Base engine (voice cloning) is loaded, return mutable ref.
-fn ensure_base(
-    engine: &mut Option<qwen3_tts::Qwen3TtsEngine>,
-    worker_id: usize,
-) -> Option<&mut qwen3_tts::Qwen3TtsEngine> {
-    if engine
-        .as_ref()
-        .is_some_and(|e| e.supports_voice_cloning())
-    {
+/// Ensure the engine is loaded with Base variant (voice cloning). Swaps if needed.
+fn ensure_base<'a>(
+    engine: &'a mut Option<qwen3_tts::Qwen3TtsEngine>,
+    variant: &mut Option<TtsVariant>,
+) -> Option<&'a mut qwen3_tts::Qwen3TtsEngine> {
+    if *variant == Some(TtsVariant::Base) && engine.is_some() {
         return engine.as_mut();
     }
-    if let Some(path) = find_tts_model("base") {
-        tracing::info!("TTS worker {worker_id}: loading Base model: {path}");
-        match qwen3_tts::Qwen3TtsEngine::new(&path) {
-            Ok(e) => {
-                *engine = Some(e);
-                engine.as_mut()
+
+    let path = find_tts_model("base")?;
+
+    if let Some(ref mut e) = engine {
+        // Swap talker in-place (reuse decoder + tokenizer)
+        tracing::info!("TTS: swapping to Base model: {path}");
+        match e.swap_model(&path) {
+            Ok(()) => {
+                *variant = Some(TtsVariant::Base);
+                return engine.as_mut();
             }
             Err(e) => {
-                tracing::error!("TTS worker {worker_id}: failed to load Base model: {e}");
-                None
+                tracing::error!("TTS: failed to swap to Base: {e}");
+                return None;
             }
         }
-    } else {
-        None
+    }
+
+    // Cold start — load from scratch
+    tracing::info!("TTS: loading Base model: {path}");
+    match qwen3_tts::Qwen3TtsEngine::new(&path) {
+        Ok(e) => {
+            *engine = Some(e);
+            *variant = Some(TtsVariant::Base);
+            engine.as_mut()
+        }
+        Err(e) => {
+            tracing::error!("TTS: failed to load Base model: {e}");
+            None
+        }
     }
 }
 
 // ── Qwen3-TTS engine holder (used by inference thread) ─────────────
 
-/// Holds both Qwen3-TTS engine variants for use by the inference thread.
+/// Holds a single Qwen3-TTS engine that swaps between CustomVoice and Base
+/// variants on demand. Only one model is in memory at a time (~3 GB instead
+/// of ~6 GB when both were loaded simultaneously).
 pub struct Qwen3TtsEngines {
-    cv_engine: Option<qwen3_tts::Qwen3TtsEngine>,
-    base_engine: Option<qwen3_tts::Qwen3TtsEngine>,
+    engine: Option<qwen3_tts::Qwen3TtsEngine>,
+    variant: Option<TtsVariant>,
     /// Cached reference audio samples for per-sentence voice cloning.
     cached_clone_ref: Option<Vec<f32>>,
 }
 
 impl Qwen3TtsEngines {
-    /// Create and optionally eager-load both engine variants.
+    /// Create and optionally eager-load the default (CustomVoice) engine.
     pub fn new(eager_load: bool) -> Self {
         let mut engines = Self {
-            cv_engine: None,
-            base_engine: None,
+            engine: None,
+            variant: None,
             cached_clone_ref: None,
         };
         if eager_load {
-            tracing::info!("Qwen3-TTS: eager-loading models...");
-            ensure_customvoice(&mut engines.cv_engine, 0);
-            ensure_base(&mut engines.base_engine, 0);
-            let cv_ok = engines.cv_engine.is_some();
-            let base_ok = engines.base_engine.is_some();
-            tracing::info!("Qwen3-TTS: eager load complete (CustomVoice={cv_ok}, Base={base_ok})");
+            tracing::info!("Qwen3-TTS: eager-loading default model (CustomVoice)...");
+            ensure_customvoice(&mut engines.engine, &mut engines.variant);
+            let ok = engines.engine.is_some();
+            tracing::info!("Qwen3-TTS: eager load complete (loaded={ok})");
         }
         engines
     }
@@ -245,16 +293,24 @@ impl Qwen3TtsEngines {
     /// Returns Ok if the engine was loaded (or was already loaded), Err if not found.
     pub fn load_model(&mut self, model_id: &str) -> eyre::Result<String> {
         if model_id.contains("base") {
-            match ensure_base(&mut self.base_engine, 0) {
+            match ensure_base(&mut self.engine, &mut self.variant) {
                 Some(_) => Ok("Qwen3-TTS Base loaded".to_string()),
                 None => Err(eyre::eyre!("Qwen3-TTS Base model not found on disk. Expected a directory containing 'tts' and 'base' under ~/.OminiX/models/")),
             }
         } else {
-            match ensure_customvoice(&mut self.cv_engine, 0) {
+            match ensure_customvoice(&mut self.engine, &mut self.variant) {
                 Some(_) => Ok("Qwen3-TTS CustomVoice loaded".to_string()),
                 None => Err(eyre::eyre!("Qwen3-TTS CustomVoice model not found on disk. Expected a directory containing 'tts' and 'customvoice' under ~/.OminiX/models/")),
             }
         }
+    }
+
+    /// Currently loaded variant name, for status reporting.
+    pub fn current_variant_name(&self) -> Option<&'static str> {
+        self.variant.map(|v| match v {
+            TtsVariant::CustomVoice => "customvoice",
+            TtsVariant::Base => "base",
+        })
     }
 
     /// Handle a TTS request inline (called from the inference thread).
@@ -270,7 +326,7 @@ impl Qwen3TtsEngines {
                             .decode(b64)
                             .map_err(|e| eyre::eyre!("Invalid base64 in reference_audio: {e}"))?;
                         let tmp = ref_audio_to_tempfile(&raw)?;
-                        let engine = ensure_base(&mut self.base_engine, 0)
+                        let engine = ensure_base(&mut self.engine, &mut self.variant)
                             .ok_or_else(|| eyre::eyre!("Base TTS model not found on disk"))?;
                         let lang = request.language.as_deref().unwrap_or("chinese");
                         engine.synthesize_clone(
@@ -282,7 +338,7 @@ impl Qwen3TtsEngines {
                         )
                     })()
                 } else {
-                    let engine = ensure_customvoice(&mut self.cv_engine, 0);
+                    let engine = ensure_customvoice(&mut self.engine, &mut self.variant);
                     match engine {
                         Some(e) => e.synthesize(&request),
                         None => Err(eyre::eyre!("CustomVoice TTS model not found on disk")),
@@ -294,7 +350,7 @@ impl Qwen3TtsEngines {
             TtsRequest::SpeechClone { request, response_tx } => {
                 let result = (|| -> eyre::Result<Vec<u8>> {
                     let tmp = ref_audio_to_tempfile(&request.reference_audio)?;
-                    let engine = ensure_base(&mut self.base_engine, 0)
+                    let engine = ensure_base(&mut self.engine, &mut self.variant)
                         .ok_or_else(|| eyre::eyre!("Base TTS model not found for voice cloning"))?;
                     engine.synthesize_clone(
                         &request.input,
@@ -308,7 +364,7 @@ impl Qwen3TtsEngines {
             }
 
             TtsRequest::SpeechOneSentence { sentence, voice, language, speed, instruct, response_tx } => {
-                let result = match ensure_customvoice(&mut self.cv_engine, 0) {
+                let result = match ensure_customvoice(&mut self.engine, &mut self.variant) {
                     Some(engine) => engine.synthesize_one_sentence(
                         &sentence,
                         &voice,
@@ -329,7 +385,7 @@ impl Qwen3TtsEngines {
                     )?;
                     self.cached_clone_ref = Some(ref_samples);
                     // Ensure base engine is loaded
-                    ensure_base(&mut self.base_engine, 0)
+                    ensure_base(&mut self.engine, &mut self.variant)
                         .ok_or_else(|| eyre::eyre!("Base TTS model not found for voice cloning"))?;
                     Ok(())
                 })();
@@ -337,19 +393,226 @@ impl Qwen3TtsEngines {
             }
 
             TtsRequest::CloneOneSentence { sentence, language, speed, instruct, response_tx } => {
-                let result = match (&mut self.base_engine, &self.cached_clone_ref) {
-                    (Some(engine), Some(ref_samples)) => engine.synthesize_clone_one_sentence(
+                let result = if self.cached_clone_ref.is_none() {
+                    Err(eyre::eyre!("No cached clone reference — call PrepareCloneRef first"))
+                } else if self.engine.is_none() {
+                    Err(eyre::eyre!("Base TTS model not loaded"))
+                } else {
+                    // Ensure Base variant is active (may need to swap back if interleaved)
+                    if self.variant != Some(TtsVariant::Base) {
+                        tracing::warn!("TTS: clone sentence found non-Base model loaded, swapping back");
+                        if ensure_base(&mut self.engine, &mut self.variant).is_none() {
+                            let _ = response_tx.send(Err(eyre::eyre!("Failed to swap back to Base model")));
+                            return;
+                        }
+                    }
+                    let engine = self.engine.as_mut().unwrap();
+                    let ref_samples = self.cached_clone_ref.as_ref().unwrap();
+                    engine.synthesize_clone_one_sentence(
                         &sentence,
                         ref_samples,
                         &language,
                         speed,
                         instruct.as_deref(),
-                    ),
-                    (None, _) => Err(eyre::eyre!("Base TTS model not loaded")),
-                    (_, None) => Err(eyre::eyre!("No cached clone reference — call PrepareCloneRef first")),
+                    )
                 };
                 let _ = response_tx.send(result);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REF_AUDIO: &str = "/Users/yuechen/home/OminiX-MLX/step-audio2-mlx/real_speech.wav";
+
+    /// Helper: send a TtsRequest and block on the oneshot response.
+    fn send_and_recv<T: Send + 'static>(
+        engines: &mut Qwen3TtsEngines,
+        make_req: impl FnOnce(oneshot::Sender<eyre::Result<T>>) -> TtsRequest,
+    ) -> eyre::Result<T> {
+        let (tx, rx) = oneshot::channel();
+        engines.handle(make_req(tx));
+        rx.blocking_recv().unwrap()
+    }
+
+    /// Interleaved CustomVoice ↔ Base (xvec clone) requests.
+    ///
+    /// Sequence:
+    ///   1. CV sentence  → loads CustomVoice
+    ///   2. PrepareCloneRef → swaps to Base
+    ///   3. Clone sentence #1 → stays Base
+    ///   4. CV sentence (interleave!) → swaps to CustomVoice
+    ///   5. Clone sentence #2 → swaps back to Base
+    ///   6. CV sentence → swaps to CustomVoice
+    ///
+    /// Verifies: every request succeeds, variant tracking is correct,
+    /// and the interleaved clone sentence recovers gracefully.
+    #[test]
+    #[ignore] // requires models on disk + MLX GPU
+    fn should_swap_models_when_interleaved_cv_and_clone_requests() {
+        // Lazy-load so we control the sequence
+        let mut engines = Qwen3TtsEngines::new(false);
+        assert!(engines.current_variant_name().is_none());
+
+        // 1. CV sentence → cold-loads CustomVoice
+        let pcm = send_and_recv(&mut engines, |tx| TtsRequest::SpeechOneSentence {
+            sentence: "你好世界".to_string(),
+            voice: "vivian".to_string(),
+            language: "chinese".to_string(),
+            speed: 1.0,
+            instruct: None,
+            response_tx: tx,
+        });
+        assert!(pcm.is_ok(), "CV sentence #1 failed: {:?}", pcm.err());
+        assert!(!pcm.unwrap().is_empty());
+        assert_eq!(engines.current_variant_name(), Some("customvoice"));
+
+        // 2. PrepareCloneRef → swaps to Base
+        let ref_bytes = std::fs::read(REF_AUDIO).expect("ref audio not found");
+        let prep = send_and_recv::<()>(&mut engines, |tx| TtsRequest::PrepareCloneRef {
+            audio_bytes: ref_bytes,
+            response_tx: tx,
+        });
+        assert!(prep.is_ok(), "PrepareCloneRef failed: {:?}", prep.err());
+        assert_eq!(engines.current_variant_name(), Some("base"));
+
+        // 3. Clone sentence #1 → stays Base
+        let pcm = send_and_recv(&mut engines, |tx| TtsRequest::CloneOneSentence {
+            sentence: "这是克隆语音测试".to_string(),
+            language: "chinese".to_string(),
+            speed: 1.0,
+            instruct: None,
+            response_tx: tx,
+        });
+        assert!(pcm.is_ok(), "Clone sentence #1 failed: {:?}", pcm.err());
+        assert!(!pcm.unwrap().is_empty());
+        assert_eq!(engines.current_variant_name(), Some("base"));
+
+        // 4. INTERLEAVE: CV sentence arrives mid-clone-batch → swaps to CustomVoice
+        let pcm = send_and_recv(&mut engines, |tx| TtsRequest::SpeechOneSentence {
+            sentence: "插入的普通语音".to_string(),
+            voice: "vivian".to_string(),
+            language: "chinese".to_string(),
+            speed: 1.0,
+            instruct: None,
+            response_tx: tx,
+        });
+        assert!(pcm.is_ok(), "Interleaved CV sentence failed: {:?}", pcm.err());
+        assert!(!pcm.unwrap().is_empty());
+        assert_eq!(engines.current_variant_name(), Some("customvoice"));
+
+        // 5. Clone sentence #2 → detects wrong variant, swaps back to Base
+        let pcm = send_and_recv(&mut engines, |tx| TtsRequest::CloneOneSentence {
+            sentence: "克隆语音第二句".to_string(),
+            language: "chinese".to_string(),
+            speed: 1.0,
+            instruct: None,
+            response_tx: tx,
+        });
+        assert!(pcm.is_ok(), "Clone sentence #2 (after interleave) failed: {:?}", pcm.err());
+        assert!(!pcm.unwrap().is_empty());
+        assert_eq!(engines.current_variant_name(), Some("base"));
+
+        // 6. Back to CV
+        let pcm = send_and_recv(&mut engines, |tx| TtsRequest::SpeechOneSentence {
+            sentence: "最后一句普通语音".to_string(),
+            voice: "vivian".to_string(),
+            language: "chinese".to_string(),
+            speed: 1.0,
+            instruct: None,
+            response_tx: tx,
+        });
+        assert!(pcm.is_ok(), "Final CV sentence failed: {:?}", pcm.err());
+        assert!(!pcm.unwrap().is_empty());
+        assert_eq!(engines.current_variant_name(), Some("customvoice"));
+    }
+
+    /// Get current process RSS in MB via macOS `task_info`.
+    fn rss_mb() -> f64 {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps failed");
+        let kb: f64 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0.0);
+        kb / 1024.0
+    }
+
+    /// Run 10 full interleave cycles (CV → Base → CV) and track RSS at each swap.
+    /// Checks for memory leaks: RSS should stabilize, not grow linearly.
+    #[test]
+    #[ignore] // requires models on disk + MLX GPU
+    fn should_not_leak_memory_across_10_interleaved_cycles() {
+        let ref_bytes = std::fs::read(REF_AUDIO).expect("ref audio not found");
+
+        let mut engines = Qwen3TtsEngines::new(false);
+        let mut rss_samples: Vec<(usize, &str, f64)> = Vec::new();
+
+        let rss_before = rss_mb();
+        eprintln!("\n[mem] before load: {rss_before:.0} MB");
+
+        for round in 0..10 {
+            // --- CV sentence ---
+            let pcm = send_and_recv(&mut engines, |tx| TtsRequest::SpeechOneSentence {
+                sentence: format!("第{round}轮，你好世界"),
+                voice: "vivian".to_string(),
+                language: "chinese".to_string(),
+                speed: 1.0,
+                instruct: None,
+                response_tx: tx,
+            });
+            assert!(pcm.is_ok(), "round {round} CV failed: {:?}", pcm.err());
+            let rss = rss_mb();
+            rss_samples.push((round, "cv", rss));
+            eprintln!("[mem] round {round:>2} CV   : {rss:.0} MB");
+
+            // --- PrepareCloneRef (swaps to Base) ---
+            let prep = send_and_recv::<()>(&mut engines, |tx| TtsRequest::PrepareCloneRef {
+                audio_bytes: ref_bytes.clone(),
+                response_tx: tx,
+            });
+            assert!(prep.is_ok(), "round {round} PrepareCloneRef failed: {:?}", prep.err());
+
+            // --- Clone sentence ---
+            let pcm = send_and_recv(&mut engines, |tx| TtsRequest::CloneOneSentence {
+                sentence: format!("第{round}轮，克隆语音测试"),
+                language: "chinese".to_string(),
+                speed: 1.0,
+                instruct: None,
+                response_tx: tx,
+            });
+            assert!(pcm.is_ok(), "round {round} clone failed: {:?}", pcm.err());
+            let rss = rss_mb();
+            rss_samples.push((round, "base", rss));
+            eprintln!("[mem] round {round:>2} Base : {rss:.0} MB");
+        }
+
+        // Print summary
+        eprintln!("\n--- RSS summary (MB) ---");
+        eprintln!("round | CV     | Base");
+        for round in 0..10 {
+            let cv = rss_samples.iter().find(|(r, t, _)| *r == round && *t == "cv").map(|x| x.2).unwrap();
+            let base = rss_samples.iter().find(|(r, t, _)| *r == round && *t == "base").map(|x| x.2).unwrap();
+            eprintln!("  {round:>2}  | {cv:>6.0} | {base:>6.0}");
+        }
+
+        // Check for leaks: RSS at round 9 should not be more than 500 MB above round 1
+        // (round 0 is cold-load, round 1 is the steady-state baseline)
+        let baseline_cv = rss_samples.iter().find(|(r, t, _)| *r == 1 && *t == "cv").map(|x| x.2).unwrap();
+        let final_cv = rss_samples.iter().find(|(r, t, _)| *r == 9 && *t == "cv").map(|x| x.2).unwrap();
+        let drift = final_cv - baseline_cv;
+        eprintln!("\n[mem] baseline (round 1 CV): {baseline_cv:.0} MB");
+        eprintln!("[mem] final    (round 9 CV): {final_cv:.0} MB");
+        eprintln!("[mem] drift: {drift:+.0} MB");
+
+        assert!(
+            drift < 500.0,
+            "RSS grew by {drift:.0} MB over 10 cycles — possible memory leak"
+        );
     }
 }
