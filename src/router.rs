@@ -39,7 +39,7 @@ pub fn build_router(state: AppState) -> Router {
                 )
                 // Chat
                 .push(Router::with_path("chat/completions").post(handlers::chat::chat_completions))
-                .push(Router::with_path("chat/completions/ascend").post(handlers::chat::chat_completions_ascend))
+                // .push(Router::with_path("chat/completions/ascend").post(handlers::chat::chat_completions_ascend))
                 // Audio — model-specific endpoints (preferred)
                 .push(Router::with_path("audio")
                     // TTS model-specific
@@ -47,18 +47,18 @@ pub fn build_router(state: AppState) -> Router {
                         .push(Router::with_path("qwen3").post(handlers::audio::tts_qwen3))
                         .push(Router::with_path("clone").post(handlers::audio::tts_clone))
                         .push(Router::with_path("sovits").post(handlers::audio::tts_sovits))
-                        // Ascend TTS endpoints
-                        .push(Router::with_path("ascend").post(handlers::audio::tts_ascend))
-                        .push(Router::with_path("ascend/clone").post(handlers::audio::tts_ascend_clone))
-                        // OuteTTS on Ascend
-                        .push(Router::with_path("outetts").post(handlers::audio::tts_outetts))
+                        // // Ascend TTS endpoints
+                        // .push(Router::with_path("ascend").post(handlers::audio::tts_ascend))
+                        // .push(Router::with_path("ascend/clone").post(handlers::audio::tts_ascend_clone))
+                        // // OuteTTS on Ascend
+                        // .push(Router::with_path("outetts").post(handlers::audio::tts_outetts))
                     )
                     // ASR model-specific
                     .push(Router::with_path("asr")
                         .push(Router::with_path("qwen3").post(handlers::audio::asr_qwen3))
                         .push(Router::with_path("paraformer").post(handlers::audio::asr_paraformer))
-                        // Ascend ASR endpoint
-                        .push(Router::with_path("ascend").post(handlers::audio::asr_ascend))
+                        // // Ascend ASR endpoint
+                        // .push(Router::with_path("ascend").post(handlers::audio::asr_ascend))
                     )
                     // Legacy endpoints (backward-compatible, auto-routes)
                     .push(Router::with_path("transcriptions").post(handlers::audio::audio_transcriptions))
@@ -69,10 +69,10 @@ pub fn build_router(state: AppState) -> Router {
                 )
                 // Images
                 .push(Router::with_path("images/generations").post(handlers::image::images_generations))
-                .push(Router::with_path("images/generations/ascend").post(handlers::image::images_generations_ascend))
+                // .push(Router::with_path("images/generations/ascend").post(handlers::image::images_generations_ascend))
                 // VLM
                 .push(Router::with_path("vlm/completions").post(handlers::vlm::vlm_completions))
-                .push(Router::with_path("vlm/completions/ascend").post(handlers::vlm::vlm_completions_ascend))
+                // .push(Router::with_path("vlm/completions/ascend").post(handlers::vlm::vlm_completions_ascend))
                 // Voices
                 .push(Router::with_path("voices")
                     .push(Router::new().get(handlers::training::list_voices))
