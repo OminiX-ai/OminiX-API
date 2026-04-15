@@ -116,6 +116,20 @@ pub struct ImageEngine {
 }
 
 impl ImageEngine {
+    /// Estimated VRAM requirements per model type (bytes).
+    fn estimated_vram(model_type: ImageModelType, is_quantized: bool) -> usize {
+        match (model_type, is_quantized) {
+            // FLUX quantized: 8-bit transformer ~4.1GB + VAE ~0.2GB (text encoder loaded/dropped)
+            (ImageModelType::FluxKlein, true) => 4_500_000_000,
+            // FLUX f32: text encoder ~15GB + transformer ~8GB + VAE ~0.2GB
+            (ImageModelType::FluxKlein, false) => 23_000_000_000,
+            // Z-Image 4-bit: transformer ~3GB + text encoder ~1.5GB + VAE ~0.2GB
+            (ImageModelType::ZImageTurbo, _) => 5_000_000_000,
+            // Qwen-Image: transformer ~3GB + text encoder ~2GB + VAE ~0.5GB
+            (ImageModelType::QwenImage, _) => 6_000_000_000,
+        }
+    }
+
     /// Create a new image generation engine
     ///
     /// First checks ~/.OminiX/local_models_config.json for model availability.
@@ -123,6 +137,8 @@ impl ImageEngine {
     /// to download from HuggingFace Hub.
     pub fn new(model_id: &str) -> Result<Self> {
         tracing::info!("Initializing image generation engine: {}", model_id);
+        let mem_before = mlx_rs_core::memory::memory_snapshot();
+        tracing::info!("GPU memory before load: {}", mem_before);
 
         // Determine model type from the user-provided model ID
         let model_type = ImageModelType::from_model_id(model_id);
@@ -207,6 +223,13 @@ impl ImageEngine {
         // Check if this is a quantized FLUX model (determines text encoder precision)
         let is_quantized_flux = model_type == ImageModelType::FluxKlein
             && model_dir.join("transformer/quantized_8bit.safetensors").exists();
+
+        // Pre-flight memory check — fail fast if clearly insufficient
+        let estimated = Self::estimated_vram(model_type, is_quantized_flux);
+        if let Err(msg) = mlx_rs_core::memory::preflight_check(estimated) {
+            tracing::warn!("Memory preflight warning: {}", msg);
+            // Don't fail — the estimate is conservative and MLX may manage. Just warn.
+        }
 
         // Get paths and configs based on model type
         let (transformer_path, text_encoder_paths, vae_path, tokenizer_path, vae_config) = match model_type {
@@ -426,7 +449,10 @@ impl ImageEngine {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| eyre::eyre!("Failed to load tokenizer: {}", e))?;
 
-        tracing::info!("Image generation engine ready");
+        let mem_after = mlx_rs_core::memory::memory_snapshot();
+        tracing::info!("Image engine ready. GPU memory: {} (loaded {:.1}MB)",
+            mem_after,
+            (mem_after.active as f64 - mem_before.active as f64) / 1e6);
 
         Ok(Self {
             model_type,
@@ -490,6 +516,9 @@ impl ImageEngine {
 
     /// Generate images from a text prompt (with optional reference image for img2img)
     pub fn generate(&mut self, request: &ImageGenerationRequest) -> Result<ImageGenerationResponse> {
+        let gen_start_mem = mlx_rs_core::memory::memory_snapshot();
+        tracing::debug!("Generate start: {}", gen_start_mem);
+
         let (width, height) = parse_size(&request.size)?;
 
         // Check if we have a reference image for img2img
@@ -530,6 +559,12 @@ impl ImageEngine {
                 revised_prompt: Some(request.prompt.clone()),
             });
         }
+
+        let gen_end_mem = mlx_rs_core::memory::memory_snapshot();
+        tracing::info!("Generate done: {} (delta {:.1}MB, peak {:.1}MB)",
+            gen_end_mem,
+            (gen_end_mem.active as f64 - gen_start_mem.active as f64) / 1e6,
+            gen_end_mem.peak as f64 / 1e6);
 
         Ok(ImageGenerationResponse {
             created: chrono::Utc::now().timestamp(),
@@ -700,7 +735,7 @@ impl ImageEngine {
         if self.is_quantized_flux {
             tracing::info!("Dropping text encoder to free memory for denoising...");
             self.text_encoder = None;
-            unsafe { mlx_sys::mlx_clear_cache(); }
+            mlx_rs_core::memory::clear_cache();
         }
 
         // Setup latent dimensions
@@ -757,7 +792,8 @@ impl ImageEngine {
             let dt = t_next - t_curr;
             let scaled_v = ops::multiply(&v_pred, &Array::from_slice(&[dt], &[1]))?;
             latent = ops::add(&latent, &scaled_v)?;
-            latent.eval()?;
+            mlx_rs_core::memory::eval_with_retry(&[&latent], 2)
+                .map_err(|e| eyre::eyre!("Denoising step eval failed: {e}"))?;
 
             tracing::info!("  Step {}/{}: t={:.3}->{:.3}", step + 1, num_steps, t_curr, t_next);
         }
@@ -772,7 +808,8 @@ impl ImageEngine {
 
         let vae_decoder = self.vae_decoder.as_mut().expect("FLUX VAE decoder must be present");
         let image = vae_decoder.forward(&latent_for_vae)?;
-        image.eval()?;
+        mlx_rs_core::memory::eval_with_retry(&[&image], 2)
+            .map_err(|e| eyre::eyre!("VAE decode eval failed: {e}"))?;
         tracing::info!("VAE decode complete, shape: {:?}", image.shape());
 
         self.vae_to_png_flux(&image)
