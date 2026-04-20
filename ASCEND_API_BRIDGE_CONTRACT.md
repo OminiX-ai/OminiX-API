@@ -7,13 +7,24 @@ and unify MLX and Ascend backends behind a shared Rust trait.
 Directions (2) [CannFusion] and (3) [Ascend/MLX model-code merge]
 remain explicitly out of scope.
 
-## 1. Goal (single sentence)
+## 1. Goals
 
-OminiX-API serves TTS requests on Ascend 910 hosts via
-`libqwen_tts_api.so` through bindgen-wrapped FFI, with MLX and Ascend
-backends both implementing a shared `TextToSpeech` trait, at parity
-(latency, ASR-content) with the existing subprocess path — **~1 week
-of engineering, no changes to the native TTS delivery track**.
+**G1 — Deploy OminiX-API on Ascend server `ac01` serving via FFI.**
+OminiX-API runs on `ac01` (Ascend 910, production host) and serves
+`/v1/audio/tts/ascend*` through `libqwen_tts_api.so` via bindgen
+FFI. All three modes — ICL, xvec, customvoice — available on this
+endpoint. Subprocess path stays compiled but is not the default.
+
+**G2 — Extend native-path optimizations to xvec + customvoice.**
+Today only ICL hits the native engine + W8 + NZ + TQE=2 stack
+(33.8 fps). xvec and customvoice fall back to llama.cpp because
+native `TalkerCannEngine` does not yet implement MRoPE 4×pos. G2
+ports MRoPE into the native engine and re-measures xvec +
+customvoice with all three stretches on (target: parity with ICL's
+33.8 fps, or ≥ 25 fps minimum-gate on both).
+
+**Combined deliverable**: one Ascend deployment at `ac01` serving
+all three TTS modes through the FFI path at parity fps + quality.
 
 ## 2. Non-goals
 
@@ -480,34 +491,77 @@ the `qwen_tts` binary for the same params on 1 canonical utt (run on
 ModelArts 910B4). `cargo check --features ascend-tts-ffi` stays clean
 on Mac; `cargo build` clean on Ascend host.
 
-### B4 — E2E parity on Ascend host (1 day) — runs after B5
+### B4 — E2E deploy + parity on Ascend `ac01` (1 day) — runs after B5
 
-- [ ] 4.1 Deploy OminiX-API + `libqwen_tts_api.so` to the ModelArts
-      910B4 host (ma-user@dev-modelarts… port 31984, reused from
-      TTS contract).
+Target host: **`ac01`** (production Ascend 910, separate from the
+ModelArts dev container used during B1-B5). SSH details to be
+provided by user before B4 starts — not in current config.
+
+- [ ] 4.1 Provision `ac01`: install `libqwen_tts_api.so` + header,
+      `rustup` toolchain, CANN runtime (should be pre-installed on a
+      prod Ascend host). Copy OminiX-API source; build with
+      `--features ascend-tts-ffi` on the host.
 - [ ] 4.2 Curl `/v1/audio/tts/ascend` with `ASCEND_TTS_TRANSPORT=ffi`
-      and again with `=subprocess` for the same 3 canonical utts.
+      and `=subprocess` for the same 3 canonical utts.
 - [ ] 4.3 ASR-gate both outputs (same `scripts/asr_quality_check.sh`
       pattern as TTS contract).
-- [ ] 4.4 Latency compare: FFI path p50 ≤ subprocess path p50 minus
-      any fork/exec overhead (target: ≥100 ms saved per request).
+- [ ] 4.4 Latency compare: FFI p50 ≤ subprocess p50 minus fork/exec
+      overhead (target: ≥ 100 ms saved per request).
 
-**Acceptance**: both transports produce ASR-PASS; FFI p50 latency
-lower; no crashes over a 100-request soak.
+**Acceptance**: both transports produce ASR-PASS on `ac01`; FFI p50
+latency lower; no crashes over a 100-request soak.
+
+### B6 — Native xvec + customvoice (MRoPE 4×pos port) (3-5 days) — G2 delivery
+
+Today `TalkerCannEngine` only implements standard RoPE; xvec and
+customvoice modes require MRoPE 4-position multi-head rotary embeds,
+which currently forces those modes onto the llama.cpp fallback
+(14.3 fps, ~2.4× slower than ICL's native path). The prefix-trim
+fix we landed in `OminiX-Ascend/tools/qwen_tts/qwen_tts.cpp` (commit
+`2c2c3f6b`) is in source for all three modes but can only be
+exercised on xvec/customvoice when they run on native.
+
+- [ ] 6.1 Add MRoPE 4×pos dispatch in `TalkerCannEngine` — new
+      `forward_decode_mrope()` variant that takes 4 position tensors
+      (spatial H/W + temporal + batch) instead of 1. Re-use the
+      existing aclnnRotaryPositionEmbedding call site but with the
+      4-component position encoding scheme Qwen3-TTS xvec uses.
+- [ ] 6.2 Wire mode dispatch in `QwenTTS::generate_xvec()` and
+      `generate_customvoice()`: when native is available, call the
+      MRoPE path; keep llama.cpp fallback compiled but not default.
+- [ ] 6.3 Re-run the full optimization stack on xvec + customvoice:
+      A16W8, FRACTAL_NZ, TASK_QUEUE_ENABLE=2. Measure fps on 3
+      canonical utterances per mode.
+- [ ] 6.4 ASR-gate all three modes; user-ear-check on 30 s samples
+      (same protocol as NATIVE_TTS_CONTRACT §6 acceptance).
+- [ ] 6.5 Verify prefix-trim fix (commit `2c2c3f6b`) works on native
+      xvec + customvoice — no pre-speech noise burst.
+
+**Acceptance**: xvec + customvoice each ≥ 25 fps (contract §1 G2
+minimum gate), ideally 33 fps parity with ICL; ASR-PASS; prefix
+clean. Cross-references `NATIVE_TTS_CONTRACT.md` — the engine-level
+work lives in that repo's source tree; this contract tracks the
+delivery surface + the measurement.
 
 ## 6. Acceptance criteria (summary)
 
+**G1 — Deployment on `ac01`:**
 - [ ] `libqwen_tts_api.so` builds, installs, and links into OminiX-API
-      on an Ascend 910 host.
-- [ ] `POST /v1/audio/tts/ascend` (FFI transport) produces
-      ASR-identical audio vs subprocess transport on 3 canonical utts.
-- [ ] FFI p50 latency < subprocess p50 latency (fork/exec savings
-      realized).
+      on `ac01`.
+- [ ] `POST /v1/audio/tts/ascend` (FFI transport) produces ASR-identical
+      audio vs subprocess transport on 3 canonical utts on `ac01`.
+- [ ] FFI p50 latency < subprocess p50 latency.
 - [ ] Shared `TextToSpeech` trait implemented by all four backends
       (GPT-SoVITS-MLX, Qwen3-MLX, Ascend-subprocess, Ascend-FFI).
-- [ ] MLX path on Mac shows no regression (smoke: one MLX TTS call
-      returns audio).
-- [ ] 100-request soak on Ascend FFI path with no crash, no VRAM leak.
+- [ ] MLX path on Mac shows no regression.
+- [ ] 100-request soak on FFI path at `ac01` with no crash, no VRAM leak.
+
+**G2 — Optimization coverage across modes:**
+- [ ] All three modes (ICL, xvec, customvoice) run on the native
+      path on `ac01`.
+- [ ] Each mode hits ≥ 25 fps on `ac01` (§1 G2 minimum gate).
+- [ ] Prefix-trim fix verified clean on xvec + customvoice under native.
+- [ ] ASR content-parity on canonical utterances for all three modes.
 
 **Verification stamp (per [x] item)**: same rule as TTS contract —
 the completing agent appends a **Verified-by:** line under each item
