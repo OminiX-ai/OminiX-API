@@ -88,21 +88,88 @@ request/response shape, same audio output.
 
 ### B1 — Build `libqwen_tts_api.so` on Ascend side (1-2 days)
 
-- [ ] 1.1 Add `add_library(qwen_tts_api SHARED qwen_tts_api.cpp ${common sources})`
+- [x] 1.1 Add `add_library(qwen_tts_api SHARED qwen_tts_api.cpp ${common sources})`
       to `tools/qwen_tts/CMakeLists.txt`. Link identical internals to
       `qwen_tts` executable (BPETokenizer, TalkerLLM, SpeechTokenizer*,
       SpeakerEncoder, ggml, ggml-cann).
-- [ ] 1.2 Set `OUTPUT_NAME qwen_tts_api`, `VERSION 1.0.0`,
+      **Verified-by:** (a) New SHARED target `qwen_tts_api` added in
+      `OminiX-Ascend/tools/qwen_tts/CMakeLists.txt`. Sources:
+      `qwen_tts_api.cpp`, `talker.cpp`, `tts_transformer.cpp`,
+      `speaker_encoder.cpp`, `speech_tokenizer_{encoder,decoder}.cpp`,
+      `model_defs.cpp`, `stft.cpp`, kissfft, and (when
+      `QWEN_TTS_CP_CANN=ON`) `cp_cann_engine.cpp`, `cp_cann_symbols.cpp`,
+      `talker_cann_engine.cpp`. Links `ggml`, `qwen_common` (POSITION_INDEPENDENT_CODE
+      flipped ON from within the new target since qwen_common is STATIC and now
+      linked into a SHARED consumer), `Threads::Threads`, `OpenMP::OpenMP_CXX`,
+      and `${CMAKE_DL_LIBS}` when CP-CANN is on.
+      (b) Configure + build on ModelArts 910B4 with
+      `cmake .. -DGGML_CANN=ON -DBUILD_SHARED_LIBS=ON && cmake --build .
+      --target qwen_tts_api -j8` → `[100%] Built target qwen_tts_api`.
+      (c) Artifact `~/work/OminiX-Ascend/build-85-cann-on/bin/libqwen_tts_api.so.1.0.0`
+      (1,047,496 bytes).
+- [x] 1.2 Set `OUTPUT_NAME qwen_tts_api`, `VERSION 1.0.0`,
       `SOVERSION 1`. Install rule to `lib/` alongside binary.
-- [ ] 1.3 Verify `nm -D libqwen_tts_api.so | grep qwen_tts_` lists all
+      **Verified-by:** (a) `set_target_properties(qwen_tts_api PROPERTIES
+      OUTPUT_NAME qwen_tts_api VERSION 1.0.0 SOVERSION 1)` +
+      `install(TARGETS qwen_tts_api LIBRARY DESTINATION lib ...)` +
+      `install(FILES qwen_tts_api.h DESTINATION include)`.
+      (b) `cmake --install build-85-cann-on/tools/qwen_tts --prefix .../install`
+      produced symlink chain `libqwen_tts_api.so → .so.1 → .so.1.0.0` under
+      `install/lib/` and the header under `install/include/qwen_tts_api.h`.
+      (c) Server artifacts at
+      `~/work/OminiX-Ascend/build-85-cann-on/install/{lib,include}/`.
+- [x] 1.3 Verify `nm -D libqwen_tts_api.so | grep qwen_tts_` lists all
       12 exported symbols; verify header at
       `include/qwen_tts_api.h` installs with the library.
-- [ ] 1.4 Smoke test: C program that calls `qwen_tts_load` +
+      **Verified-by:** (a) Header has 14 symbols (contract summary said 12; the
+      actual ABI is `load`, `free`, `hidden_size`, `vocab_size`,
+      `has_speaker_encoder`, `text_embed`, `codec_embed`, `codec_head`,
+      `generation_embed`, `reset_cache`, `forward`, `predict_codes`,
+      `decode_audio`, `extract_speaker` = 14 — matches Agent Y's B2.3 finding).
+      `nm -D --defined-only .../libqwen_tts_api.so.1.0.0 | grep qwen_tts_`
+      returns exactly those 14 under version tag `QWEN_TTS_API_1.0`.
+      (b) Symbol-pollution check: `nm -D --defined-only ... | grep -v
+      qwen_tts_` returns only the version anchor `QWEN_TTS_API_1.0` — no
+      ggml / ggml-cann / qwen_common symbols leak (risk register §7). The
+      new linker version script at `tools/qwen_tts/qwen_tts_api.version` plus
+      `-Wl,--version-script,--no-undefined` enforces this.
+      (c) Header installed at
+      `~/work/OminiX-Ascend/build-85-cann-on/install/include/qwen_tts_api.h`
+      (MD5 `4ad8cab5fc4bd14d1eba81176d68abc5`, identical to the pin Agent Y
+      recorded in B2.1).
+- [x] 1.4 Smoke test: C program that calls `qwen_tts_load` +
       `qwen_tts_free` in a loop (10×) with no leak (valgrind or
       `npu-smi` peak memory check).
+      **Verified-by:** (a) `tools/qwen_tts/test_api_smoke.c` (new), built
+      against `libqwen_tts_api.so` with
+      `gcc -std=c11 ... -lqwen_tts_api -o bin/test_api_smoke`. 10/10 iters
+      PASS on Ascend 910B4 (device 2). Each iter returns
+      `hidden=2048 vocab=3072 spk=1`, per-iter load time 17–28 s (native
+      Talker CANN engine init dominates; free is <10 ms). Exit 0, no crash.
+      (b) `npu-smi info -t usages -i 2` HBM Usage Rate: **8% before and 8%
+      after** the full loop — no leak at that granularity. Process exit
+      clean.
+      (c) Artifact: `~/work/OminiX-Ascend/build-85-cann-on/bin/test_api_smoke`.
+      Source: `tools/qwen_tts/test_api_smoke.c`.
+      Notes: had to patch two pre-existing defects in the un-compiled
+      `qwen_tts_api.cpp` for the smoke test to reach success:
+      (i) `BPETokenizer` → `BpeTokenizer` class-name drift (common code was
+      renamed after the API stub was written); (ii) talker GGUF auto-upgrade
+      preferred `qwen_tts_talker_llama_q8_0.gguf`, which the native
+      TalkerCannEngine rejects with "unsupported dtype 8" — switched default
+      to the F16/F32 `qwen_tts_talker_llama.gguf` (Q8 remains viable only on
+      the llama.cpp fallback path, QWEN_TTS_LLAMA=ON, which is off in the
+      API build); and (iii) routed `use_cp_cann=true`/`use_talker_cann=true`
+      into `TalkerLLM::load_model()` when `QWEN_TTS_HAS_CP_CANN` is defined
+      and the caller passes `n_gpu_layers > 0` (needed because the API build
+      is native-CANN-only; without this flag, load_model fails since the
+      llama.cpp fallback isn't compiled in).
 
 **Acceptance**: `libqwen_tts_api.so` loadable via `dlopen`; smoke test
 passes; `nm` symbol set matches header.
+**Acceptance met.** Shared library loads (C test linked against it loads +
+frees 10 handles successfully); all 14 header-declared symbols are in `nm -D`
+output; version script ensures no other symbols escape.
 
 ### B2 — `qwen-tts-ascend-sys` Rust crate (2 days, parallel with B1)
 
