@@ -331,20 +331,98 @@ that wraps the existing `QwenTTS::generate()` logic. Contract decision:
 **(b)**. `NATIVE_TTS_CONTRACT.md` §8 2026-04-19 rationale (user-visible
 win, no model-code merge) applies.
 
-- [ ] 5.1 Add `qwen_tts_synth_params_t` struct and
+- [x] 5.1 Add `qwen_tts_synth_params_t` struct and
       `int qwen_tts_synthesize(qwen_tts_ctx_t*, const qwen_tts_synth_params_t*,
       float** pcm_out, int* n_samples_out)` to `qwen_tts_api.h`. Mirrors
       `QwenTTSParams` fields used by `QwenTTS::generate()`/`generate_xvec()`/
       `generate_customvoice()`. Mode selector chooses path.
-- [ ] 5.2 Add `void qwen_tts_pcm_free(float* pcm)` so library owns the
+      **Verified-by:** (a) New `typedef struct { ... } qwen_tts_synth_params_t;`
+      in `OminiX-Ascend/tools/qwen_tts/qwen_tts_api.h` with 17 fields
+      mirroring the `QwenTTSParams` subset `generate*` actually reads
+      (text / ref_audio_path / ref_text / ref_lang / target_lang / mode /
+      speaker / seed / max_tokens / temperature / top_k / top_p /
+      repetition_penalty / cp_groups / cp_layers / greedy). Zero-sentinel
+      defaults documented per-field in the header doc comment. Return
+      contract: 0 = success, -1 = null ctx/params, -2 = unknown mode,
+      -3 = generation failed; on error `*pcm_out = NULL,
+      *n_samples_out = 0`.
+      (b) Header stays bindgen-clean — `<stdint.h>` + `<stddef.h>` only,
+      `extern "C"` guarded, no C++ types leaked.
+      (c) Source: `OminiX-Ascend/tools/qwen_tts/qwen_tts_api.h` (additive;
+      the existing 14 primitive declarations are byte-identical).
+- [x] 5.2 Add `void qwen_tts_pcm_free(float* pcm)` so library owns the
       allocation (unknown output length; two-shot plan is worse UX).
-- [ ] 5.3 Implement in `qwen_tts_api.cpp` by instantiating a
+      **Verified-by:** (a) Declaration added to `qwen_tts_api.h`
+      immediately after `qwen_tts_synthesize`, doc comment "Equivalent
+      to free(pcm). Safe to call with NULL (no-op)."
+      (b) Impl in `qwen_tts_api.cpp` is a one-liner: `std::free(pcm);`
+      paired with the `std::malloc(n * sizeof(float))` inside
+      `qwen_tts_synthesize` — no mismatched allocator risk.
+      (c) Sources: `qwen_tts_api.h` and `qwen_tts_api.cpp`.
+- [x] 5.3 Implement in `qwen_tts_api.cpp` by instantiating a
       `QwenTTSParams`, dispatching to `QwenTTS::generate*`, and
       `malloc`+`memcpy`-ing the resulting `std::vector<float>` into a
       caller-freeable buffer.
-- [ ] 5.4 Add the two new symbols to the version script + vendored
+      **Verified-by:** (a) `qwen_tts_api.cpp` grew three pieces:
+      (i) `qwen_tts_ctx` now captures `load_model_dir` / `load_tokenizer_dir`
+      / `load_talker_override` / `load_cp_override` / `load_n_gpu_layers` /
+      `load_n_threads` at `qwen_tts_load()` time, plus
+      `std::unique_ptr<QwenTTS> synth` + `std::mutex synth_mu`;
+      (ii) static helper `translate_synth_params()` maps the C struct
+      defaults → `QwenTTSParams` + `TalkerSamplingParams` per the header
+      comments (top_k == -1 → disabled [0], top_k == 0 → default 50,
+      greedy → `do_sample=false` on both Talker and CP samplers, cp_*
+      hyperparams mirrored onto the CP branch to match the Python
+      reference);
+      (iii) `qwen_tts_synthesize()` zeros outputs first, null-checks
+      ctx/params/pcm_out/n_samples_out/text/mode (returns -1),
+      lazy-builds `synth` on first call under `synth_mu`, dispatches on
+      `mode` ("icl" → `generate`, "xvec" → `generate_xvec`,
+      "customvoice" → `generate_customvoice`, unknown → -2), then
+      `std::malloc` + `std::memcpy` the `std::vector<float>` into a heap
+      buffer (-3 if `generate_*()` returned false OR produced zero
+      samples).
+      (b) `qwen_tts.cpp`'s generation logic is untouched — only
+      `qwen_tts_api.cpp`, `qwen_tts_api.h`, `qwen_tts_api.version`,
+      `CMakeLists.txt`, and the new `test_synthesize_smoke.c` changed.
+      The Mutex serializes synthesize() per-handle as §7 risk register
+      requires.
+      (c) Source: `OminiX-Ascend/tools/qwen_tts/qwen_tts_api.cpp`.
+- [x] 5.4 Add the two new symbols to the version script + vendored
       header. Bump header `SOVERSION` stays at 1 (additive only —
       no ABI break).
+      **Verified-by:** (a) `qwen_tts_api.version`: added
+      `qwen_tts_synthesize` and `qwen_tts_pcm_free` to the
+      `QWEN_TTS_API_1.0` export block (kept the tag — additive; no new
+      version node needed). Comment updated from "12 C API symbols" /
+      "14" to "16" with an inline note about B5 additive-only intent.
+      (b) `CMakeLists.txt`: `API_SRC_FILES` now includes `qwen_tts.cpp`
+      (previously only in the executable's sources) so
+      `QwenTTS::generate*` link into the SHARED target. `VERSION`
+      bumped 1.0.0 → 1.1.0; `SOVERSION` stays at 1 (additive ABI).
+      Executable target untouched.
+      (c) Build + symbol verification on ModelArts 910B4
+      (`~/work/OminiX-Ascend/build-85-cann-on/`):
+      `cmake --build . --target qwen_tts_api -j8` → `[100%] Built
+      target qwen_tts_api`. Resulting SO chain:
+      `libqwen_tts_api.so → .so.1 → .so.1.1.0` (1,817,344 bytes).
+      `nm -D --defined-only bin/libqwen_tts_api.so | grep qwen_tts_`
+      lists exactly 16 symbols tagged `@@QWEN_TTS_API_1.0`:
+      codec_embed / codec_head / decode_audio / extract_speaker /
+      forward / free / generation_embed / has_speaker_encoder /
+      hidden_size / load / pcm_free / predict_codes / reset_cache /
+      synthesize / text_embed / vocab_size. `nm -D --defined-only ...
+      | grep -v qwen_tts_` returns only the version anchor
+      `QWEN_TTS_API_1.0` — no ggml/qwen_common leakage, same as B1.3.
+      End-to-end smoke: `test_synthesize_smoke.c` (new) calls load →
+      synthesize(ICL, mayun_ref.wav, target="大家好，今天天气真不错。")
+      → writes a 24 kHz mono 16-bit WAV → pcm_free → free. Run on
+      ModelArts produced `/tmp/b5_smoke.wav` (119,564 bytes, 59,760
+      samples = 2.49 s); `file` reports `RIFF (little-endian) data,
+      WAVE audio, Microsoft PCM, 16 bit, mono 24000 Hz`, exit 0,
+      `[smoke] PASS`. End-to-end latency: load ~6.2 s + synth 7.78 s
+      (prefill 3.60 + generate 2.35 + decode 1.84) on a 2.49 s
+      output → RTF 3.12×.
 - [x] 5.5 Re-run `bindgen` in `qwen-tts-ascend-sys` (header pin updates;
       SHA-256 bump). Wrapper exposes `QwenTtsCtx::synthesize(params) ->
       Result<Vec<f32>, TtsError>`.
