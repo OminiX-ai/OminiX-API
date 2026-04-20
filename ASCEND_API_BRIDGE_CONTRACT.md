@@ -681,6 +681,7 @@ with (a) what was built/run, (b) measured numbers, (c) artifact path.
 | Engine is not thread-safe per handle (TTS contract finding). Concurrent requests to one handle corrupts KV cache. | High | v1: serialize calls per-handle behind a `Mutex` in the safe wrapper. Parallelism = multiple handles, not multiple threads on one handle. |
 | Mac dev workflow cannot exercise FFI path. | Medium | Stub impl for non-Linux; CI target on Ascend host only. Document clearly. |
 | Header drift between OminiX-Ascend and vendored copy in API crate. | Medium | `build.rs` asserts a content-hash of the header matches a pinned value; bump the pin intentionally. |
+| **xvec-path rumble** — xvec mode outputs have ~200× the sub-100Hz energy of the reference audio (sub-100Hz = 0.28 of total vs 0.001 on ref; 2-5 kHz content 7× reduced). Not introduced by B6; reproduces on the pre-B6 llama.cpp fallback build identically. Diagnosed 2026-04-20 during B6 trim-fix A/B (artifacts `xvec_long_fix.wav` [B6 native] vs `xvec_llama_ab.wav` [llama.cpp]; both same seed + ref + text). Likely in the speaker-encoder → speaker-embedding injection shared by both Talker backends. | High for xvec quality; **not blocking the bridge contract** (G1 delivery works regardless of xvec content quality) | Tracked as a separate issue. Diagnose by (a) profile xvec speaker-encoder output numerics vs ICL, (b) ablate the speaker-embedding injection site in `TalkerLLM::prefill_xvec`. |
 
 ## 8. Decision log
 
