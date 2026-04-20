@@ -14,6 +14,14 @@ use crate::types::{SpeechCloneRequest, SpeechRequest, TranscriptionRequest};
 
 use super::helpers::{get_state, send_and_wait};
 
+/// Normalize a TTS voice name: treat empty/"default" as the fallback "vivian".
+fn normalize_voice(voice: Option<String>) -> String {
+    match voice.as_deref() {
+        None | Some("") | Some("default") => "vivian".to_string(),
+        Some(v) => v.to_string(),
+    }
+}
+
 /// Timeout for audio transcription
 const TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(1800); // 30 minutes
 /// Timeout for text-to-speech (non-streaming WAV fallback)
@@ -73,7 +81,7 @@ pub async fn audio_speech(
     let chunk_rx = spawn_per_sentence_tts(
         state.inference_tx.clone(),
         qwen3_tts::split_sentences(&request.input),
-        request.voice.unwrap_or_else(|| "vivian".to_string()),
+        normalize_voice(request.voice),
         request.language.unwrap_or_else(|| "chinese".to_string()),
         request.speed,
         request.instruct,
@@ -169,7 +177,7 @@ pub async fn tts_qwen3(
     let chunk_rx = spawn_per_sentence_tts(
         state.inference_tx.clone(),
         qwen3_tts::split_sentences(&request.input),
-        request.voice.unwrap_or_else(|| "vivian".to_string()),
+        normalize_voice(request.voice),
         request.language.unwrap_or_else(|| "chinese".to_string()),
         request.speed,
         request.instruct,

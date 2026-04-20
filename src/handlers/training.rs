@@ -11,37 +11,37 @@ use crate::types::*;
 
 use super::helpers::get_state;
 
-/// GET /v1/voices - List all registered voices
+/// Qwen3-TTS CustomVoice preset speaker names (built into the model).
+const PRESET_SPEAKERS: &[&str] = &[
+    "vivian", "serena", "ryan", "aiden", "uncle_fu",
+    "chinese_woman", "chinese_man", "dialect", "english_man",
+];
+
+/// GET /v1/voices - List all registered voices (preset + custom cloned)
 #[handler]
 pub async fn list_voices(res: &mut Response) {
+    // Start with built-in preset speakers
+    let mut voices: Vec<VoiceInfo> = PRESET_SPEAKERS.iter().map(|name| VoiceInfo {
+        name: name.to_string(),
+        aliases: Vec::new(),
+    }).collect();
+
+    // Append custom cloned voices from voices.json
     let voices_path = crate::utils::expand_tilde("~/.OminiX/models/voices.json");
-    let voices = match std::fs::read_to_string(&voices_path) {
-        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(config) => {
-                let mut voice_list = Vec::new();
-                if let Some(voices) = config.get("voices").and_then(|v| v.as_object()) {
-                    for (name, voice) in voices {
-                        let aliases = voice
-                            .get("aliases")
-                            .and_then(|a| a.as_array())
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        voice_list.push(VoiceInfo {
-                            name: name.clone(),
-                            aliases,
-                        });
-                    }
+    if let Ok(content) = std::fs::read_to_string(&voices_path) {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(custom) = config.get("voices").and_then(|v| v.as_object()) {
+                for (name, voice) in custom {
+                    let aliases = voice
+                        .get("aliases")
+                        .and_then(|a| a.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    voices.push(VoiceInfo { name: name.clone(), aliases });
                 }
-                voice_list
             }
-            Err(_) => Vec::new(),
-        },
-        Err(_) => Vec::new(),
-    };
+        }
+    }
 
     res.render(Json(VoiceListResponse { voices }));
 }
