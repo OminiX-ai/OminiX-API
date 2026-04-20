@@ -320,7 +320,43 @@ bytes for the same request; no regression in MLX paths.
 link-clean verification and E2E byte-equivalence of the subprocess
 endpoint roll into B4.
 
-### B4 — E2E parity on Ascend host (1 day)
+### B5 — High-level `qwen_tts_synthesize` ABI (1 day) — inserted 2026-04-19
+
+Discovered during B3: the fine-grained ABI exposes engine internals
+(embed / forward / predict_codes / decode_audio) but no one-shot
+synthesis function. To call it from Rust, we'd either (a) reimplement
+the full autoregressive loop + BPE tokenization + sampling in Rust
+(~1 week, drift risk) or (b) add a coarse ABI function on the C++ side
+that wraps the existing `QwenTTS::generate()` logic. Contract decision:
+**(b)**. `NATIVE_TTS_CONTRACT.md` §8 2026-04-19 rationale (user-visible
+win, no model-code merge) applies.
+
+- [ ] 5.1 Add `qwen_tts_synth_params_t` struct and
+      `int qwen_tts_synthesize(qwen_tts_ctx_t*, const qwen_tts_synth_params_t*,
+      float** pcm_out, int* n_samples_out)` to `qwen_tts_api.h`. Mirrors
+      `QwenTTSParams` fields used by `QwenTTS::generate()`/`generate_xvec()`/
+      `generate_customvoice()`. Mode selector chooses path.
+- [ ] 5.2 Add `void qwen_tts_pcm_free(float* pcm)` so library owns the
+      allocation (unknown output length; two-shot plan is worse UX).
+- [ ] 5.3 Implement in `qwen_tts_api.cpp` by instantiating a
+      `QwenTTSParams`, dispatching to `QwenTTS::generate*`, and
+      `malloc`+`memcpy`-ing the resulting `std::vector<float>` into a
+      caller-freeable buffer.
+- [ ] 5.4 Add the two new symbols to the version script + vendored
+      header. Bump header `SOVERSION` stays at 1 (additive only —
+      no ABI break).
+- [ ] 5.5 Re-run `bindgen` in `qwen-tts-ascend-sys` (header pin updates;
+      SHA-256 bump). Wrapper exposes `QwenTtsCtx::synthesize(params) ->
+      Result<Vec<f32>, TtsError>`.
+- [ ] 5.6 Wire `AscendFfiTts::synthesize` in `src/engines/tts_backends.rs`
+      to call `QwenTtsCtx::synthesize`, under the `Mutex` guard.
+
+**Acceptance**: `qwen_tts_synthesize` produces ASR-identical audio to
+the `qwen_tts` binary for the same params on 1 canonical utt (run on
+ModelArts 910B4). `cargo check --features ascend-tts-ffi` stays clean
+on Mac; `cargo build` clean on Ascend host.
+
+### B4 — E2E parity on Ascend host (1 day) — runs after B5
 
 - [ ] 4.1 Deploy OminiX-API + `libqwen_tts_api.so` to the ModelArts
       910B4 host (ma-user@dev-modelarts… port 31984, reused from
