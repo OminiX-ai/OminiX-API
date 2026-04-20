@@ -1,27 +1,27 @@
 /*
- * Pinned from: OminiX-Ascend @ 12405a5251346d9568116e801c88b22bced661e8
- *              tools/qwen_tts/qwen_tts_api.h (working-tree state as of
- *              2026-04-19 post-B5.1 landing; upstream commit for the B5
- *              symbols pending — Agent X is still staging).
- * Content SHA-256 (upstream, before this pin header):
- *   042025b6979ad2096990e1f42f5253a46fb6dfc90de258abfe3ca022c7d892e9
+ * Pinned from: OminiX-Ascend @ d5a1e761 (merge: take origin/main for tools/qwen_tts/)
+ * Upstream content SHA-256: 76fd5e19aee46df97520024e308ff9dcd6f64f3614773de1d37e0f7050f88bac
+ * Upstream path:  tools/qwen_tts/qwen_tts_api.h
  *
- * To re-vendor after an upstream change:
- *   1. Copy OminiX-Ascend/tools/qwen_tts/qwen_tts_api.h over this file.
- *   2. Re-prepend this block with updated commit + sha256.
- *   3. Bump qwen-tts-ascend-sys crate version.
- *
- * build.rs does NOT currently assert the content hash (no in-tree check
- * yet); the hash above is informational and must be re-recorded by the
- * agent doing a header refresh.
+ * v1.2 shrunk the surface from 16 symbols to 7 after upstream's
+ * QwenTTS::generate() unification removed the TalkerLLM friend accessors
+ * the 9 fine-grained primitives depended on. bindings.rs now generates
+ * 7 extern declarations; wrapper.rs methods for the removed primitives
+ * were dropped in the same PR.
  */
+
 /**
- * qwen_tts_api.h — Minimal C API for Qwen3-TTS compute primitives.
+ * qwen_tts_api.h — C API for Qwen3-TTS one-shot synthesis.
  *
- * Exposes embedding lookup, transformer forward pass, code prediction,
- * speech decoding, and speaker encoding as C functions.
- * The generation loop logic (sampling, prefill building, CustomVoice/x-vector)
- * lives in Rust (qwen3-tts-core).
+ * v1.2 (2026-04-20): fine-grained primitive ABI (text_embed, forward,
+ * predict_codes, decode_audio, extract_speaker, reset_cache, codec_head,
+ * codec_embed, generation_embed) dropped in favour of the single
+ * high-level `qwen_tts_synthesize` path. The primitives required
+ * friend-accessor methods on TalkerLLM that upstream's unified
+ * `QwenTTS::generate()` refactor removed; no caller of the primitives
+ * exists in this tree. Bindings consumers (qwen-tts-ascend-sys) call
+ * `qwen_tts_synthesize` exclusively. Removed symbols stay in the version
+ * script as historical docs in the .version file but are not exported.
  */
 
 #ifndef QWEN_TTS_API_H
@@ -73,134 +73,6 @@ int qwen_tts_vocab_size(const qwen_tts_ctx_t* ctx);
 int qwen_tts_has_speaker_encoder(const qwen_tts_ctx_t* ctx);
 
 /* ========================================================================== */
-/* Embedding operations                                                       */
-/* ========================================================================== */
-
-/**
- * Compute text_proj(text_embed(token_id)).
- * out: buffer of size hidden_size.
- */
-void qwen_tts_text_embed(qwen_tts_ctx_t* ctx, uint32_t token_id, float* out);
-
-/**
- * Lookup raw codec embedding (no projection).
- * out: buffer of size hidden_size.
- */
-void qwen_tts_codec_embed(qwen_tts_ctx_t* ctx, uint32_t codec_token, float* out);
-
-/**
- * Apply codec_head to hidden state → logits.
- * hidden: [hidden_size], logits_out: [vocab_size]
- */
-void qwen_tts_codec_head(qwen_tts_ctx_t* ctx, const float* hidden, float* logits_out);
-
-/**
- * Compute generation embedding: sum of 16 codec group embeddings for prev frame + text.
- * text_embed: [hidden_size] (pre-computed text_proj)
- * prev_codes: [16] codec values from previous frame
- * out: [hidden_size]
- */
-void qwen_tts_generation_embed(
-    qwen_tts_ctx_t* ctx,
-    const float* text_embed,
-    const uint32_t* prev_codes,
-    float* out
-);
-
-/* ========================================================================== */
-/* Transformer forward pass                                                   */
-/* ========================================================================== */
-
-/**
- * Reset KV cache (call before each new generation).
- */
-void qwen_tts_reset_cache(qwen_tts_ctx_t* ctx);
-
-/**
- * Forward pass through the 28-layer transformer backbone.
- *
- * input_embeds: [seq_len * hidden_size] flat f32
- * seq_len: number of positions
- * logits_out: [vocab_size] logits from LAST position (after codec_head)
- * hidden_out: [hidden_size] hidden state from LAST position
- *
- * Returns 0 on success, non-zero on error.
- */
-int qwen_tts_forward(
-    qwen_tts_ctx_t* ctx,
-    const float* input_embeds,
-    int seq_len,
-    float* logits_out,
-    float* hidden_out
-);
-
-/* ========================================================================== */
-/* Code prediction (codebooks 1-15)                                          */
-/* ========================================================================== */
-
-/**
- * Generate sub-codes (codebooks 1-15) from hidden state + code0.
- *
- * hidden: [hidden_size] from transformer output
- * code0: group 0 token
- * codes_out: buffer of size 15 (groups 1-15)
- *
- * Returns 0 on success.
- */
-int qwen_tts_predict_codes(
-    qwen_tts_ctx_t* ctx,
-    const float* hidden,
-    uint32_t code0,
-    uint32_t* codes_out
-);
-
-/* ========================================================================== */
-/* Speech tokenizer decoder (codes → audio)                                  */
-/* ========================================================================== */
-
-/**
- * Decode codec frames to audio waveform.
- *
- * codes: [n_frames * n_groups] flat u32 (row-major: frame0_g0, frame0_g1, ..., frame1_g0, ...)
- * n_frames: number of codec frames
- * n_groups: codebook groups (16)
- * audio_out: output buffer (caller allocates, recommend n_frames * 1920 floats)
- * n_samples_out: actual number of audio samples written
- *
- * Returns 0 on success.
- */
-int qwen_tts_decode_audio(
-    qwen_tts_ctx_t* ctx,
-    const uint32_t* codes,
-    int n_frames,
-    int n_groups,
-    float* audio_out,
-    int* n_samples_out
-);
-
-/* ========================================================================== */
-/* Speaker encoder (reference audio → embedding)                             */
-/* ========================================================================== */
-
-/**
- * Extract speaker embedding from reference audio.
- *
- * audio: f32 samples at sample_rate Hz
- * n_samples: number of samples
- * sample_rate: audio sample rate (24000 recommended)
- * embedding_out: buffer of size hidden_size (typically 2048)
- *
- * Returns 0 on success, -1 if speaker encoder not loaded.
- */
-int qwen_tts_extract_speaker(
-    qwen_tts_ctx_t* ctx,
-    const float* audio,
-    int n_samples,
-    int sample_rate,
-    float* embedding_out
-);
-
-/* ========================================================================== */
 /* High-level one-shot synthesis (Ascend API Bridge Contract §5 B5)           */
 /* ========================================================================== */
 
@@ -208,13 +80,14 @@ int qwen_tts_extract_speaker(
  * Parameters for qwen_tts_synthesize().
  *
  * Mirrors the fields of QwenTTSParams (see qwen_tts.h) actually consumed by
- * QwenTTS::generate() / generate_xvec() / generate_customvoice(). Callers
- * construct, fill, and pass by pointer; the library never retains it past
- * the synthesize() call.
+ * QwenTTS::generate(). Mode is inferred from which fields are populated:
+ *   mode="icl"         → ref_audio_path + ref_text
+ *   mode="xvec"        → ref_audio_path (.wav auto-extracts to .xvec tempfile)
+ *   mode="customvoice" → speaker (built-in voice id resolved via voices.json)
  *
  * Zero-defaulted sampling fields use the same defaults as the qwen_tts
- * CLI / Python reference (documented per-field below). Set any field to
- * its "use default" sentinel to fall through.
+ * CLI / Python reference. Set any field to its "use default" sentinel to
+ * fall through.
  */
 typedef struct {
     const char* text;               /* target text (UTF-8, non-null)            */
@@ -230,18 +103,17 @@ typedef struct {
     int         top_k;              /* 0 = default 50, -1 = disabled            */
     float       top_p;              /* 0 = default 1.0                          */
     float       repetition_penalty; /* 0 = default 1.05                         */
-    int         cp_groups;          /* 0 = default (all 15)                     */
-    int         cp_layers;          /* 0 = default (all 5)                      */
+    int         cp_groups;          /* reserved; ignored in v1.2 (no longer in sampling params) */
+    int         cp_layers;          /* reserved; ignored in v1.2                */
     int         greedy;             /* 0 = sample, non-zero = greedy            */
 } qwen_tts_synth_params_t;
 
 /**
  * One-shot text-to-speech synthesis.
  *
- * Dispatches by params->mode to QwenTTS::generate() (ICL),
- * generate_xvec(), or generate_customvoice(). The library allocates the
- * output PCM buffer via malloc() (size is unknown up front); the caller
- * MUST release it with qwen_tts_pcm_free().
+ * Dispatches to QwenTTS::generate() with params populated from the mode
+ * field. Library allocates the output PCM buffer via malloc() (size is
+ * unknown up front); caller MUST release it with qwen_tts_pcm_free().
  *
  * pcm_out:       [out] pointer receiving the malloc()'d f32 buffer (24kHz mono)
  * n_samples_out: [out] number of float samples written
@@ -250,7 +122,7 @@ typedef struct {
  * *n_samples_out is set to 0. Error codes:
  *   -1: ctx or params was NULL
  *   -2: unknown mode
- *   -3: generation failed inside QwenTTS::generate*
+ *   -3: generation failed
  */
 int qwen_tts_synthesize(
     qwen_tts_ctx_t*                   ctx,
