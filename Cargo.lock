@@ -2903,6 +2903,7 @@ dependencies = [
  "mlx-sys",
  "moxin-vlm-mlx",
  "qwen-image-mlx",
+ "qwen-tts-ascend-sys",
  "qwen3-asr-mlx",
  "qwen3-mlx",
  "qwen3-tts-core",
@@ -2914,6 +2915,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokenizers 0.22.2",
  "tokio",
  "tokio-stream",
@@ -3379,6 +3381,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
+]
+
+[[package]]
+name = "qwen-tts-ascend-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

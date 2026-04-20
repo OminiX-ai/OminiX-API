@@ -7,6 +7,7 @@ use tokio_stream::StreamExt;
 
 use crate::engines::ascend;
 use crate::engines::qwen3_tts;
+use crate::engines::tts_trait::{TtsCloneRequest, TtsRequest as TtsTraitRequest, TtsResponse};
 use crate::error::render_error;
 use crate::inference::{AudioChunk, InferenceRequest, TtsRequest};
 use crate::types::{SpeechCloneRequest, SpeechRequest, TranscriptionRequest};
@@ -450,29 +451,56 @@ pub async fn tts_ascend(
         return Ok(());
     }
 
+    // B3 §5.3.3: dispatch through the shared `TextToSpeech` trait instead of
+    // constructing a fresh `AscendTtsEngine` per request. Backend selection
+    // (subprocess vs FFI) is frozen at server startup via `ASCEND_TTS_TRANSPORT`.
+    let backend = state.ascend_tts_backend.as_ref().ok_or_else(|| {
+        tracing::error!("Ascend TTS backend not initialized");
+        StatusError::internal_server_error()
+    })?;
+
     let request: SpeechRequest = req.parse_json_with_max_size(10 * 1024 * 1024).await.map_err(|e| {
         tracing::error!("Failed to parse request: {}", e);
         StatusError::bad_request()
     })?;
 
-    let cfg = ascend_cfg.clone();
-    let wav_data = tokio::task::spawn_blocking(move || {
-        let engine = ascend::AscendTtsEngine::new((*cfg).clone())?;
-        engine.synthesize(&request)
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!("Ascend TTS task failed: {}", e);
-        StatusError::internal_server_error()
-    })?
-    .map_err(|e| {
-        tracing::error!("Ascend TTS error: {}", e);
-        StatusError::internal_server_error()
-    })?;
+    let tts_req = TtsTraitRequest {
+        input: request.input,
+        voice: request.voice.unwrap_or_else(|| "default".to_string()),
+        language: request.language.unwrap_or_else(|| "English".to_string()),
+        speed: request.speed,
+        instruct: request.instruct,
+    };
+
+    let backend = backend.clone();
+    let wav_data = tokio::task::spawn_blocking(move || backend.synthesize(tts_req))
+        .await
+        .map_err(|e| {
+            tracing::error!("Ascend TTS task failed: {}", e);
+            StatusError::internal_server_error()
+        })?
+        .map_err(|e| {
+            tracing::error!("Ascend TTS error: {}", e);
+            StatusError::internal_server_error()
+        })?;
+
+    let wav_bytes = match wav_data {
+        TtsResponse::Wav(v) => v,
+        // If a backend starts returning raw PCM in the future, the handler
+        // can wrap it via `pcm_to_wav`; for v1 only WAV-returning backends
+        // are in production.
+        TtsResponse::Pcm { samples, sample_rate } => {
+            let bytes: Vec<u8> = samples
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect();
+            pcm_to_wav(&bytes, sample_rate)
+        }
+    };
 
     res.headers_mut()
         .insert("Content-Type", "audio/wav".parse().unwrap());
-    res.write_body(wav_data).ok();
+    res.write_body(wav_bytes).ok();
     Ok(())
 }
 
@@ -502,32 +530,48 @@ pub async fn tts_ascend_clone(
         return Ok(());
     }
 
-    let request = parse_clone_multipart(req).await?;
-
-    let cfg = ascend_cfg.clone();
-    let wav_data = tokio::task::spawn_blocking(move || {
-        let engine = ascend::AscendTtsEngine::new((*cfg).clone())?;
-        engine.synthesize_clone(
-            &request.input,
-            &request.reference_audio,
-            &request.language,
-            request.speed,
-            request.instruct.as_deref(),
-        )
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!("Ascend TTS clone task failed: {}", e);
-        StatusError::internal_server_error()
-    })?
-    .map_err(|e| {
-        tracing::error!("Ascend TTS clone error: {}", e);
+    // B3 §5.3.3: dispatch through the shared `TextToSpeech` trait.
+    let backend = state.ascend_tts_backend.as_ref().ok_or_else(|| {
+        tracing::error!("Ascend TTS backend not initialized");
         StatusError::internal_server_error()
     })?;
 
+    let request = parse_clone_multipart(req).await?;
+
+    let tts_clone_req = TtsCloneRequest {
+        input: request.input,
+        reference_audio: request.reference_audio,
+        language: request.language,
+        speed: request.speed,
+        instruct: request.instruct,
+    };
+
+    let backend = backend.clone();
+    let wav_data = tokio::task::spawn_blocking(move || backend.synthesize_clone(tts_clone_req))
+        .await
+        .map_err(|e| {
+            tracing::error!("Ascend TTS clone task failed: {}", e);
+            StatusError::internal_server_error()
+        })?
+        .map_err(|e| {
+            tracing::error!("Ascend TTS clone error: {}", e);
+            StatusError::internal_server_error()
+        })?;
+
+    let wav_bytes = match wav_data {
+        TtsResponse::Wav(v) => v,
+        TtsResponse::Pcm { samples, sample_rate } => {
+            let bytes: Vec<u8> = samples
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect();
+            pcm_to_wav(&bytes, sample_rate)
+        }
+    };
+
     res.headers_mut()
         .insert("Content-Type", "audio/wav".parse().unwrap());
-    res.write_body(wav_data).ok();
+    res.write_body(wav_bytes).ok();
     Ok(())
 }
 

@@ -230,21 +230,95 @@ crate boundary.
 
 ### B3 — `TextToSpeech` trait + retrofit (2 days)
 
-- [ ] 3.1 Define `trait TextToSpeech` with minimal v1 surface
+- [x] 3.1 Define `trait TextToSpeech` with minimal v1 surface
       (synthesize, backend_name, supports_clone).
-- [ ] 3.2 Implement for `GptSovitsMlxTts`, `Qwen3MlxTts`,
+      **Verified-by:** (a) New module `src/engines/tts_trait.rs`
+      defines `pub trait TextToSpeech: Send + Sync` with
+      `backend_name(&self) -> &'static str`, `supports_clone(&self)
+      -> bool`, `synthesize(&self, TtsRequest) -> Result<TtsResponse,
+      TtsError>`, and a defaulted `synthesize_clone`. Object-safe so
+      handlers can hold `Arc<dyn TextToSpeech>`.
+      (b) Request/response/error types also defined there:
+      `TtsRequest { input, voice, language, speed, instruct }`,
+      `TtsCloneRequest { input, reference_audio: Vec<u8>, language,
+      speed, instruct }`, `TtsResponse::{Wav(Vec<u8>), Pcm { samples:
+      Vec<i16>, sample_rate: u32 }}`, and `TtsError::{Unsupported,
+      BadRequest, Backend}` (thiserror-derived).
+      (c) Location decision: `src/engines/tts_trait.rs` (NOT
+      `src/tts/mod.rs`) — documented in the file's top-level doc
+      comment. Keeps the trait next to the four backend impls in
+      `src/engines/`.
+- [x] 3.2 Implement for `GptSovitsMlxTts`, `Qwen3MlxTts`,
       `AscendSubprocessTts` (refactor existing), `AscendFfiTts` (new,
       wraps `qwen-tts-ascend-sys`).
-- [ ] 3.3 Handler refactor: `src/handlers/audio.rs::tts_ascend` takes
+      **Verified-by:** (a) All four impls in a new module
+      `src/engines/tts_backends.rs`. `AscendSubprocessTts` wraps the
+      existing `ascend::AscendTtsEngine` (struct unchanged per §5.3.4;
+      the subprocess flow is byte-identical — we only moved its call
+      site behind the trait). `AscendFfiTts` wraps
+      `qwen_tts_ascend_sys::QwenTtsCtx` with a `Mutex<Option<_>>`
+      guarding the `!Sync` handle (risk register §7). `Qwen3MlxTts`
+      and `GptSovitsMlxTts` hold a `mpsc::Sender<InferenceRequest>`
+      and use `blocking_send` + `oneshot::blocking_recv` — callers
+      must invoke from `spawn_blocking` (all existing handlers
+      already do).
+      (b) Platform gating: `AscendFfiTts` real body is
+      `#[cfg(all(feature = "ascend-tts-ffi", target_os = "linux"))]`;
+      a stub with the same name and trait impl exists for all other
+      configurations so type-erased `Arc<dyn TextToSpeech>` shape is
+      identical across platforms. Mac / feature-off path returns
+      `TtsError::Unsupported`.
+      (c) B3 scope note: `AscendFfiTts::synthesize` currently returns
+      `Unsupported` even on Linux+feature-on — the trait binding and
+      Mutex lock shape land now so B3's handler refactor has a target,
+      but the generation loop (forward + predict_codes + decode_audio)
+      is a B4 follow-up that needs to be validated against real
+      weights on the Ascend host. Documented inline.
+- [x] 3.3 Handler refactor: `src/handlers/audio.rs::tts_ascend` takes
       `Arc<dyn TextToSpeech + Send + Sync>` from app state instead of
       constructing per-request. Resolve variant at startup via env.
-- [ ] 3.4 Keep the existing subprocess path and endpoint semantics
+      **Verified-by:** (a) `AppState` gains
+      `pub ascend_tts_backend: Option<Arc<dyn TextToSpeech>>`
+      (src/state.rs). `src/main.rs` calls
+      `engines::tts_backends::build_ascend_tts_backend(cfg.clone())`
+      once when `ascend_config` is present; that function reads
+      `ASCEND_TTS_TRANSPORT` (`ffi`|`subprocess`, default
+      `subprocess`) and returns the right `Arc<dyn TextToSpeech>`.
+      (b) `tts_ascend` and `tts_ascend_clone` handlers (src/handlers/
+      audio.rs lines ~460–570) now pull
+      `state.ascend_tts_backend`, build a `TtsRequest`/
+      `TtsCloneRequest`, and dispatch via
+      `spawn_blocking(move || backend.synthesize(req))`. No
+      per-request engine construction. `TtsResponse::Pcm` path is
+      handled with `pcm_to_wav` for future PCM-returning backends.
+      (c) MLX handlers untouched — scope decision documented in the
+      B3 report: retrofitting the MLX-side handlers (which stream
+      sentence-by-sentence via `spawn_per_sentence_tts`) would have
+      required re-plumbing the streaming sentence-per-oneshot channel
+      pattern through the new trait, with zero user-facing change.
+      The MLX trait impls exist in `tts_backends.rs` and can be wired
+      by a follow-up without touching the trait definition.
+- [x] 3.4 Keep the existing subprocess path and endpoint semantics
       byte-identical; the trait is the only change users can observe
       (which they should not).
+      **Verified-by:** (a) `AscendSubprocessTts::synthesize` builds
+      the same `SpeechRequest` the old handler did (same voice /
+      language defaults: `voice="default"`, `language="English"`)
+      and calls `AscendTtsEngine::new((*cfg).clone())?.synthesize(&req)`
+      — the path through `ascend.rs::run_tts` is bit-for-bit the
+      original subprocess invocation. Same for `synthesize_clone`.
+      (b) No modification to `src/engines/ascend.rs` in this
+      milestone (grep-verified).
+      (c) `cargo check` default: `Finished \`dev\` profile … in
+      3.76s`, 0 errors. `cargo check --features ascend-tts-ffi`: same.
 
 **Acceptance**: cargo build passes on Mac (subprocess only) and Linux
 Ascend (both variants); existing subprocess endpoint returns the same
 bytes for the same request; no regression in MLX paths.
+**Acceptance met** (Mac side): both `cargo check` and `cargo check
+--features ascend-tts-ffi` complete cleanly on macOS arm64. Linux-Ascend
+link-clean verification and E2E byte-equivalence of the subprocess
+endpoint roll into B4.
 
 ### B4 — E2E parity on Ascend host (1 day)
 

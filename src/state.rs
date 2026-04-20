@@ -4,6 +4,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::download;
 use crate::engines::ascend::AscendConfig;
+use crate::engines::tts_trait::TextToSpeech;
 use crate::inference::InferenceRequest;
 use crate::server_config::ServerConfig;
 use crate::training;
@@ -30,4 +31,10 @@ pub struct AppState {
     pub server_config: Arc<ServerConfig>,
     /// Optional Ascend NPU backend configuration
     pub ascend_config: Option<Arc<AscendConfig>>,
+    /// Shared TTS backend for Ascend endpoints (selected at startup via
+    /// `ASCEND_TTS_TRANSPORT`: `ffi`|`subprocess`, default `subprocess`).
+    /// `None` when `ascend_config` is `None`.
+    ///
+    /// See `ASCEND_API_BRIDGE_CONTRACT.md` §5 B3.3.
+    pub ascend_tts_backend: Option<Arc<dyn TextToSpeech>>,
 }

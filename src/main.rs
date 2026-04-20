@@ -126,7 +126,14 @@ async fn main() -> eyre::Result<()> {
     //     if cfg.has_diffusion() { tracing::info!("  Diffusion: {:?}", cfg.diffusion_model); }
     //     std::sync::Arc::new(cfg)
     // });
-    let ascend_config = None;
+    let ascend_config: Option<std::sync::Arc<engines::ascend::AscendConfig>> = None;
+
+    // B3 §5.3.3: select Ascend TTS backend once at startup (ASCEND_TTS_TRANSPORT).
+    // When `ascend_config` is None we don't build a backend — handlers that
+    // need it already check `state.ascend_config` first and 503 if absent.
+    let ascend_tts_backend = ascend_config
+        .as_ref()
+        .map(|cfg| engines::tts_backends::build_ascend_tts_backend(cfg.clone()));
 
     let state = AppState {
         inference_tx,
@@ -138,6 +145,7 @@ async fn main() -> eyre::Result<()> {
         download_cancel_flags,
         server_config,
         ascend_config,
+        ascend_tts_backend,
     };
 
     let router = router::build_router(state);
