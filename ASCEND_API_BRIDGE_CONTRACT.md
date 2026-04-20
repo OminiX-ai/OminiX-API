@@ -345,11 +345,57 @@ win, no model-code merge) applies.
 - [ ] 5.4 Add the two new symbols to the version script + vendored
       header. Bump header `SOVERSION` stays at 1 (additive only —
       no ABI break).
-- [ ] 5.5 Re-run `bindgen` in `qwen-tts-ascend-sys` (header pin updates;
+- [x] 5.5 Re-run `bindgen` in `qwen-tts-ascend-sys` (header pin updates;
       SHA-256 bump). Wrapper exposes `QwenTtsCtx::synthesize(params) ->
       Result<Vec<f32>, TtsError>`.
-- [ ] 5.6 Wire `AscendFfiTts::synthesize` in `src/engines/tts_backends.rs`
+      **Verified-by:** (a) Vendored header at
+      `OminiX-API/qwen-tts-ascend-sys/wrapper/qwen_tts_api.h` updated with
+      upstream content SHA-256 `042025b6979ad2096990e1f42f5253a46fb6dfc90de258abfe3ca022c7d892e9`.
+      Pin base commit stays at `12405a5251346d9568116e801c88b22bced661e8`
+      (Agent X's B5.1–5.4 header edit was still working-tree at vendor
+      time; pin block notes this — a later refresh should record the
+      actual B5 commit hash once Agent X commits). Bindgen regenerates
+      `qwen_tts_synth_params_t`, `qwen_tts_synthesize`, and
+      `qwen_tts_pcm_free` in
+      `target/debug/build/.../out/bindings.rs` lines 101–133.
+      (b) `cargo check` in `qwen-tts-ascend-sys/` both feature states:
+      `Finished dev profile ... in 3.56s` (no feature) and
+      `... in 0.02s` (with `--features ascend-available`, macOS warning
+      skips linking as expected).
+      (c) Wrapper:
+      `OminiX-API/qwen-tts-ascend-sys/src/wrapper.rs::QwenTtsCtx::synthesize`
+      + new `pub struct SynthParams` mirror. Error path reuses a new
+      `TtsError::Backend(String)` variant (wraps C return codes, CString
+      NUL failures, and NULL-pcm/zero-samples-on-rc=0 guards); SAFETY
+      comments sit on every `unsafe` block. Library-owned PCM is freed
+      via `qwen_tts_pcm_free` both on success and on the non-zero-rc
+      cleanup path. `SynthParams` + `TtsError::Backend` re-exported at
+      the crate root (`src/lib.rs`).
+- [x] 5.6 Wire `AscendFfiTts::synthesize` in `src/engines/tts_backends.rs`
       to call `QwenTtsCtx::synthesize`, under the `Mutex` guard.
+      **Verified-by:** (a)
+      `src/engines/tts_backends.rs::AscendFfiTts` (cfg-gated real impl,
+      `feature = "ascend-tts-ffi"` + `target_os = "linux"`):
+      `synthesize` now calls `ensure_loaded()` (lazy
+      `QwenTtsCtx::load` on first request, stored in
+      `Mutex<Option<QwenTtsCtx>>`), builds `SynthParams` via a new
+      `params_for_preset` helper (maps empty `voice` → `"icl"` mode,
+      non-empty voice → `"customvoice"` with `speaker=voice`), and wraps
+      the resulting `Vec<f32>` into `TtsResponse::Pcm` at 24 kHz via a
+      new `f32_pcm_to_response` helper (clamps to [-1,1] and rounds to
+      i16 so the existing `TtsResponse::Pcm { samples: Vec<i16>,
+      sample_rate: u32 }` enum shape is preserved).
+      (b) `synthesize_clone` writes `req.reference_audio` to a
+      `tempfile::NamedTempFile` (prefix `ascend_ffi_ref_`, suffix
+      `.wav`) and passes the path via `SynthParams.ref_audio_path` in
+      ICL mode. The tempfile is explicitly `drop`ed after the synthesis
+      call so unlink happens on scope exit. `supports_clone` flipped
+      `false → true` since ICL mode does not require a speaker encoder.
+      (c) `cargo check` default: `Finished dev profile ... in 7.44s`,
+      31 warnings (all pre-existing dead-code lints). `cargo check
+      --features ascend-tts-ffi` on macOS: `Finished dev profile ... in
+      6.73s`, same warnings. Linux link verification and E2E parity roll
+      into B4.
 
 **Acceptance**: `qwen_tts_synthesize` produces ASR-identical audio to
 the `qwen_tts` binary for the same params on 1 canonical utt (run on

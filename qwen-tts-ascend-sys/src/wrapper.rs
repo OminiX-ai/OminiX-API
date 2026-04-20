@@ -43,6 +43,11 @@ pub enum TtsError {
     #[error("qwen_tts_extract_speaker failed with code {0}")]
     SpeakerExtractFailed(c_int),
 
+    /// `qwen_tts_synthesize` returned a non-zero status code, or a
+    /// CString build failed for one of its path/text fields.
+    #[error("qwen_tts_synthesize failed: {0}")]
+    Backend(String),
+
     /// The requested operation is not supported on this build target
     /// (e.g. Mac dev host without the `ascend-available` feature, or a
     /// model loaded without a speaker encoder).
@@ -452,6 +457,135 @@ impl QwenTtsCtx {
         }
     }
 
+    /// High-level one-shot synthesis entry point.
+    ///
+    /// Wraps `qwen_tts_synthesize` (contract §5 B5.1). On success, the C
+    /// library mallocs a `float*` PCM buffer at 24 kHz; we copy it into a
+    /// `Vec<f32>` and immediately free the C-owned buffer via
+    /// `qwen_tts_pcm_free`, so callers never see a raw pointer.
+    ///
+    /// Per the contract's ABI comments, `0`-valued numeric fields mean
+    /// "use library default". Empty string fields (`""`) are passed as
+    /// NULL so the library default kicks in.
+    pub fn synthesize(&mut self, params: &SynthParams) -> Result<Vec<f32>, TtsError> {
+        #[cfg(not(feature = "ascend-available"))]
+        {
+            let _ = params;
+            Err(TtsError::Unsupported(
+                "synthesize needs `ascend-available`",
+            ))
+        }
+
+        #[cfg(feature = "ascend-available")]
+        {
+            // Build CStrings up front so they live for the whole FFI call.
+            // An empty source string becomes a None → we pass NULL so the
+            // C side applies its own default per ABI contract.
+            fn to_cstring_opt(s: &str) -> Result<Option<CString>, TtsError> {
+                if s.is_empty() {
+                    Ok(None)
+                } else {
+                    CString::new(s.as_bytes())
+                        .map(Some)
+                        .map_err(|e| TtsError::Backend(format!("CString: {e}")))
+                }
+            }
+
+            let c_text = to_cstring_opt(&params.text)?;
+            let c_ref_audio = to_cstring_opt(&params.ref_audio_path)?;
+            let c_ref_text = to_cstring_opt(&params.ref_text)?;
+            let c_ref_lang = to_cstring_opt(&params.ref_lang)?;
+            let c_target_lang = to_cstring_opt(&params.target_lang)?;
+            let c_mode = to_cstring_opt(&params.mode)?;
+            let c_speaker = to_cstring_opt(&params.speaker)?;
+
+            let ptr = |c: &Option<CString>| -> *const std::os::raw::c_char {
+                c.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null())
+            };
+
+            let c_params = ffi::qwen_tts_synth_params_t {
+                text: ptr(&c_text),
+                ref_audio_path: ptr(&c_ref_audio),
+                ref_text: ptr(&c_ref_text),
+                ref_lang: ptr(&c_ref_lang),
+                target_lang: ptr(&c_target_lang),
+                mode: ptr(&c_mode),
+                speaker: ptr(&c_speaker),
+                seed: params.seed as c_int,
+                max_tokens: params.max_tokens as c_int,
+                temperature: params.temperature,
+                top_k: params.top_k as c_int,
+                top_p: params.top_p,
+                repetition_penalty: params.repetition_penalty,
+                cp_groups: params.cp_groups as c_int,
+                cp_layers: params.cp_layers as c_int,
+                greedy: if params.greedy { 1 } else { 0 },
+            };
+
+            let mut pcm_out: *mut f32 = std::ptr::null_mut();
+            let mut n_samples_out: c_int = 0;
+
+            // Safety:
+            //  * `self.raw` is a live handle per the struct invariant.
+            //  * `c_params` lives until after the call returns; every
+            //    non-NULL `const char*` inside it points into a CString
+            //    that also lives for the duration of this scope.
+            //  * `pcm_out` + `n_samples_out` are local mutable bindings
+            //    addressed by `&mut`; the C side writes each once.
+            //  * `&mut self` serializes concurrent callers on this handle.
+            let rc = unsafe {
+                ffi::qwen_tts_synthesize(
+                    self.raw,
+                    &c_params as *const ffi::qwen_tts_synth_params_t,
+                    &mut pcm_out,
+                    &mut n_samples_out,
+                )
+            };
+
+            if rc != 0 {
+                // If the library still allocated something on a failure
+                // path, make a best-effort free so we don't leak.
+                if !pcm_out.is_null() {
+                    // Safety: `pcm_out` is whatever the C side left us;
+                    // the free contract says NULL is a no-op so passing
+                    // non-NULL-only is fine. The C impl must tolerate
+                    // being called after a non-zero return.
+                    unsafe { ffi::qwen_tts_pcm_free(pcm_out) };
+                }
+                return Err(TtsError::Backend(format!(
+                    "qwen_tts_synthesize rc={rc}"
+                )));
+            }
+
+            if pcm_out.is_null() || n_samples_out <= 0 {
+                if !pcm_out.is_null() {
+                    // Safety: same contract as above.
+                    unsafe { ffi::qwen_tts_pcm_free(pcm_out) };
+                }
+                return Err(TtsError::Backend(format!(
+                    "qwen_tts_synthesize returned rc=0 but pcm_out={:?} n_samples_out={}",
+                    pcm_out, n_samples_out,
+                )));
+            }
+
+            let n = n_samples_out as usize;
+            // Safety: C library gave us `pcm_out` pointing to `n` valid
+            // f32s (it wrote each one) and promised the buffer stays valid
+            // until `qwen_tts_pcm_free`. We copy out of it before freeing.
+            let samples: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(pcm_out as *const f32, n).to_vec()
+            };
+
+            // Safety: `pcm_out` is the exact pointer the library handed us
+            // from this call; the C ABI owns the allocator so we must
+            // route free through `qwen_tts_pcm_free` rather than Rust's
+            // global allocator.
+            unsafe { ffi::qwen_tts_pcm_free(pcm_out) };
+
+            Ok(samples)
+        }
+    }
+
     fn check_buffer(
         &self,
         actual: usize,
@@ -467,6 +601,55 @@ impl QwenTtsCtx {
             Err(TtsError::Unsupported(label))
         }
     }
+}
+
+// ============================================================================
+// SynthParams — pure-Rust mirror of qwen_tts_synth_params_t
+// ============================================================================
+
+/// One-shot synthesis parameters. Mirrors `qwen_tts_synth_params_t` from
+/// the C ABI (contract §5 B5.1); keeps owned `String`s so callers don't
+/// juggle `CString` lifetimes.
+///
+/// All numeric fields follow the C ABI "0 = use library default"
+/// convention. Empty-string fields are passed as `NULL` so the library
+/// picks its own default (see `QwenTtsCtx::synthesize`).
+#[derive(Debug, Clone, Default)]
+pub struct SynthParams {
+    /// Text to synthesize (required; empty → the C side will reject).
+    pub text: String,
+    /// Reference audio path for voice cloning (ICL / CustomVoice modes).
+    pub ref_audio_path: String,
+    /// Transcript of the reference audio (ICL mode).
+    pub ref_text: String,
+    /// Language tag for the reference audio (e.g. `"en"`, `"zh"`).
+    pub ref_lang: String,
+    /// Target language for the output.
+    pub target_lang: String,
+    /// Synthesis mode selector — typically one of
+    /// `"icl"` | `"xvec"` | `"customvoice"`. `""` → library default.
+    pub mode: String,
+    /// Named speaker preset (`customvoice` mode).
+    pub speaker: String,
+
+    /// RNG seed; `0` → library default.
+    pub seed: i32,
+    /// Token-generation cap; `0` → library default.
+    pub max_tokens: i32,
+    /// Sampling temperature; `0.0` → library default.
+    pub temperature: f32,
+    /// Top-k sampling; `0` → disabled / library default.
+    pub top_k: i32,
+    /// Top-p (nucleus) sampling; `0.0` → library default.
+    pub top_p: f32,
+    /// Repetition penalty; `0.0` → library default.
+    pub repetition_penalty: f32,
+    /// CP (code-predictor) tensor-parallel groups; `0` → library default.
+    pub cp_groups: i32,
+    /// CP tensor-parallel layers; `0` → library default.
+    pub cp_layers: i32,
+    /// If true, bypass sampling and always pick argmax.
+    pub greedy: bool,
 }
 
 impl Drop for QwenTtsCtx {

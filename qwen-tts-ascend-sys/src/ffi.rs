@@ -114,6 +114,40 @@ mod stub {
             sample_rate: c_int,
             embedding_out: *mut f32,
         ) -> c_int;
+
+        // --- B5 high-level ABI (contract §5 B5.1) ---
+        pub fn qwen_tts_synthesize(
+            ctx: *mut qwen_tts_ctx_t,
+            params: *const qwen_tts_synth_params_t,
+            pcm_out: *mut *mut f32,
+            n_samples_out: *mut c_int,
+        ) -> c_int;
+
+        pub fn qwen_tts_pcm_free(pcm: *mut f32);
+    }
+
+    /// `qwen_tts_synth_params_t` — stub mirror for non-Ascend builds.
+    /// Real layout from contract §5 B5.1; fields must match the C ABI
+    /// once the header lands.
+    #[repr(C)]
+    #[allow(dead_code)]
+    pub struct qwen_tts_synth_params_t {
+        pub text: *const c_char,
+        pub ref_audio_path: *const c_char,
+        pub ref_text: *const c_char,
+        pub ref_lang: *const c_char,
+        pub target_lang: *const c_char,
+        pub mode: *const c_char,
+        pub speaker: *const c_char,
+        pub seed: c_int,
+        pub max_tokens: c_int,
+        pub temperature: f32,
+        pub top_k: c_int,
+        pub top_p: f32,
+        pub repetition_penalty: f32,
+        pub cp_groups: c_int,
+        pub cp_layers: c_int,
+        pub greedy: c_int,
     }
 
     // Unused-import silencer: c_void is referenced by the real bindgen

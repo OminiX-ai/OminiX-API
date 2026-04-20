@@ -161,24 +161,148 @@ impl AscendFfiTts {
 }
 
 #[cfg(all(feature = "ascend-tts-ffi", target_os = "linux"))]
+impl AscendFfiTts {
+    /// Ensure the `QwenTtsCtx` is loaded (lazy init on first call). Returns
+    /// a locked `MutexGuard` for the caller's synthesize pass.
+    fn ensure_loaded<'a>(
+        &'a self,
+    ) -> Result<std::sync::MutexGuard<'a, Option<qwen_tts_ascend_sys::QwenTtsCtx>>, TtsError> {
+        let mut guard = self
+            .ctx
+            .lock()
+            .map_err(|e| TtsError::Backend(format!("AscendFfiTts mutex poisoned: {e}")))?;
+        if guard.is_none() {
+            let ctx = qwen_tts_ascend_sys::QwenTtsCtx::load(
+                &self.model_dir,
+                None, // tokenizer_dir — auto from model_dir
+                None, // talker_override
+                None, // cp_override
+                self.n_gpu_layers,
+                self.n_threads,
+            )
+            .map_err(|e| TtsError::Backend(format!("QwenTtsCtx::load: {e}")))?;
+            *guard = Some(ctx);
+        }
+        Ok(guard)
+    }
+
+    /// Build a `SynthParams` from a preset-voice `TtsRequest`. No reference
+    /// audio (ICL mode handled by `synthesize_clone`); the `voice` name
+    /// maps to the C-side `speaker` field under `customvoice` mode when
+    /// non-empty, otherwise library defaults apply.
+    fn params_for_preset(&self, req: &TtsRequest) -> qwen_tts_ascend_sys::SynthParams {
+        let mode = if req.voice.is_empty() {
+            // No preset → default ICL with library defaults.
+            "icl".to_string()
+        } else {
+            // Named preset voice → CustomVoice path.
+            "customvoice".to_string()
+        };
+        qwen_tts_ascend_sys::SynthParams {
+            text: req.input.clone(),
+            ref_audio_path: String::new(),
+            ref_text: String::new(),
+            ref_lang: String::new(),
+            target_lang: req.language.clone(),
+            mode,
+            speaker: req.voice.clone(),
+            seed: 0,
+            max_tokens: 0,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 0.0,
+            repetition_penalty: 0.0,
+            cp_groups: 0,
+            cp_layers: 0,
+            greedy: false,
+        }
+    }
+
+    /// Convert a library-produced `Vec<f32>` at 24 kHz to the trait's
+    /// `TtsResponse::Pcm` (16-bit signed LE). Clamp and round to i16
+    /// range; the conversion is the same one `hound` does internally.
+    fn f32_pcm_to_response(samples: Vec<f32>) -> TtsResponse {
+        let pcm: Vec<i16> = samples
+            .iter()
+            .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+            .collect();
+        TtsResponse::Pcm {
+            samples: pcm,
+            sample_rate: 24_000,
+        }
+    }
+}
+
+#[cfg(all(feature = "ascend-tts-ffi", target_os = "linux"))]
 impl TextToSpeech for AscendFfiTts {
     fn backend_name(&self) -> &'static str {
         "ascend-ffi"
     }
 
     fn supports_clone(&self) -> bool {
-        // Clone will be supported once the generation loop lands; gate
-        // on has_speaker_encoder at call time.
-        false
+        // ICL clone uses `ref_audio_path` directly in SynthParams; no
+        // speaker-encoder requirement for the ICL path.
+        true
     }
 
-    fn synthesize(&self, _req: TtsRequest) -> Result<TtsResponse, TtsError> {
-        // B3 exposes the dispatch shape; the inner generation loop is a
-        // B4 follow-up (needs real-hardware validation).
-        let _ = (&self.ctx, self.n_gpu_layers, self.n_threads);
-        Err(TtsError::Unsupported(
-            "AscendFfiTts::synthesize: generation loop not wired (B4 follow-up)",
-        ))
+    fn synthesize(&self, req: TtsRequest) -> Result<TtsResponse, TtsError> {
+        let params = self.params_for_preset(&req);
+        let mut guard = self.ensure_loaded()?;
+        let ctx = guard
+            .as_mut()
+            .expect("ensure_loaded leaves Some(ctx) on Ok");
+        let samples = ctx
+            .synthesize(&params)
+            .map_err(|e| TtsError::Backend(format!("QwenTtsCtx::synthesize: {e}")))?;
+        Ok(Self::f32_pcm_to_response(samples))
+    }
+
+    fn synthesize_clone(&self, req: TtsCloneRequest) -> Result<TtsResponse, TtsError> {
+        // The C ABI takes a reference-audio *path*, not bytes. Write the
+        // incoming buffer to a tempfile for the lifetime of the call;
+        // tempfile::NamedTempFile::Drop unlinks on scope exit. This
+        // matches how the subprocess path works in ascend.rs::run_tts.
+        use std::io::Write;
+        let mut tmp = tempfile::Builder::new()
+            .prefix("ascend_ffi_ref_")
+            .suffix(".wav")
+            .tempfile()
+            .map_err(|e| TtsError::Backend(format!("tempfile create: {e}")))?;
+        tmp.write_all(&req.reference_audio)
+            .map_err(|e| TtsError::Backend(format!("tempfile write: {e}")))?;
+        tmp.flush()
+            .map_err(|e| TtsError::Backend(format!("tempfile flush: {e}")))?;
+        let ref_path = tmp.path().to_string_lossy().into_owned();
+
+        let params = qwen_tts_ascend_sys::SynthParams {
+            text: req.input.clone(),
+            ref_audio_path: ref_path,
+            ref_text: String::new(),
+            ref_lang: String::new(),
+            target_lang: req.language.clone(),
+            mode: "icl".to_string(),
+            speaker: String::new(),
+            seed: 0,
+            max_tokens: 0,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 0.0,
+            repetition_penalty: 0.0,
+            cp_groups: 0,
+            cp_layers: 0,
+            greedy: false,
+        };
+
+        let mut guard = self.ensure_loaded()?;
+        let ctx = guard
+            .as_mut()
+            .expect("ensure_loaded leaves Some(ctx) on Ok");
+        let samples = ctx
+            .synthesize(&params)
+            .map_err(|e| TtsError::Backend(format!("QwenTtsCtx::synthesize (clone): {e}")))?;
+        // `tmp` drops here — ref audio file is unlinked.
+        drop(tmp);
+        Ok(Self::f32_pcm_to_response(samples))
     }
 }
 

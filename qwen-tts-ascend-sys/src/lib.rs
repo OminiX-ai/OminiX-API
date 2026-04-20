@@ -28,4 +28,4 @@
 pub mod ffi;
 pub mod wrapper;
 
-pub use wrapper::{QwenTtsCtx, TtsError};
+pub use wrapper::{QwenTtsCtx, SynthParams, TtsError};
