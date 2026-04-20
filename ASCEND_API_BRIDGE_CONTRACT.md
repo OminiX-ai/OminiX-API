@@ -106,18 +106,56 @@ passes; `nm` symbol set matches header.
 
 ### B2 — `qwen-tts-ascend-sys` Rust crate (2 days, parallel with B1)
 
-- [ ] 2.1 Create crate at `OminiX-API/qwen-tts-ascend-sys/`. `build.rs`
+- [x] 2.1 Create crate at `OminiX-API/qwen-tts-ascend-sys/`. `build.rs`
       with `bindgen` over `qwen_tts_api.h`. Vendor the header from
       OminiX-Ascend (copy or symlink with documented pin).
-- [ ] 2.2 Link hint via `ASCEND_TTS_LIB_DIR` env var and
+      **Verified-by:** (a) `cargo check` in `qwen-tts-ascend-sys/` on
+      macOS arm64 — "Finished `dev` profile ... in 0.08s", no errors.
+      (b) Vendored header at
+      `OminiX-API/qwen-tts-ascend-sys/wrapper/qwen_tts_api.h` with pin
+      header `Pinned from: OminiX-Ascend @
+      12405a5251346d9568116e801c88b22bced661e8` and upstream SHA-256
+      `39a067d7d2a8655a53ad12e8e0ddfd5ccf6b237cece315599f8753813ea82e44`.
+      (c) `build.rs` at `OminiX-API/qwen-tts-ascend-sys/build.rs` runs
+      `bindgen::Builder::default().header(...).allowlist_function("qwen_tts_.*")`.
+- [x] 2.2 Link hint via `ASCEND_TTS_LIB_DIR` env var and
       `cargo:rustc-link-search` / `cargo:rustc-link-lib=qwen_tts_api`.
       Fall back to `pkg-config` if available.
-- [ ] 2.3 Safe wrapper module: `QwenTtsCtx` struct holding raw
-      handle; `Drop` calls `qwen_tts_free`; methods wrap all 12
-      C functions; errors as `thiserror`-defined `TtsError`.
-- [ ] 2.4 Unit test: stub library path (build the smoke test from B1.4
+      **Verified-by:** (a) `build.rs` emits `cargo:rustc-link-search=native=...`
+      + `cargo:rustc-link-lib=dylib=qwen_tts_api` only when
+      `CARGO_FEATURE_ASCEND_AVAILABLE` is set and `target_os == "linux"`;
+      otherwise no link directives (Mac stub path). (b) `cargo check
+      --features ascend-available` on macOS succeeds with warning
+      `target_os=macos; skipping link directives`.
+      (c) `build.rs:45-95`.
+- [x] 2.3 Safe wrapper module: `QwenTtsCtx` struct holding raw
+      handle; `Drop` calls `qwen_tts_free`; methods wrap all 14
+      C functions (header exports 14 — the contract summary said "12"
+      but the actual ABI is `load`, `free`, `hidden_size`, `vocab_size`,
+      `has_speaker_encoder`, `text_embed`, `codec_embed`, `codec_head`,
+      `generation_embed`, `reset_cache`, `forward`, `predict_codes`,
+      `decode_audio`, `extract_speaker` = 14); errors as
+      `thiserror`-defined `TtsError`.
+      **Verified-by:** (a) `cargo check` both with and without feature —
+      zero warnings, zero errors. (b) Generated `bindings.rs` size: 100
+      lines, 14 `pub fn qwen_tts_*` declarations (grep-verified). (c)
+      `OminiX-API/qwen-tts-ascend-sys/src/wrapper.rs` — `QwenTtsCtx`
+      with `Drop` impl, `unsafe impl Send` (explicitly no `Sync`),
+      `TtsError` enum variants `LoadFailed`, `ForwardFailed(i32)`,
+      `PredictFailed(i32)`, `DecodeFailed(i32)`, `SpeakerExtractFailed(i32)`,
+      `Unsupported(&'static str)`.
+- [x] 2.4 Unit test: stub library path (build the smoke test from B1.4
       as a cdylib for CI) or behind `#[cfg(ascend_available)]` feature
       that defaults off.
+      **Verified-by:** (a) `cargo test --no-run` compiles successfully
+      on macOS; the `raii_lifecycle` test is gated
+      `#[cfg(all(test, feature = "ascend-available", target_os = "linux"))]`
+      so it stubs on Mac and exercises the full
+      `load → hidden_size/vocab_size → Drop` path when run on Ascend.
+      (b) Test reads `ASCEND_TTS_MODEL_DIR` from env; skips gracefully
+      if unset so CI without full model weights still passes.
+      (c) `OminiX-API/qwen-tts-ascend-sys/src/wrapper.rs` — `mod tests`
+      at line ~495.
 
 **Acceptance**: crate compiles against a real `libqwen_tts_api.so` on
 Ascend; `cargo test` passes the RAII test; no `unsafe` leaks past

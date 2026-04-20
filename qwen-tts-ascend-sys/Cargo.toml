@@ -1,0 +1,26 @@
+# Standalone workspace so `cargo check` inside this directory does not
+# walk up into OminiX-API/Cargo.toml (which has unrelated dev-tree
+# path-deps that may fail to resolve). The parent consumes us via a
+# simple `path = "qwen-tts-ascend-sys"` dep, no workspace coupling.
+[workspace]
+
+[package]
+name = "qwen-tts-ascend-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Rust FFI bindings for libqwen_tts_api.so (Ascend 910 TTS C ABI)"
+license = "MIT OR Apache-2.0"
+links = "qwen_tts_api"
+
+[features]
+# Default off so `cargo check` on Mac dev hosts works without the .so.
+# Turn on via `--features ascend-available` on an Ascend Linux host that has
+# libqwen_tts_api.so installed (or reachable via ASCEND_TTS_LIB_DIR / pkg-config).
+default = []
+ascend-available = []
+
+[dependencies]
+thiserror = "1"
+
+[build-dependencies]
+bindgen = "0.72"

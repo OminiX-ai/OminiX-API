@@ -1,3 +1,11 @@
+# NOTE: OminiX-API intentionally stays a non-workspace single crate for
+# now. The qwen-tts-ascend-sys subcrate is consumed via a path-dependency
+# below. This avoids dragging the root crate's (currently broken in this
+# dev tree — missing `funasr-qwen4b-mlx`) manifest into every `cargo
+# check` of the sub-crate. The B2 milestone contract explicitly allows
+# this as the fallback when workspace is disruptive; revisit in B3 if we
+# grow more sub-crates.
+
 [package]
 name = "ominix-api"
 version = "1.2.0"
@@ -9,10 +17,17 @@ license = "MIT OR Apache-2.0"
 default = ["mlx"]
 mlx = []   # Apple Silicon MLX backend (macOS only)
 ggml = []  # GGML/Ascend backend (Linux/Ascend, requires llama-sys + ggml-sys)
+# Enable the native Ascend TTS FFI path (requires libqwen_tts_api.so).
+# Off by default so Mac dev hosts build. B3 will consume this to wire
+# AscendFfiTts behind an enum selector.
+ascend-tts-ffi = ["qwen-tts-ascend-sys/ascend-available"]
 
 [dependencies]
 # Backend-agnostic TTS core
 qwen3-tts-core = { path = "../OminiX-MLX/qwen3-tts-core" }
+
+# Native Ascend TTS FFI (wire-up lives here in B2; handler integration in B3).
+qwen-tts-ascend-sys = { path = "qwen-tts-ascend-sys" }
 
 # GGML/Ascend backend (enabled via feature flag)
 # qwen3-tts-ggml = { path = "../OminiX-MLX/qwen3-tts-ggml", optional = true }
