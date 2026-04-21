@@ -155,7 +155,37 @@ the 3e-3 parity drift in the harness at
 `aclrtStreamWaitEvent` between the pure-head output (main stream) and
 the rebound-capture region consuming it).
 
-### G2 — Full `forward_one_token` capture, pos-keyed cache (2-3 days, gated on G1 YELLOW)
+### G2 — Full `forward_one_token` capture, pos-keyed cache (DONE)
+
+**Verified-by Agent G2 (2026-04-21, fork commit `63a3d90e`)**.
+
+- [x] G2.1 Buffer design. Engine-owned fixed dev buffers; per-pos tensor
+      views reference same buffers with pos-specific offsets. No
+      per-frame pointer rebind. **PASS**.
+- [x] G2.2 Capture-at-init. 17 warmup forwards captured, each into an
+      `aclmdlRI` handle via `aclmdlRICaptureBegin(GLOBAL)`. **17/17
+      captures succeeded** on first run (RELAXED fallback not needed).
+- [x] G2.3 D2D memcpy audit + refactor. 3 D2D memcpys/layer × 5 layers
+      = 15/forward moved outside captured region: V→v_cache_slot
+      replaced by V-proj descriptor pointing at `v_cache_dev_[il] +
+      pos*kv_dim` (baked per-graph); `residual = cur` replaced by
+      `aclnnAdd(cur, zero_f16_cp_dev_, alpha=1, residual)` with new
+      engine-owned zero buffer.
+- [x] G2.4 Per-frame replay path. `forward_one_token_launch` branches
+      on `cp_aclgraph_applied_`; fixed-buffer H2D/D2H around
+      `aclmdlRIExecuteAsync(graphs_[pos], main_stream)`.
+- [x] G2.5 Re-capture semantics. Capture once at engine init;
+      `aclmdlRIDestroy` in destructor. Unset env = stock path,
+      bit-identical.
+
+**Scope guard**: capture only runs under canonical path
+`cp_fusion_applied_ && w8_applied_ && !cp_ascendc_applied_`; other
+combos skip capture silently.
+
+**Smoke**: 100-frame canonical xvec mayun zh completes both
+`TALKER_CP_ACLGRAPH=1` and unset, no crash.
+
+### G2-footnote — (original spec text preserved for reference)
 
 Per PM G1 decision: **Option 1 — pos-keyed graph cache**. Captures
 17 full-forward graphs at engine init, one per `pos ∈ [0, 16]`.
@@ -200,19 +230,35 @@ cp_groups=15, so pos in [0, 14]. Set MAX_ACLGRAPH_POS=16 for margin.
 If a longer sequence somehow exceeds, fall back to eager for positions
 beyond cache; graph cache only covers common path.
 
-### G3 — Correctness parity gate (1 day)
+### G3 — Correctness parity gate (DONE)
 
-- [ ] G3.1 Canonical mayun xvec zh `--cp_greedy --seed 42
-      --max_tokens 16`. Compare token IDs with `TALKER_CP_ACLGRAPH`
-      unset vs set. Gate: ≤ 1 token drift per frame per group for
-      first 16 frames (same shape as W1.4 / W4.1.4).
-- [ ] G3.2 ICL full run + customvoice run as secondary regression —
-      sanity that non-xvec paths are untouched when `TALKER_CP_ACLGRAPH=1`.
-- [ ] G3.3 If drift > 1 anywhere, debug before proceeding. Common
-      suspects: rebind order (cos/sin vs KV-slot vs seq_len),
-      executor reuse across replays, stale workspace.
+**Verified-by Agent G2 (2026-04-21, fork commit `63a3d90e`)**.
 
-**Gate**: drift ≤ 1 on xvec; ICL + CV have no regression.
+- [x] G3.1 Canonical mayun xvec zh `--cp_greedy --seed 42`.
+      Per-frame max-drift first 16 frames: **all zeros**.
+      max_drift_over_240 = **0**. 100-frame extended dump (1680
+      tokens) max drift = **0**, sum = 0. Output wav md5 identical.
+      **Byte-identical parity. PASS by perfect margin.**
+- [x] G3.2 ICL mayun zh + CV serena zh regression runs:
+      - ICL: token diff exit=0, wav md5 `fbb67b02dfb13b0432026e06c059a4ed`
+        matches stock
+      - CV: token diff exit=0, wav md5 `d68633035e4621e3737998fd07e5a1e3`
+        matches stock
+      Both byte-identical, aclgraph-off path untouched.
+- [x] G3.3 No debug needed — G3.1 passed on first run.
+
+**Gate**: **PASS** byte-identical across xvec / ICL / CV.
+
+### G3-sanity — perf preview (not a gate, G4 is authoritative)
+
+`TALKER_CP_PROF=1` 50-frame xvec mayun zh:
+- Stock median `fwd = 18.34 ms` (range 18.3-19.1)
+- aclgraph median `fwd = 17.83 ms` (range 17.8-17.84)
+- Per-forward delta: ~0.5 ms (at lower bound of G1's extrapolation)
+
+xvec wall 43 frames: 1340.8 ms stock → 1289.1 ms aclgraph (~4% wall
+win). Projected: 30.5 fps → ~31.7 fps wall on this short test. Full
+canonical run (G4) likely higher due to capture amortisation.
 
 ### G4 — Perf + user-ear HARD GATE (1 day)
 
