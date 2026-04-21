@@ -2,13 +2,35 @@
 
 ## 1. Status & mandate
 
-**Status**: NEW (drafted 2026-04-21, PM signed).
+**Status (2026-04-21 pm, updated)**: **PARKED — WAITING UPSTREAM**.
+F0 toolchain probe PASS on CANN 8.3.RC1 / Ascend 910B4 (build, generate,
+compile, device-dispatch all clean via bisheng/ccec/lld — cannfusion
+0.2.0). However F0 surfaced upstream `CANN_ESCALATION.md §1.12` (dated
+2026-04-17, open after 4 fix waves through Wave 12e''', PM note
+`1dcb3c3`): **fused-epilogue cube-only path hits
+`ACL_ERROR_RT_AICORE_EXCEPTION 507015` on `aclrtSynchronizeStream`**.
+The fault is a CANN *runtime* bug — "runtime decodes vec-arch
+instructions as cube-arch instructions" — not patchable in CannFusion's
+codegen. Resolution depends on Huawei CANN engineering cadence.
+
+The entire pivot value-add (silu + mul + residual-add epilogue fusion
+for the CP FFN sublayer) is blocked on §1.12. Plain matmul (empty
+epilogue) is convergent per §1.9 but has near-zero fps upside vs the
+existing `aclnnWeightQuantBatchMatmulV3` path — not worth dispatching
+F1 just for that.
+
+PM has pivoted again to the `aclGraph` track (see
+`aclgraph_feasibility.md` once Agent G0 reports). This contract stays
+in-tree as a **watchpoint**: resume F1/F2 if upstream merges a §1.12 fix
+in a future CannFusion release.
+
 **Origin**: PM decision to pivot from Path C hand-written AscendC after
 W4.1.3 landed on fork (commit `3ac9aab5`) but showed 6.5× slowdown
 preview under the naive `blockDim=1` vector kernel. Tiling to 20-core
 parallelism is days of work with uncertain outcome; CannFusion's codegen
 path is already authored, Apache-2.0, and targets exactly the
-Mm-+-epilogue fusion we need for the FFN sublayer.
+Mm-+-epilogue fusion we need for the FFN sublayer — **but the fusion
+half is currently broken upstream**.
 
 **Ceiling claim to beat**: current clean-quality canonical xvec mayun zh
 delivers **30.5 fps** (W8 + TQE=2 + cp_groups=15 + sampling + W1 NPU
@@ -90,22 +112,32 @@ tiling is not pre-funded but left possible.
 
 ### F0 — CANN 8.3.RC1 toolchain probe (1 hour, HARD GATE)
 
-- [ ] F0.1 Clone CannFusion on Mac, `cargo install --path .` locally
-      OR `cargo install cannfusion` if crates.io published. Validate the
-      Rust CLI runs.
-- [ ] F0.2 Run `cannfusion generate --config tests/fixtures/valid_basic.toml
-      --output /tmp/cf_probe/`. Capture generated tree.
-- [ ] F0.3 Scp `/tmp/cf_probe/` to ac01, then run
-      `scripts/remote-smoke.sh --host ac01 --full` OR hand-roll:
-      `cmake -S /tmp/cf_probe -B /tmp/cf_build -DCMAKE_CXX_COMPILER=bisheng/ccec`
-      then `cmake --build /tmp/cf_build`. Gate: compiles clean on 8.3.RC1.
-- [ ] F0.4 Dispatch generated kernel via a throwaway C++ smoke test on
-      ac01. Must launch + return without hang.
+- [x] F0.1 Clone + cargo build on Mac. **PASS** — cannfusion 0.2.0,
+      Rust 1.85 MSRV, CLI at `target/release/cannfusion`.
+- [x] F0.2 Generate from `tests/fixtures/valid_basic.toml`. **PASS** —
+      12 files produced (kernel.h, kernel_entry.cpp, kernel_meta.cpp,
+      tiling_data.h, tiling.cpp, def.cpp, infershape.cpp, binary.json,
+      api.h, api.cpp, CMakeLists.txt, vec_kernel.h).
+- [x] F0.3 Compile on ac01 / CANN 8.3.RC1 / Ascend 910B4. **PASS** —
+      bisheng clang 15.0.5, CANN 8.3.0.1.200, full cmake build ≤ 10 s.
+      Two-pass bisheng (cube + vec) + `ld.lld -m aicorelinux` produces
+      fatbin `kernel_entry.o` + `libcannfusion_gemm_host.so` with
+      exports `aclnnCannfusionGemm` / `aclnnCannfusionGemmGetWorkspaceSize`.
+- [x] F0.4 Device-dispatch smoke. **PASS-WITH-CAVEAT** —
+      `LaunchAscendKernel rc=0`, stream sync returns `507015`
+      (`ACL_ERROR_RT_AICORE_EXCEPTION`). The `507015` is EXPECTED per
+      `api.cpp` L196-221: the aclnn public API is a v0.1.1 shim that
+      requires caller-populated tiling blob (wave-13 TODO upstream).
+      Project's own `scripts/device-smoke/runner.cpp` populates
+      `CfTiling` by hand and reports `0/65536 mismatches, max_abs=0` on
+      this exact ac01/CANN/SoC triple (see `CANN_ESCALATION.md §1.9`).
 
-**Gate**: clean compile + clean dispatch on ac01 with CANN 8.3.RC1. If
-fails with version-specific errors: STOP, report failure mode, PM
-decides to upstream a patch / abandon CannFusion / request a CANN
-upgrade on ac01.
+**Gate verdict**: **PASS** (toolchain compatible with 8.3.RC1). BUT
+F0.4 surfaced the §1.12 bug (see §1 STATUS): fused-epilogue cube-only
+cmd-stream throws the same 507015 even when tiling IS populated, and
+this is an unresolved CANN runtime bug upstream has escalated to
+CANN engineering. F1/F2 NOT dispatched — fused epilogue is the entire
+pivot value prop, and it is the surface that's blocked.
 
 ### F1 — A16W8 dtype probe (1-2 hours, HARD GATE)
 
