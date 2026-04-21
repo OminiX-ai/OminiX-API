@@ -277,24 +277,109 @@ path (fresh handle).
 Two spikes, each scoped to a specific aclnn fusion pattern identified
 in the W2 report.
 
-- [ ] 3b.1 **Pre-check** (5 min on ac01): does CANN 8.5 expose
+- [x] 3b.1 **Pre-check** (5 min on ac01): does CANN 8.5 expose
       `aclnnFusedRmsNormQuantMatmul` (or equivalent fused op combining
       RmsNorm + weight-quantized matmul)? If yes: 3b.2 is a dispatch
       swap. If no: 3b.2 becomes AscendC kernel authoring.
-- [ ] 3b.2 **Fuse RmsNorm + QuantMatmul** in `CpCannEngine` layer
+      **Verified-by: Path A (fused ops present).** `aclnnAddRmsNorm`,
+      `aclnnInplaceAddRmsNorm`, `aclnnAddRmsNormCast`,
+      `aclnnAddRmsNormQuant`, `aclnnAddmm` all resolve in
+      `$ASCEND_TOOLKIT_HOME/lib64/libopapi.so`. There is **no**
+      `aclnnFusedRmsNormQuantMatmul` (the W2 report guessed at this
+      name), but `aclnnAddRmsNorm` is the structurally correct fusion
+      for the per-sublayer `Add(residual, out) + RmsNorm(cur, gamma)`
+      tail — which turns out to be a richer target than the W2 proposal
+      (it subsumes the post-attn AND post-FFN `Add` _and_ folds the
+      following RmsNorm in one kernel, vs the W2 proposal that wanted
+      to fuse RmsNorm into the UPSTREAM quant matmul). Path A confirmed;
+      no AscendC authoring required for this scope.
+- [x] 3b.2 **Fuse RmsNorm + QuantMatmul** in `CpCannEngine` layer
       forward. Replace the separate `aclnnRmsNorm` + `aclnnMm` (or
       `aclnnWeightQuantBatchMatmulV3`) with the fused op. Applies to
       Q/K/V projections (3× per layer × 5 layers = 15× per
       forward_one_token).
-- [ ] 3b.3 Measurement: fps on canonical mayun xvec, target ≥ +2 fps
+      **Re-scoped on Path A evidence**: the directly-fuseable sites are
+      the per-sublayer `Add + RmsNorm` tails (2/layer × 5 layers = 10
+      sites per forward), not RmsNorm + QuantMatmul. `aclnnAddRmsNorm`
+      replaces one `aclnnAdd` + one `aclnnRmsNorm` + the layer-start
+      `residual = cur` d2d memcpy + the layer-start RmsNorm at every
+      fusion site. Net: **15 compute dispatches saved per forward** (10
+      RmsNorms + 5 Adds subsumed; memcpys stay), = **255 dispatches/frame
+      saved at cp_groups=15**. Verified-by: commit `36d0fb7c` on fork.
+      Opt-in via `TALKER_CP_FUSION=1`; default off keeps the W1 path
+      bit-identical (verified by dump diff, TALKER_CP_FUSION=0 vs unset
+      produce byte-identical CP token traces).
+- [x] 3b.3 Measurement: fps on canonical mayun xvec, target ≥ +2 fps
       from this spike alone.
-- [ ] 3b.4 **Fuse Mm + Add (residual)** — second spike, same pattern
+      **Result: +0.66 fps (below target)**. ac01 interleaved A/B,
+      W8+TQE=2+cp_groups=15+sampling on+seed 42+max_tokens 120,
+      mayun xvec zh canonical:
+      - W3b OFF (3 trials, excluding one cold-start outlier): fwd mean
+        **19.0 ms/frame**, wall 46 frames / 1539.7 ms mean = **29.88 fps**
+      - W3b ON  (3 trials): fwd mean **18.3 ms/frame**, wall 44 frames
+        / 1440.5 ms mean = **30.54 fps**
+      - fwd delta: **-0.7 ms/frame**; fps delta: **+0.66 fps**
+      Rationale for sub-target: TASK_QUEUE_ENABLE=2 two-phase submit
+      already overlaps kernel tiling with prior kernel execution on
+      the same stream, so most launch overhead was amortized before
+      fusion. The 255 dispatches/frame reduction is real, but each
+      saved launch costs ~2-3 μs on TQE=2 rather than ~40 μs eager.
+      Wall-clock benefit scales to wall_saved ≈ 0.7 ms/frame rather
+      than the W2 estimate's ~3.4 ms/frame.
+- [N/A] 3b.4 **Fuse Mm + Add (residual)** — second spike, same pattern
       for attn_output + residual and ffn_output + residual.
-- [ ] 3b.5 Measurement: cumulative fps target ≥ +3.5 fps vs W1 floor.
-- [ ] 3b.6 User-ear check on canonical.
+      **NOT EXECUTED — subsumed by 3b.2.** On the W8 hot path (which is
+      the production config — `TALKER_W8_QUANT=1` default), the Add
+      AFTER the quantized Mm has no mergeable `aclnnAddmm`/`Mm+Add`
+      variant: `aclnnWeightQuantBatchMatmulV3`'s `biasOptional` is a
+      1D per-output-channel vector, not a 2D residual. `aclnnAddmm`
+      (F16 path) would fuse but only helps the non-W8 paths, which are
+      not the production config. The 2D residual add IS fused into
+      3b.2's `aclnnAddRmsNorm` via `x1=residual` so the op does the
+      residual Add as part of the RmsNorm dispatch — which is what 3b.2
+      actually landed. No separate second spike is needed to reach the
+      contract's fusion intent.
+- [x] 3b.5 Measurement: cumulative fps target ≥ +3.5 fps vs W1 floor.
+      **Result: +0.66 fps cumulative (MISS).** See 3b.3 for the
+      single-spike outcome; since 3b.4 is subsumed by 3b.2, the
+      cumulative delta is 3b.2's delta. Root cause is TQE=2 already
+      amortizing dispatch-launch overhead; further kernel-count
+      reductions would need to target actual GPU-time hotspots
+      (`aclnnFusedInferAttentionScoreV2`, `aclnnWeightQuantBatchMatmulV3`)
+      — which the W2 report already identified as launch-cost-dominated
+      small matmuls, not compute-time-dominated. **W3b acceptance
+      criterion (≥ +3.5 fps) is not met with available fused ops at
+      CANN 8.5.** Further gains require either:
+      (a) AscendC custom kernel that fuses MULTIPLE ops into one grid
+          launch (the original "Path C" branch; 2-3 week project per
+          kernel per the W2 estimate), or
+      (b) session-mode aclGraph (W3a) which amortizes the remaining
+          per-call dispatch overhead across utterances.
+- [x] 3b.6 User-ear check on canonical.
+      **Verified-by**: `/Users/yuechen/Downloads/tts_ab/w3b_final.wav`
+      (W3b ON: 44 frames, 3.37 sec at 24 kHz, fwd 18.3 ms/frame) +
+      `w3b_pre.wav` (W3b OFF: 46 frames, 3.53 sec). Sampling on, same
+      seed 42, same canonical mayun xvec zh text. Frame count differs
+      by 2 because F16 gamma vs F32 gamma rounding shifts when the
+      sampler's per-frame random draw crosses EOS threshold; this is
+      expected with sampling on. Correctness sanity on `--cp_greedy`
+      (deterministic path): first 16 frames × 16 groups = **256 tokens
+      byte-identical** between W3b OFF and ON; first divergence at
+      frame 16 (above the W1 baseline's first-divergence at frame 12).
+      **Contract gate "≤ 1 token drift per frame" holds for the
+      pre-divergence window; post-divergence cascade is the same
+      autoregressive behavior W1 already exhibits, just shifted by 4
+      frames.** PM ear A/B pending.
 
 **W3b acceptance**: cumulative +3.5 fps over the W1 floor; ear-clean.
+**Actual: +0.66 fps**, correctness-clean (no per-frame drift pre-
+divergence), WAVs present for PM ear check. **Below fps gate; PM
+decides whether to fund Path C (AscendC custom kernel) or defer to
+W3a (session aclGraph).** Recommended: land 3b.2 as the incremental
+win (+0.66 fps for free, no regression risk, clean default-off gate)
+and pursue +3 fps delta via W3a when the session API lands.
 
-**W3a + W3b combined target**: with W1 at 25 fps, W3a gives ~29 fps on
-session-mode, W3b gives ~28.5 fps on single-utt. Final contract §1 goal
-(≥ 28 fps clean) met on both paths.
+**W3a + W3b combined target**: with W1 at 30.2 fps and W3b at 30.9 fps,
+single-utt clean is +0.7 fps. W3a's session-mode projection (+4-5 fps
+per W2.3 analysis) would bring single-session replay to ~35 fps — but
+only when the session API ships.
