@@ -199,11 +199,75 @@ checks, decides whether to fund W3 based on W2.5.
 
 ## 9. Sign-off
 
-- [ ] User signs this contract (PM to request before spawning agents).
-- [ ] On sign-off, PM spawns Agent X + Agent Y in parallel.
+- [x] User signs this contract (PM to request before spawning agents).
+      **Signed 2026-04-20.** Agents X + Y dispatched.
+- [x] On sign-off, PM spawns Agent X + Agent Y in parallel.
 - [ ] PM reports back per milestone; does not dive into the engineering.
 
----
+## 10. W2 outcome + W3 tracks funded (2026-04-20)
 
-**Current status**: draft, pending user sign-off. PM (Claude) will not
-dispatch agents until the user marks this contract accepted.
+W2 report landed at `OminiX-Ascend/docs/cp_forward_opt_exploration.md`
+(commit `8d045c76`). Corrected dispatch count: 95 aclnn ops per
+`forward_one_token`, ~1,615/frame at cp_groups=15, ~7 ms/frame of
+dispatch-launch overhead alone — directly the fusion target.
+
+**PM decisions on W2.5 recommendations (user, 2026-04-20):**
+
+- **(a) Session API lands this quarter**: YES → **W3a (aclGraph for CP
+  forward)** promoted to funded track, gated on session API landing.
+  Expected +4-5 fps when paired with session caller.
+- **(b) Budget for custom AscendC kernels if CANN 8.5 fused-op headers
+  are missing**: YES → **W3b (kernel fusion)** funded as two 2-day
+  spikes regardless of whether CANN ships the fused ops. If headers
+  present, use `aclnnFusedRmsNormQuantMatmul` / `aclnnMmAdd`; if not,
+  drop to AscendC kernel authoring.
+
+### W3a — aclGraph capture for CP forward (deferred, gated on session API)
+
+Exploration done (W2.3). Single-utt break-even; real win requires a
+caller that reuses the handle across many utts (session API). Track
+unblocks when the FFI bridge contract §1 G1 ("OminiX-API on ac01") +
+a session-mode endpoint lands.
+
+- [ ] 3a.1 Verify session API endpoint in OminiX-API that reuses
+      `QwenTtsCtx` across requests without calling `qwen_tts_free`
+      between utts. Reference: `ASCEND_API_BRIDGE_CONTRACT.md` once
+      present.
+- [ ] 3a.2 Implement per-shape `aclmdlRI*` capture for
+      `forward_one_token` keyed on `(pos)`. Replay on subsequent calls
+      with the same pos. Cache size: ~17 graphs (positions 0-16 for
+      the 15-group loop).
+- [ ] 3a.3 Measurement: 10-utt session replay vs fresh-handle-per-utt.
+      Target: ≥ 4 fps gain on the amortized path.
+- [ ] 3a.4 User-ear check on 3 canonical utts through the session
+      endpoint.
+
+**W3a acceptance**: +4 fps on session path; no regression on single-utt
+path (fresh handle).
+
+### W3b — CP kernel fusion (funded, start after W1 lands)
+
+Two spikes, each scoped to a specific aclnn fusion pattern identified
+in the W2 report.
+
+- [ ] 3b.1 **Pre-check** (5 min on ac01): does CANN 8.5 expose
+      `aclnnFusedRmsNormQuantMatmul` (or equivalent fused op combining
+      RmsNorm + weight-quantized matmul)? If yes: 3b.2 is a dispatch
+      swap. If no: 3b.2 becomes AscendC kernel authoring.
+- [ ] 3b.2 **Fuse RmsNorm + QuantMatmul** in `CpCannEngine` layer
+      forward. Replace the separate `aclnnRmsNorm` + `aclnnMm` (or
+      `aclnnWeightQuantBatchMatmulV3`) with the fused op. Applies to
+      Q/K/V projections (3× per layer × 5 layers = 15× per
+      forward_one_token).
+- [ ] 3b.3 Measurement: fps on canonical mayun xvec, target ≥ +2 fps
+      from this spike alone.
+- [ ] 3b.4 **Fuse Mm + Add (residual)** — second spike, same pattern
+      for attn_output + residual and ffn_output + residual.
+- [ ] 3b.5 Measurement: cumulative fps target ≥ +3.5 fps vs W1 floor.
+- [ ] 3b.6 User-ear check on canonical.
+
+**W3b acceptance**: cumulative +3.5 fps over the W1 floor; ear-clean.
+
+**W3a + W3b combined target**: with W1 at 25 fps, W3a gives ~29 fps on
+session-mode, W3b gives ~28.5 fps on single-utt. Final contract §1 goal
+(≥ 28 fps clean) met on both paths.
