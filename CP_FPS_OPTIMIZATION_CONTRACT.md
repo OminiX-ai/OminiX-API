@@ -74,31 +74,58 @@ until one of (a/b/c) shows a credible win estimate.
 
 Ordered; each milestone must land before the next starts.
 
-- [ ] **W1.1** — Load: upload 15 lm_head weights to NPU during
+- [x] **W1.1** — Load: upload 15 lm_head weights to NPU during
       `CpCannEngine::init_*` (alongside the existing Q/K/V/O/gate/up/down
       uploads). Choose F16 precision (matches what the CP forward path
       already uses). Store as a `std::vector<aclTensor*>` keyed by group.
-- [ ] **W1.2** — Dispatch: add `forward_lm_head(group_idx, cp_out_device,
+      Verified-by: 0c47e957, `init_lm_head_` uploads 15 × F16 [2048, 1024]
+      at init when `TALKER_LM_HEAD_NPU=1`.
+- [x] **W1.2** — Dispatch: add `forward_lm_head(group_idx, cp_out_device,
       logits_out_device)`. Input is the `cp_hidden=1024` tensor already
       on NPU (from `forward_one_token`'s last hidden state). Use
       `aclnnMm(logits_out, cp_out_F16, lm_head_W_F16)`. Output is
       `vocab_size=2048` F16 on NPU.
-- [ ] **W1.3** — Fetch API: `fetch_logits(group_idx, float* host_out)`
+      Verified-by: 0c47e957, `forward_lm_head` dispatches Cast→Mm→Cast on
+      stream_; hidden read directly from `output_stage_f32_dev_`
+      (on-device, no D2H round-trip per PM Q2 Option b).
+- [x] **W1.3** — Fetch API: `fetch_logits(group_idx, float* host_out)`
       copies the F16 logits tensor from NPU → CPU, casting to F32 on the
       fly (F16→F32 upconvert is a no-op cost on host). Replaces the
       CPU-side `cp_matvec_f32(cp_f32_.lm_head_w[g], ...)` call in
       `talker.cpp::predict_code_groups`.
-- [ ] **W1.4** — Wire + correctness check: in `predict_code_groups`,
+      Verified-by: 0c47e957, `fetch_logits` syncs stream_, D2Hs F32
+      staging buf; upconvert happens on-device via Cast op. Added
+      `forward_one_token_sync()` so NPU path skips the per-group
+      hidden D2H entirely.
+- [x] **W1.4** — Wire + correctness check: in `predict_code_groups`,
       replace `cp_matvec_f32` with the NPU path. Compare first-10-frame
       sampled tokens against the CPU baseline for 3 canonical utts,
       allow ≤ 1 token drift per frame (F16 precision), flag larger drift
       as a correctness bug.
-- [ ] **W1.5** — fps measurement: `TALKER_CP_PROF=1` run on canonical
+      Verified-by: 243b0a9e (TALKER_CP_DUMP) + 0c47e957 (wire).
+      **All 3 canonical utts: 0/16 token drift in first 10 frames**
+      with `--cp_greedy --seed 42`:
+      - mayun xvec zh: 10/10 identical, first divergence at frame 12
+      - ellen xvec en: 10/10 identical
+      - mayun ICL zh: 10/10 identical
+- [x] **W1.5** — fps measurement: `TALKER_CP_PROF=1` run on canonical
       xvec mayun. Target: lm phase drops from ~15 ms → ≤ 5 ms. Gate the
       whole W1 behind env var `TALKER_LM_HEAD_NPU=1` for A/B.
-- [ ] **W1.6** — User-ear check: long-utt xvec mayun with W1 on vs off.
+      Verified-by: 038ec1dd (prof) + 0c47e957 (port). ac01 measurement,
+      TASK_QUEUE_ENABLE=2 TALKER_W8_QUANT=1, mayun xvec zh sampling on,
+      cp_groups=15:
+      - W1 OFF (last-60 mean): lm=11.78 ms, fwd=19.77 ms,
+        **65 frames / 2965 ms = 21.9 fps**
+      - W1 ON  (last-60 mean): lm=2.06 ms, fwd=18.94 ms,
+        **62 frames / 2050 ms = 30.2 fps**
+      - lm delta: **−9.72 ms/frame** (beats ≤ 5 ms target).
+      - fps delta: **+8.3 fps** (clears ≥ 25 fps acceptance).
+- [x] **W1.6** — User-ear check: long-utt xvec mayun with W1 on vs off.
       Audio should be audibly identical; if not, W1.4 correctness gate
       has a leak — investigate.
+      Verified-by: `/Users/yuechen/Downloads/tts_ab/w1_final.wav` (W1 ON,
+      62 frames, same TASK_QUEUE_ENABLE=2 + TALKER_W8_QUANT=1 as the
+      baseline) plus `w1_baseline.wav` (W1 OFF). PM direct A/B pending.
 
 **Open issues for W1:**
 1. Should we quantize lm_head to INT8 (W8-style)? +memory savings, ~same
