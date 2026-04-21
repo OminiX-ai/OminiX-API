@@ -121,12 +121,22 @@ contract body assumed). All capabilities needed are present.
 
 Single-track, ac01. **Agent C-attn**.
 
-- [ ] 4.1.1 **Kernel skeleton**: author `fused_attn_sublayer.ccec`
+- [x] 4.1.1 **Kernel skeleton**: author `fused_attn_sublayer.ccec`
       implementing: one block of (RmsNorm → QKV-matmul → RoPE →
       attention → O-matmul → residual-add). F16 arithmetic. Weight
       layout matches `cp_cann_engine.cpp`'s existing Q/K/V/O uploads;
       **do not re-pack weights**, the engine's existing tensors are
       the input.
+      **Verified-by**: skeleton at
+      `tools/qwen_tts/ascendc/fused_attn_sublayer.cpp` (renamed from
+      `.cce` because CANN 8.3.RC1's `ascendc_library()` only accepts
+      `.cpp`/`.asc` — matches the probe's `kernel.cpp` convention).
+      `ascendc_library()` + auto-generated
+      `aclrtlaunch_fused_attn_sublayer` host stub build cleanly;
+      `qwen_tts` target re-links with the new static lib. Tile
+      strategy + KV-cache-append split documented in the file header.
+      Scalar softmax's `exp` uses a Remez-quartic over `2^y` because
+      `exp` is not exposed as an aicore intrinsic on 8.3.RC1.
 - [ ] 4.1.2 **Offline numerical validation**: extract one layer's
       input hidden + Q/K/V/O weights into test fixture. Dispatch the
       kernel on that fixture and compare output to the stock aclnn
