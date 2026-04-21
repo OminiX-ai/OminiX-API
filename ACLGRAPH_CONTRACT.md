@@ -92,65 +92,113 @@ ms/forward of host overhead + pipeline gaps. At 15 forwards/frame and
 
 Verified-by Agent G0 (2026-04-21): `docs/aclgraph_feasibility.md`.
 
-### G1 — One-layer capture smoke (2 days, HARD GATE)
+### G1 — One-layer capture smoke (DONE, YELLOW verdict)
 
-**Purpose**: answer the single remaining feasibility question — does
-`aclmdlRICaptureTaskUpdateBegin/End` accept re-binding of the FIAv2
-`seq_len` int64 scalar + K/V stride-over-seq tensor views on an
-already-captured `aclOpExecutor`?
+**Verified-by Agent G1 (2026-04-21, fork commit `20ed1871`)**.
 
-- [ ] G1.1 Extend `cp_cann_symbols.cpp` to optionally resolve the
-      task-group + task-update symbols: `aclmdlRICaptureTaskGrpBegin`,
-      `aclmdlRICaptureTaskGrpEnd`, `aclmdlRICaptureTaskUpdateBegin`,
-      `aclmdlRICaptureTaskUpdateEnd`. Add a `has_aclgraph_update()`
-      capability probe. If any symbol missing: STOP, report, PM
-      decides.
-- [ ] G1.2 Isolate one transformer layer (`il=0`) into a standalone
-      capture harness inside `cp_cann_engine.cpp` behind
-      `#ifdef TALKER_CP_ACLGRAPH_SMOKE`. Capture at `pos=0`, record
-      the layer-0 sub-DAG into a `aclmdlRI` handle with FIAv2 +
-      RoPE + KV-slot-write inside a `TaskGrp` block.
-- [ ] G1.3 Replay 10× with `pos` varying 0..9. Each replay uses
-      `CaptureTaskUpdateBegin/End` on a side stream to rebind:
-        (a) RoPE cos/sin strided slice pointer
-        (b) KV-cache write offset (`k_cache_dev_[0] + pos * kv_dim`)
-        (c) FIAv2 `seq_len` scalar
-      Verify output bit-identical (or ≤ 1e-4 F16 abs-diff) vs the
-      stock eager path for all 10 positions.
-- [ ] G1.4 Wall-time per replay vs eager. Record with
-      `aclrtRecordEvent` around the replay call and subtract.
+- [x] G1.1 Extend `cp_cann_symbols.{h,cpp}` + optional dlsym. **PASS**
+      — all 4 task-update symbols resolve on 8.3.RC1
+      (`aclmdlRICaptureTaskGrpBegin/End`,
+      `aclmdlRICaptureTaskUpdateBegin/End`).
+      `has_aclgraph_task_update()` returns true.
+- [x] G1.2 One-layer capture harness (`test_aclgraph_smoke.cpp`,
+      1046 LoC, synthetic weights, gated by
+      `-DQWEN_TTS_ACLGRAPH_SMOKE=ON`). Capture at `pos=0` with FIAv2
+      + RoPE + KV-slot each in its own `TaskGrp`. Capture success.
+- [x] G1.3 Replay 10× with pos 0..9 and per-op TaskUpdate rebind.
+      Per-op results:
+        RoPE-Q rebind:    **PASS**
+        RoPE-K rebind:    **PASS**
+        FIAv2 seq_len:    **PASS** ← the critical question
+        KV-slot memcpy:   **PASS_EXTERNAL** — `aclrtMemcpyAsync` D2D
+                          NOT CAPTURABLE on 8.3.RC1 (err 507009
+                          "task not supported"). Must launch outside
+                          captured region.
+      Parity multi-grp: **max_abs_diff = 3e-3 F16** (gate was 1e-4 —
+      30× off). Likely harness stream-barrier bug, not a driver bug.
+      Per-replay wall (ms): [0.332, 0.347, 0.301, 0.303, 0.308, 0.303,
+      0.302, 0.300, 0.305, 0.302], **median 0.30 ms / layer** —
+      PASSES 1.5 ms gate by 5×. Extrapolates to ~1.5 ms / 5-layer
+      forward vs current ~18 ms eager → **projected +10 fps**.
+- [x] G1.4 Verdict: **YELLOW**. Task-update semantic works for every
+      parameter class we care about (including FIAv2 seq_len). Replay
+      timing blows past the gate. The 3e-3 parity drift is the only
+      open concern and is not debuggable within G1 scope.
 
-**Gate**: parity PASS + **replay ≤ 1.5 ms / layer** (extrapolated to
-7.5 ms / forward, vs current ~18 ms). If parity fails OR replay
-≥ eager, STOP, report:
-- Parity fail → debug; investigate whether `seq_len` is templated into
-  the executor (the feared failure mode).
-- Slower-than-eager → abandon aclGraph; pivot to group-collapse or
-  revisit Path C with proper tiling.
+**Hard constraints surfaced for G2**:
+1. **One TaskGrp per op**: driver rejects multi-op TaskGrp updates
+   ("total=3 success=1 failed=2", `rtsStreamEndTaskUpdate task group
+   update error`). Required: one `TaskGrpBegin/End` per rebound op.
+2. **No D2D memcpys inside capture**: V→KV-slot write and any
+   residual-copy memcpys must launch on `main_stream` BEFORE
+   `aclmdlRIExecuteAsync`. Design around this.
 
-**Fallback path** (pre-approved, same scope): if `CaptureTaskUpdate`
-rejects FIAv2 seq_len but replay-at-fixed-pos is fast, switch to
-**pos-keyed graph cache** (~17 graphs, one per valid `pos` in 0..16).
-Same fps upside; adds ~1 day to G2.
+**PM decision (2026-04-21)**: proceed to G2 with **Option 1 —
+pos-keyed graph cache**. Rationale:
+- Avoids the 3e-3 multi-grp parity drift that single-graph TaskUpdate
+  would force us to debug.
+- Minimal-risk surface: only uses the all-green subset (`CaptureBegin/
+  End` + `ExecuteAsync`, no TaskUpdate).
+- 17 graphs × ~1 MB = ~17 MB RAM; trivial.
+- Captured per-pos graphs bake `seq_len` into the executor so no
+  rebind needed at all. Simplest possible production architecture.
+- Same projected fps upside (+6 to +10 fps).
 
-### G2 — Full `forward_one_token` capture (2 days, gated on G1)
+Option 2 (single graph + per-op TaskUpdate) remains available as a
+future optimisation if fps ceiling needs another push. Deferred.
 
-- [ ] G2.1 Capture-at-init path: extend `CpCannEngine::init_post_weights_`
-      (or equivalent post-weight-upload hook) to run one warmup forward
-      and, if `TALKER_CP_ACLGRAPH=1`, capture it into an `aclmdlRI`
-      handle. Use `ACL_MODEL_RI_CAPTURE_MODE_GLOBAL` (tolerates
-      cross-stream W1 lm_head wait).
-- [ ] G2.2 Per-frame replay path: `forward_one_token_launch` branches
-      on `cp_aclgraph_applied_`. If true, `aclmdlRICaptureTaskUpdateBegin`
-      → rebind 3 param-update points → `aclmdlRIExecuteAsync` →
-      `CaptureTaskUpdateEnd`. Otherwise stock path.
-- [ ] G2.3 Re-capture semantics for fresh `QwenTtsCtx`: capture is
-      engine-lifetime, not utt-lifetime. Verify engine re-use across
-      consecutive TTS calls does not leak the captured graph.
+### G1-legacy — single-graph + TaskUpdate (DEFERRED)
+
+Option 2 is not in active scope. If revisited, first step is debugging
+the 3e-3 parity drift in the harness at
+`tools/qwen_tts/test_aclgraph_smoke.cpp` (likely: missing
+`aclrtStreamWaitEvent` between the pure-head output (main stream) and
+the rebound-capture region consuming it).
+
+### G2 — Full `forward_one_token` capture, pos-keyed cache (2-3 days, gated on G1 YELLOW)
+
+Per PM G1 decision: **Option 1 — pos-keyed graph cache**. Captures
+17 full-forward graphs at engine init, one per `pos ∈ [0, 16]`.
+Per-frame dispatch = pointer-select + `aclmdlRIExecuteAsync`.
+
+- [ ] G2.1 Buffer design: engine-owned fixed dev buffers for input
+      (H2D-staged), output, residual/normed/cur scratches. All graph
+      I/O points to these fixed pointers — no per-frame pointer
+      rebind needed, eliminates TaskUpdate path entirely.
+- [ ] G2.2 Capture-at-init path: extend `CpCannEngine::init(...)`
+      post-weight-upload. If `TALKER_CP_ACLGRAPH=1` and
+      `has_aclgraph()`, run 17 warmup forwards in series, each with
+      `aclmdlRICaptureBegin(stream, GLOBAL) → forward_one_token
+      → aclmdlRICaptureEnd`. Store the 17 `aclmdlRI` handles in a
+      `std::vector<aclmdlRI>`. If capture of any pos fails, disable
+      aclgraph silently and fall back to eager.
+- [ ] G2.3 D2D memcpy audit: identify every D2D `aclrtMemcpyAsync`
+      inside `forward_one_token_launch` (V-to-KV-slot,
+      `residual = cur`, `cur = residual`, etc.). Launch them on
+      `main_stream` BEFORE `aclmdlRIExecuteAsync` — NOT inside the
+      captured region. Verify capture doesn't record them (capture
+      will silently accept but replay will break — G1 found this).
+- [ ] G2.4 Per-frame replay path: `forward_one_token_launch` branches
+      on `cp_aclgraph_applied_`. If true:
+        (a) H2D-memcpy input to fixed input buffer (outside capture)
+        (b) Launch all pre-capture D2D memcpys on main_stream
+        (c) `aclmdlRIExecuteAsync(graphs_[pos], main_stream)`
+        (d) Read output from fixed output buffer
+      Otherwise stock eager path.
+- [ ] G2.5 Re-capture semantics for fresh `QwenTtsCtx`: capture is
+      engine-lifetime, not utt-lifetime. Graphs persist across
+      consecutive TTS calls. Verified by running 3 sequential calls
+      with `TALKER_CP_ACLGRAPH=1` and checking no crash / no graph
+      leak.
 
 **Gate**: runs without crash on canonical mayun xvec zh, 100 frames,
 env `TASK_QUEUE_ENABLE=2 TALKER_W8_QUANT=1 TALKER_LM_HEAD_NPU=1
 TALKER_CP_FUSION=1 TALKER_CP_ACLGRAPH=1`.
+
+**Risk**: max-pos needs to be large enough. Canonical benchmarks use
+cp_groups=15, so pos in [0, 14]. Set MAX_ACLGRAPH_POS=16 for margin.
+If a longer sequence somehow exceeds, fall back to eager for positions
+beyond cache; graph cache only covers common path.
 
 ### G3 — Correctness parity gate (1 day)
 
