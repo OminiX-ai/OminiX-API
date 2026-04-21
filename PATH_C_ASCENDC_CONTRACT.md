@@ -209,8 +209,8 @@ W4.1.5 perf gate has passed.
 
 ## 9. Sign-off
 
-- [ ] User signs this contract (PM requests before any code).
-- [ ] On sign-off, PM dispatches Agent C-probe for W4.0.
+- [x] User signs this contract. **Signed 2026-04-21.**
+- [x] PM dispatches Agent C-probe for W4.0.
 - [ ] PM gates each milestone: verifies numbers + ear-check artifacts
       before authorizing the next milestone.
 - [ ] PM pulls the plug at W4.1.5 if the perf gate doesn't clear.
