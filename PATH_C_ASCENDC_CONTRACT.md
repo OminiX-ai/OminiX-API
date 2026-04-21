@@ -19,6 +19,22 @@ via one or two custom AscendC kernels fusing CP-transformer
 sublayers, **without regressing audio quality** (user-ear identical,
 token drift ≤ 1 / frame / group).
 
+## 1a. STATUS (2026-04-21, updated): PAUSED
+
+W4.1.3 wiring landed on fork (commit `3ac9aab5`), env-gated off by
+default. W4.1.4 correctness gate **FAILED CATASTROPHICALLY**
+(max_drift=1949, 1/256 exact-match positions). The W4.1.2v kernel
+passes offline diff ≤ 5e-4 but diverges at runtime — wiring bug or a
+runtime-vs-offline state mismatch. Root-cause investigation **not
+pre-funded**; this contract is paused.
+
+**PM pivoted to CannFusion**: see `CANNFUSION_CONTRACT.md`. Path C
+lane stays landed for future return but is not the active effort.
+W4.1.5 / W4.1.6 NOT run. W4.2 / W4.3 NOT started.
+
+If Path C is ever resumed, first step is a rootcause agent on the
+runtime divergence before any further wiring work.
+
 ## 2. Non-goals
 
 - Not rewriting the full CP transformer in AscendC.
@@ -137,20 +153,74 @@ Single-track, ac01. **Agent C-attn**.
       strategy + KV-cache-append split documented in the file header.
       Scalar softmax's `exp` uses a Remez-quartic over `2^y` because
       `exp` is not exposed as an aicore intrinsic on 8.3.RC1.
-- [ ] 4.1.2 **Offline numerical validation**: extract one layer's
+- [x] 4.1.2 **Offline numerical validation**: extract one layer's
       input hidden + Q/K/V/O weights into test fixture. Dispatch the
       kernel on that fixture and compare output to the stock aclnn
       chain's output. Max-abs-diff ≤ 1e-2 (F16 noise). This step runs
       against canned input, not the live generate loop.
-- [ ] 4.1.3 **Wire into `CpCannEngine`**: replace the attn-sublayer
+      **Verified-by (2026-04-21, W4.1.2v vector-primitive rewrite)**:
+      fork commit `42efd0b` — `feat(tts): W4.1.2v vector-primitive
+      rewrite of fused_attn_sublayer`. Scalar FMA loops that hung the
+      NPU watchdog in the W4.1.1 skeleton replaced with AscendC vector
+      primitives (Cast / Muls / Mul / Add / Duplicate / Exp / ReduceSum
+      / DataCopy). EnQue/DeQue round-trips added on every GM↔UB
+      boundary to sync MTE2/V/MTE3 pipes. `test_fused_attn_diff`
+      harness also landed (was uncommitted after prior W4.1.1 spawn).
+      Offline-diff result on the synthetic fixture (cp_hidden=1024,
+      q_dim=2048, kv_dim=1024, head_dim=128, seq_len=8, host-F32 gold):
+      ```
+      [diff] residual max_abs_diff = 0.000488
+      [diff] k_cache  max_abs_diff = 0.000488
+      [diff] v_cache  max_abs_diff = 0.000977
+      [diff] gate <= 1e-2; result: PASS
+      ```
+      **Note on push**: ac01 has no git push credentials configured
+      for the fork remote (`https://github.com/ymote/OminiX-Ascend`).
+      Both 4687768 (W4.1.1) and 42efd0b (W4.1.2v) are committed
+      locally at `~/work/OminiX-Ascend-w1` on ac01 but not yet pushed.
+      PM decision needed on push mechanism before W4.1.3 can reference
+      the SHA externally.
+- [x] 4.1.3 **Wire into `CpCannEngine`**: replace the attn-sublayer
       aclnn chain with `forward_lm_head`-style dispatch of the fused
       kernel, gated on `TALKER_CP_ASCENDC=1`. Unset = old path
       bit-identical. Skip dispatching both paths in parallel — gate is
       compile-time-like (runtime env, but path-exclusive).
-- [ ] 4.1.4 **Correctness gate** (live): canonical mayun xvec zh under
+      **Verified-by (2026-04-22, Agent C-attn-v3)**: ac01 local commit
+      `be082ed` — `feat(tts): W4.1.3 wire fused attn kernel into
+      CpCannEngine (env-gated)`. Build gate `QWEN_TTS_HAS_ASCENDC`
+      (auto-on) + runtime gate `TALKER_CP_ASCENDC=1 AND w8_applied_`
+      wire the W4.1.2v kernel at `forward_one_token_launch`'s per-layer
+      attn sublayer; stock chain wrapped in `{}` and skipped via `goto
+      ascendc_attn_done`. `init_ascendc_f16_gammas_` creates the F16
+      q_norm/k_norm gammas the kernel reads (plus input_ln/post_ln/
+      final_norm as insurance for ASCENDC-without-FUSION). Post-kernel
+      `memcpy cur_dev_ ← residual_dev_` + `RmsNorm(cur, post_ln)`
+      restores the buffer layout the stock FFN matmuls expect.
+      Smoke (canonical mayun xvec zh, `--cp_greedy --seed 42
+      --max_tokens 100`, env `TASK_QUEUE_ENABLE=2 TALKER_W8_QUANT=1
+      TALKER_LM_HEAD_NPU=1 TALKER_CP_FUSION=1`):
+      - `TALKER_CP_ASCENDC=1`: completes, 100 frames, wav produced
+      - unset: completes, EOS at step 30, wav produced
+      Both paths run without crash. Correctness drift (W4.1.4) and
+      perf HARD KILL (W4.1.5) still pending. Patch at
+      `/tmp/w4_1_3.patch` (ac01) → `/tmp/w4_1_3.patch` (Mac) ready for
+      PM to push to fork.
+- [x] 4.1.4 **Correctness gate** (live): canonical mayun xvec zh under
       `--cp_greedy --seed 42`. Token drift ≤ 1 / frame / group for
       first 16 frames (same gate as W1.4). If > 1, debug — do not
-      ship.
+      ship. **Verified-by Agent C-attn-v4 (2026-04-21, ac01 @ be082ed)**:
+      **FAIL, CATASTROPHIC**. max_drift=1949 codebook IDs at (frame 1,
+      group 14); only 1/256 positions matched (frame 0 group 0 = 1995).
+      Per-frame max drift: [1776, 1949, 1216, 1613, 1415, 1438, 1281,
+      1753, 1163, 1848, 1902, 1786, 1515, 1538, 1305, 1620]. Both runs
+      produced 16 frames and a wav; ASCENDC run was ~2.1× slower
+      (4948 ms vs 2306 ms talker_xvec). Logs:
+      `/tmp/w4_1_4_stock_tokens.txt`, `/tmp/w4_1_4_ascendc_tokens.txt`
+      on ac01. Gate used existing `TALKER_CP_DUMP` plumbing (W1.4
+      heritage). The fused ASCENDC attn kernel is mathematically
+      incoherent, not just noisy — the hidden-state stream diverges
+      from frame 0 onward. PM pivots to CannFusion per pre-arranged
+      plan; W4.1.5 / W4.1.6 NOT run.
 - [ ] 4.1.5 **Perf gate**: `TALKER_CP_PROF=1` shows fwd drops from
       18.3 ms → **≤ 16 ms / forward_one_token**. fps on canonical
       lifts from 30.5 → **≥ 32 fps**. If gate misses, STOP and report
