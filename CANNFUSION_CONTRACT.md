@@ -2,27 +2,53 @@
 
 ## 1. Status & mandate
 
-**Status (2026-04-21 pm, updated)**: **PARKED — WAITING UPSTREAM**.
-F0 toolchain probe PASS on CANN 8.3.RC1 / Ascend 910B4 (build, generate,
-compile, device-dispatch all clean via bisheng/ccec/lld — cannfusion
-0.2.0). However F0 surfaced upstream `CANN_ESCALATION.md §1.12` (dated
-2026-04-17, open after 4 fix waves through Wave 12e''', PM note
-`1dcb3c3`): **fused-epilogue cube-only path hits
-`ACL_ERROR_RT_AICORE_EXCEPTION 507015` on `aclrtSynchronizeStream`**.
-The fault is a CANN *runtime* bug — "runtime decodes vec-arch
-instructions as cube-arch instructions" — not patchable in CannFusion's
-codegen. Resolution depends on Huawei CANN engineering cadence.
+**Status (2026-04-21 evening, updated)**: **UNBLOCKED — NOT ACTIVE**.
 
-The entire pivot value-add (silu + mul + residual-add epilogue fusion
-for the CP FFN sublayer) is blocked on §1.12. Plain matmul (empty
-epilogue) is convergent per §1.9 but has near-zero fps upside vs the
-existing `aclnnWeightQuantBatchMatmulV3` path — not worth dispatching
-F1 just for that.
+Agent F-re re-probed on ac03 (independent from G2's ac01 work) with a
+fresh clone of `https://gitcode.com/Rust4CANN/CannFusion.git` @
+`539fc01`. **§1.12 is resolved in the code**: the fused-epilogue
+cube+vec pipeline now dispatches cleanly on CANN 8.3.RC1 / Ascend
+910B4. F-re ran the project's own `scripts/device-smoke.sh` on the
+§1.12 reference fixture `tests/fixtures/codegen/m12e_cube_bias_silu_cast.toml`
+(F16×F16→F32→F16, epilogue = [bias, silu, cast], 128×128×128):
 
-PM has pivoted again to the `aclGraph` track (see
-`aclgraph_feasibility.md` once Agent G0 reports). This contract stays
-in-tree as a **watchpoint**: resume F1/F2 if upstream merges a §1.12 fix
-in a future CannFusion release.
+- `LaunchAscendKernel` rc = 0 (both matmul and epilogue phases)
+- `aclrtSynchronizeStream(matmul)` rc = 0
+- **`aclrtSynchronizeStream(epilogue)` rc = 0** ← the exact call F0 saw
+  return 507015; now clean
+- Numerical parity vs host reference (A·B + bias + SiLU + f16 cast):
+  0 / 16384 mismatches, max_abs_diff = 0.0078125 (F16 noise floor)
+
+Note: PM's local commit `e1a2284` ("Mark §1.12 escalation as
+historical") is not yet pushed upstream — origin HEAD is still
+`539fc01` and the escalation text still reads as active there. But the
+*code* is fixed.
+
+**Why still NOT ACTIVE**: honest fps-upside math for our CP FFN sublayer:
+- 15 fewer aclnn calls/forward × 3 μs TQE=2 dispatch = 45 μs/forward
+- 45 μs × 15 forwards/frame = 0.675 ms/frame saved
+- On 30.5 fps (32.8 ms/frame) baseline = **~+0.6 fps** (→ 31.1 fps)
+- HBM round-trip elimination is additional but unmeasured; STACK.md's
+  "2-3×" example is at different shapes (W4A8, larger tiles), so not
+  transferable without device measurement.
+
+aclGraph G2+G3 currently in flight projects **+6 to +10 fps** (30.5 →
+36-40 fps). CannFusion's standalone upside is ~10× smaller. The
+tracks are additive, not alternatives — but headcount-priority is
+aclGraph.
+
+**Decision**: keep CannFusion contract alive with all F0 stamps; do
+NOT dispatch F1 until (a) aclGraph lands and we want to push above
+36-40 fps, OR (b) aclGraph stalls and CannFusion becomes the fallback.
+F-re artefacts preserved at `/Users/yuechen/home/cannfusion_reprobe/`
+(Mac) and `~/cf_reprobe/` (ac03) for future F1 dispatch.
+
+**Origin**: PM decision to pivot from Path C hand-written AscendC after
+W4.1.3 landed on fork (commit `3ac9aab5`) but showed 6.5× slowdown
+preview under the naive `blockDim=1` vector kernel. CannFusion's codegen
+path is Apache-2.0 and targets exactly the Mm-+-epilogue fusion we
+need for the FFN sublayer — and as of 2026-04-21 evening, the fusion
+half is verified working on our target host/CANN.
 
 **Origin**: PM decision to pivot from Path C hand-written AscendC after
 W4.1.3 landed on fork (commit `3ac9aab5`) but showed 6.5× slowdown
