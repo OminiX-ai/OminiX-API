@@ -2,7 +2,63 @@
 
 ## 1. Status & mandate
 
-**Status (2026-04-21 evening, updated)**: **UNBLOCKED — NOT ACTIVE**.
+**Status (2026-04-21 late evening, FINAL)**: **CLOSED — DEAD ON F1 DTYPE**.
+
+Agent F1/F2-probe ran the A16W8 validator probe on a fresh clone of
+CannFusion `539fc01`. Verdict: **RED**. CannFusion's `validate_dtype_compat`
+function (`src/validate.rs:141-163`) has a hard-coded dtype whitelist:
+
+```rust
+matches!(
+    combo,
+    (F16,F16,F16) | (F16,F16,F16,F32) | (BF16,BF16,F32) | (F32,F32,F32)
+  | (INT8,INT8,INT32) | (INT8,INT8,F32)
+)
+```
+
+Our production Qwen3-TTS W8 path uses **F16 activation × INT8 weight →
+F16** (A16W8, per-channel F16 scale). This combo is **not in the
+whitelist**. There's an explicit negative unit test
+`dtype_rejects_f16_int8_f32` at `validate.rs:367-372` confirming the
+rejection is intentional design.
+
+**Fallbacks ruled out**:
+- **(a) Upstream patch**: multi-day-to-week. Requires new codegen lane
+  in `src/codegen/context.rs` (TILING_KEY is single-dtype keyed), new
+  per-channel scale/zp tensor plumbing in `TilingData`, new kernel.h
+  dequant lane, new host API signature, new test fixtures.
+  CannFusion is v0.2.0 with explicit "done" status per
+  `DELIVERY_CONTRACT.md:226`; upstream unlikely to prioritise an A16W8
+  lane as ad-hoc patch.
+- **(b) A8W8 with activation quant**: our `CpCannEngine` has no A8
+  lane. `aclnnWeightQuantBatchMatmulV3` / V2 are A16W8 by semantics.
+  Building an A8 activation-quant pipeline is a multi-week contract of
+  its own and would regress quality risk.
+- **(c) Abandon CannFusion**: the honest call.
+
+**Fps math reconfirmed dead**: `CANNFUSION_CONTRACT.md §1` previously
+estimated +0.6 fps upside assuming a clean F2/F3 integration. That
+upside **evaporates** once F1 removes A16W8 from the table, because
+an F16×F16 CannFusion kernel cannot dispatch on our production W8
+calls. The only alternative — running F16 end-to-end at ~2.7 GB
+weight-RAM regression — is explicitly rejected by the project.
+
+**Verified-by Agent F1/F2-probe (2026-04-21, no code changes, 25 min
+wall)**. Probe TOML at `/tmp/cf_f1_probe/a16w8.toml`. Validator
+whitelist at
+`/Users/yuechen/home/cannfusion_reprobe/src/validate.rs:141-163`.
+Negative test in-tree at `validate.rs:367-372`.
+
+**Action**: contract CLOSED, no agents dispatched. F-re artefacts at
+`/Users/yuechen/home/cannfusion_reprobe/` (Mac) and `~/cf_reprobe/`
+(ac03) preserved for historical reference. PM refocuses fps push on
+aclGraph (delivered +1.6 fps, need +2.2 more for ≥32 gate) + whatever
+Agent PC-tile's Path C re-spike returns + algorithmic levers
+(CP group-collapse) outside this contract.
+
+---
+
+**Origin-state memo** (preserved from earlier versions):
 
 Agent F-re re-probed on ac03 (independent from G2's ac01 work) with a
 fresh clone of `https://gitcode.com/Rust4CANN/CannFusion.git` @
