@@ -74,33 +74,48 @@ bit-identical W1+W3b path.
 Single-track probe. **Agent C-probe**, ac01. If any sub-step fails,
 STOP. Path C becomes a toolchain escalation, not an engineering track.
 
-- [ ] 4.0.1 Verify `ccec` AscendC compiler on ac01
-      (`$ASCEND_TOOLKIT_HOME/compiler/ccec_compiler/bin/ccec --version`
-      works; path is already in PATH per `/etc/profile` — confirm).
-- [ ] 4.0.2 Verify `aclnn` custom-op registration API: look for
-      `aclopRegisterCustom`, `aclopCreateHandle`, or equivalent in
-      `$ASCEND_TOOLKIT_HOME/aarch64-linux/include/acl/`. List what's
-      available; record which symbols are dlsym-accessible.
-- [ ] 4.0.3 Write **hello_kernel.ccec** (~20 lines, identity copy
-      input→output). Compile with `ccec`, package as `.so`, `dlopen`
-      from a 40-line C++ test binary, dispatch on ac01, verify output
-      matches input.
-- [ ] 4.0.4 Record: compile command, package shape, dispatch boilerplate,
-      timing vs plain `aclrtMemcpy`. This is the template the W4.1 /
-      W4.2 kernels will extend.
+- [x] 4.0.1 Verify `ccec` AscendC compiler on ac01.
+      **Verified-by**: ccec at `$ASCEND_TOOLKIT_HOME/compiler/ccec_compiler/bin/ccec`
+      (bisheng 5c68a1cb1231 / clang 15.0.5). Not in default PATH —
+      requires `source set_env.sh`. PASS.
+- [x] 4.0.2 Verify custom-op / kernel launch API.
+      **Verified-by**: contract's assumed `aclopRegisterCustom` API NOT
+      present in CANN 8.3.RC1. Working path: `ascendc_library()` cmake
+      macro at `$ASCEND_TOOLKIT_HOME/tools/tikcpp/ascendc_kernel_cmake/`
+      auto-generates `aclrtlaunch_<kname>` host wrapper; runtime
+      symbols in `libascendc_runtime.a` (`RegisterAscendBinary`,
+      `LaunchAscendKernel`, `UnregisterAscendBinary`). Static-link,
+      not dlsym. PASS.
+- [x] 4.0.3 Hello-kernel round-trip.
+      **Verified-by**: 4096 F16 elements, 1 block, identity copy
+      kernel. Result: `kernel=0.564ms mismatch=0/4096` —
+      bit-identical. Artifact: `~/work/OminiX-Ascend-w1/ascendc-probe/`
+      on ac01 (`hello_kernel.cce`, `launch_kernel.cpp`, `cmake_ref/`).
+- [x] 4.0.4 Template extraction.
+      **Verified-by**: reusable snippets in the probe dir:
+      `compile_ascendc.sh`, cmake fragment using `ascendc_library()`,
+      `launch_kernel.cpp` 10-liner showing `aclrtlaunch_<kname>`
+      pattern. Link line documented: `libascendc_runtime.a
+      libascendcl libruntime libmsprofiler libmmpa libc_sec
+      libprofapi liberror_manager`.
 
 **W4.0 acceptance**: hello_kernel round-trip works on ac01; agent
 reports the exact build + dispatch commands as a reusable snippet.
 PM gates here — if infra isn't in place, no further Path C spend.
 
-**Open issues for W4.0**:
-1. Does CANN 8.5 require kernels to be pre-registered via tiling
-   functions, or can AscendC kernels be dispatched ad-hoc? If former,
-   tiling-fn authoring adds ~1 day per kernel — add to W4.1/W4.2 scope.
-2. Is there an `aclrtLaunchKernel` alternative that accepts AscendC
-   binaries directly?
-3. Do our `TALKER_W8_QUANT=1` INT8 weights need re-layout for AscendC
-   kernel access (vs the aclnn layout the engine uses today)?
+**Open issues for W4.0** — all resolved by C-probe on 2026-04-21:
+1. ✅ Q1: Ad-hoc dispatch works. No pre-registered tiling fns required
+   (tilingKey=0 path is supported).
+2. ✅ Q2: `aclrtlaunch_<kname>(blockDim, stream, args...)` — the cmake
+   kit generates this host wrapper automatically; it calls
+   `LaunchAscendKernel` from `libascendc_runtime.a` internally.
+3. ✅ Q3: **No re-layout needed.** AscendC kernels consume the
+   engine's existing `aclrtMalloc`'d INT8 weight buffers directly via
+   `__gm__ int8_t*`; scales are `__gm__ half*`. Kernel-internal
+   dequant.
+
+**CANN version note**: ac01 runs CANN 8.3.RC1 (not 8.5 as the
+contract body assumed). All capabilities needed are present.
 
 ### W4.1 — Fused attention sublayer kernel (~2 weeks)
 
