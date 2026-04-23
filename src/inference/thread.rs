@@ -287,7 +287,11 @@ pub fn inference_thread(
                     "tts" => {
                         tts_engine = None;
                         let prev = current_tts_model.take();
-                        Ok(format!("Unloaded TTS model: {:?}", prev))
+                        let prev_qwen3 = qwen3_tts.unload();
+                        Ok(format!(
+                            "Unloaded TTS model: {:?}; Qwen3-TTS: {:?}",
+                            prev, prev_qwen3
+                        ))
                     }
                     "image" => {
                         image_engine = None;
@@ -300,12 +304,14 @@ pub fn inference_thread(
                         Ok(format!("Unloaded VLM model: {:?}", prev))
                     }
                     "qwen3_tts" => {
-                        Ok("Qwen3-TTS auto-loads on demand".to_string())
+                        let prev = qwen3_tts.unload();
+                        Ok(format!("Unloaded Qwen3-TTS model: {:?}", prev))
                     }
                     "all" => {
                         llm_engine = None;
                         asr_engine = None;
                         tts_engine = None;
+                        let prev_qwen3_tts = qwen3_tts.unload();
                         image_engine = None;
                         vlm_engine = None;
                         current_llm_model = None;
@@ -313,7 +319,7 @@ pub fn inference_thread(
                         current_tts_model = None;
                         current_image_model = None;
                         current_vlm_model = None;
-                        Ok("Unloaded all models".to_string())
+                        Ok(format!("Unloaded all models; Qwen3-TTS: {:?}", prev_qwen3_tts))
                     }
                     _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, qwen3_tts, image, vlm, or all", model_type)),
                 };

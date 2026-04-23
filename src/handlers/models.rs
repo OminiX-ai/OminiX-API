@@ -27,6 +27,7 @@ pub async fn load_model(
 
     #[derive(serde::Deserialize)]
     struct LoadModelRequest {
+        #[serde(alias = "model_id")]
         model: String,
         #[serde(default = "default_model_type")]
         model_type: String,

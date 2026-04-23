@@ -13,6 +13,7 @@
 use tokio::sync::oneshot;
 
 use crate::engines::qwen3_tts;
+use crate::model_config::{self, ModelAvailability, ModelCategory};
 use crate::types::{SpeechCloneRequest, SpeechRequest};
 
 
@@ -105,159 +106,324 @@ enum TtsVariant {
     Base,
 }
 
+impl TtsVariant {
+    fn from_model_ref(model_ref: &str) -> Self {
+        if model_ref.to_lowercase().contains("base") {
+            Self::Base
+        } else {
+            Self::CustomVoice
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CustomVoice => "customvoice",
+            Self::Base => "base",
+        }
+    }
+}
+
 impl std::fmt::Display for TtsVariant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TtsVariant::CustomVoice => write!(f, "customvoice"),
-            TtsVariant::Base => write!(f, "base"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 
 // ── Model discovery ────────────────────────────────────────────────
 
-/// Search standard model directories for a TTS model variant.
-/// Searches both first-level and second-level subdirectories under each base dir.
-fn find_tts_model(variant: &str) -> Option<String> {
-    fn has_qwen3_tts_weights(path: &std::path::Path) -> bool {
-        path.join("model.safetensors").is_file()
-            || path.join("model.safetensors.index.json").is_file()
+fn has_qwen3_tts_weights(path: &std::path::Path) -> bool {
+    path.join("model.safetensors").is_file()
+        || path.join("model.safetensors.index.json").is_file()
+}
+
+fn read_tts_config(path: &std::path::Path) -> Option<serde_json::Value> {
+    let content = std::fs::read_to_string(path.join("config.json")).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn detect_tts_variant(path: &std::path::Path) -> Option<TtsVariant> {
+    if let Some(config) = read_tts_config(path) {
+        let model_type = config
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if model_type != "qwen3_tts" {
+            return None;
+        }
+
+        let tts_model_type = config
+            .get("tts_model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        return match tts_model_type.as_str() {
+            "base" => Some(TtsVariant::Base),
+            "customvoice" | "custom_voice" => Some(TtsVariant::CustomVoice),
+            _ => None,
+        };
     }
 
-    let home = dirs::home_dir()?;
+    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    if name.contains("base") {
+        Some(TtsVariant::Base)
+    } else if name.contains("customvoice") || name.contains("custom_voice") {
+        Some(TtsVariant::CustomVoice)
+    } else {
+        None
+    }
+}
+
+fn detect_quant_bits(path: &std::path::Path) -> Option<i64> {
+    let config = read_tts_config(path)?;
+    config
+        .pointer("/quantization/bits")
+        .or_else(|| config.pointer("/quantization_config/bits"))
+        .and_then(|v| v.as_i64())
+}
+
+fn path_matches_variant(path: &std::path::Path, variant: TtsVariant) -> bool {
+    has_qwen3_tts_weights(path) && detect_tts_variant(path) == Some(variant)
+}
+
+fn quant_bits_from_label(label: &str) -> Option<i64> {
+    let lower = label.to_lowercase();
+    (2..=8)
+        .find(|bits| {
+            lower.contains(&format!("{bits}bit")) || lower.contains(&format!("{bits}-bit"))
+        })
+        .map(i64::from)
+}
+
+fn catalog_quant_bits(model_ref: &str) -> Option<i64> {
+    crate::model_registry::get_default_models()
+        .into_iter()
+        .find(|model| {
+            model.category == ModelCategory::Tts
+                && (model.id == model_ref || model.source.repo_id.as_deref() == Some(model_ref))
+        })
+        .and_then(|model| model.runtime.quantization.as_deref().and_then(quant_bits_from_label))
+}
+
+fn requested_quant_bits(model_ref: &str) -> Option<i64> {
+    quant_bits_from_label(model_ref).or_else(|| catalog_quant_bits(model_ref))
+}
+
+fn path_matches_model_ref(path: &std::path::Path, model_ref: &str) -> bool {
+    let lower = model_ref.to_lowercase();
+    let path_lower = path.to_string_lossy().to_lowercase();
+
+    if let Some(bits) = requested_quant_bits(model_ref) {
+        return detect_quant_bits(path) == Some(bits)
+            || path_lower.contains(&format!("{bits}bit"))
+            || path_lower.contains(&format!("{bits}-bit"));
+    }
+
+    let leaf = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    let normalized_leaf = leaf.replace(['-', '_'], "");
+    let normalized_path = path_lower.replace(['-', '_'], "");
+    path_lower.contains(leaf) || normalized_path.contains(&normalized_leaf)
+}
+
+fn path_matches_requested_model(
+    path: &std::path::Path,
+    model_ref: &str,
+    variant: TtsVariant,
+) -> bool {
+    path_matches_variant(path, variant) && path_matches_model_ref(path, model_ref)
+}
+
+fn collect_tts_candidates() -> Vec<std::path::PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
     let search_dirs = [
         home.join(".OminiX").join("models"),
         home.join(".ominix").join("models"),
     ];
+
+    let mut candidates = Vec::new();
     for dir in &search_dirs {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            let mut candidates = Vec::new();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_lowercase();
-                if !path.is_dir() {
-                    continue;
-                }
-                // Direct match (first level)
-                if name.contains("tts") && name.contains(variant) {
-                    candidates.push(path.clone());
-                }
-                // Search one level deeper (e.g. ~/.OminiX/models/qwen3-tts-mlx/<variant-dir>)
-                if name.contains("tts") {
-                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                        for sub in sub_entries.flatten() {
-                            let sub_path = sub.path();
-                            let sub_name = sub.file_name().to_string_lossy().to_lowercase();
-                            if sub_path.is_dir()
-                                && sub_name.contains(variant)
-                                && has_qwen3_tts_weights(&sub_path)
-                            {
-                                candidates.push(sub_path);
-                            }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            if detect_tts_variant(&path).is_some() && has_qwen3_tts_weights(&path) {
+                candidates.push(path.clone());
+            }
+
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if name.contains("tts") {
+                if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                    for sub in sub_entries.flatten() {
+                        let sub_path = sub.path();
+                        if sub_path.is_dir()
+                            && detect_tts_variant(&sub_path).is_some()
+                            && has_qwen3_tts_weights(&sub_path)
+                        {
+                            candidates.push(sub_path);
                         }
                     }
                 }
             }
-
-            candidates.sort_by_key(|path| {
-                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                (
-                    !has_qwen3_tts_weights(path),
-                    !name.to_lowercase().contains("8bit"),
-                    name.len(),
-                )
-            });
-
-            if let Some(path) = candidates.into_iter().next() {
-                return Some(path.to_string_lossy().to_string());
-            }
         }
     }
-    None
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn resolve_configured_tts_model(
+    model_ref: &str,
+    variant: TtsVariant,
+) -> Option<std::path::PathBuf> {
+    match model_config::check_model(model_ref, ModelCategory::Tts) {
+        ModelAvailability::Ready {
+            local_path: Some(path),
+            ..
+        } if path_matches_requested_model(&path, model_ref, variant) => Some(path),
+        _ => None,
+    }
+}
+
+fn resolve_catalog_tts_model(
+    model_ref: &str,
+    variant: TtsVariant,
+) -> Option<std::path::PathBuf> {
+    let model = crate::model_registry::get_default_models()
+        .into_iter()
+        .find(|model| {
+            model.category == ModelCategory::Tts
+                && (model.id == model_ref || model.source.repo_id.as_deref() == Some(model_ref))
+        })?;
+    let path = std::path::PathBuf::from(crate::utils::expand_tilde(&model.storage.local_path));
+    path_matches_requested_model(&path, model_ref, variant).then_some(path)
+}
+
+fn resolve_exact_tts_model(
+    model_ref: &str,
+    variant: TtsVariant,
+) -> Option<std::path::PathBuf> {
+    let expanded = crate::utils::expand_tilde(model_ref);
+    let path = std::path::PathBuf::from(&expanded);
+    if path.is_dir() && path_matches_variant(&path, variant) {
+        return Some(path);
+    }
+
+    if let Some(path) = resolve_configured_tts_model(model_ref, variant) {
+        return Some(path);
+    }
+
+    if let Some(path) = resolve_catalog_tts_model(model_ref, variant) {
+        return Some(path);
+    }
+
+    if let Some(path) = crate::utils::resolve_from_hub_cache(model_ref) {
+        if path_matches_requested_model(&path, model_ref, variant) {
+            return Some(path);
+        }
+    }
+
+    collect_tts_candidates()
+        .into_iter()
+        .filter(|path| path_matches_variant(path, variant))
+        .find(|path| path_matches_model_ref(path, model_ref))
+}
+
+/// Search standard model directories for a TTS model variant.
+/// Searches both first-level and second-level subdirectories under each base dir.
+fn find_tts_model(variant: TtsVariant) -> Option<String> {
+    let mut candidates: Vec<_> = collect_tts_candidates()
+        .into_iter()
+        .filter(|path| path_matches_variant(path, variant))
+        .collect();
+
+    candidates.sort_by_key(|path| {
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        (!name.to_lowercase().contains("8bit"), name.len())
+    });
+
+    candidates
+        .into_iter()
+        .next()
+        .map(|path| path.to_string_lossy().to_string())
 }
 
 // ── Engine ensure helpers ─────────────────────────────────────────
 
-/// Ensure the engine is loaded with CustomVoice variant. Swaps if needed.
-fn ensure_customvoice<'a>(
+/// Ensure the engine is loaded with the requested variant. Swaps if needed.
+fn ensure_variant<'a>(
     engine: &'a mut Option<qwen3_tts::Qwen3TtsEngine>,
-    variant: &mut Option<TtsVariant>,
+    current_variant: &mut Option<TtsVariant>,
+    current_path: &mut Option<String>,
+    desired_variant: TtsVariant,
+    requested_path: Option<std::path::PathBuf>,
 ) -> Option<&'a mut qwen3_tts::Qwen3TtsEngine> {
-    if *variant == Some(TtsVariant::CustomVoice) && engine.is_some() {
+    let path = requested_path
+        .map(|path| path.to_string_lossy().to_string())
+        .or_else(|| find_tts_model(desired_variant))?;
+
+    if *current_variant == Some(desired_variant)
+        && current_path.as_deref() == Some(path.as_str())
+        && engine.is_some()
+    {
         return engine.as_mut();
     }
 
-    let path = find_tts_model("customvoice")?;
-
     if let Some(ref mut e) = engine {
         // Swap talker in-place (reuse decoder + tokenizer)
-        tracing::info!("TTS: swapping to CustomVoice model: {path}");
+        tracing::info!("TTS: swapping to {desired_variant} model: {path}");
         match e.swap_model(&path) {
             Ok(()) => {
-                *variant = Some(TtsVariant::CustomVoice);
+                *current_variant = Some(desired_variant);
+                *current_path = Some(path);
                 return engine.as_mut();
             }
             Err(e) => {
-                tracing::error!("TTS: failed to swap to CustomVoice: {e}");
+                tracing::error!("TTS: failed to swap to {desired_variant}: {e}");
                 return None;
             }
         }
     }
 
     // Cold start — load from scratch
-    tracing::info!("TTS: loading CustomVoice model: {path}");
+    tracing::info!("TTS: loading {desired_variant} model: {path}");
     match qwen3_tts::Qwen3TtsEngine::new(&path) {
         Ok(e) => {
             *engine = Some(e);
-            *variant = Some(TtsVariant::CustomVoice);
+            *current_variant = Some(desired_variant);
+            *current_path = Some(path);
             engine.as_mut()
         }
         Err(e) => {
-            tracing::error!("TTS: failed to load CustomVoice: {e}");
+            tracing::error!("TTS: failed to load {desired_variant}: {e}");
             None
         }
     }
+}
+
+/// Ensure the engine is loaded with CustomVoice variant. Swaps if needed.
+fn ensure_customvoice<'a>(
+    engine: &'a mut Option<qwen3_tts::Qwen3TtsEngine>,
+    variant: &mut Option<TtsVariant>,
+    current_path: &mut Option<String>,
+) -> Option<&'a mut qwen3_tts::Qwen3TtsEngine> {
+    ensure_variant(engine, variant, current_path, TtsVariant::CustomVoice, None)
 }
 
 /// Ensure the engine is loaded with Base variant (voice cloning). Swaps if needed.
 fn ensure_base<'a>(
     engine: &'a mut Option<qwen3_tts::Qwen3TtsEngine>,
     variant: &mut Option<TtsVariant>,
+    current_path: &mut Option<String>,
 ) -> Option<&'a mut qwen3_tts::Qwen3TtsEngine> {
-    if *variant == Some(TtsVariant::Base) && engine.is_some() {
-        return engine.as_mut();
-    }
-
-    let path = find_tts_model("base")?;
-
-    if let Some(ref mut e) = engine {
-        // Swap talker in-place (reuse decoder + tokenizer)
-        tracing::info!("TTS: swapping to Base model: {path}");
-        match e.swap_model(&path) {
-            Ok(()) => {
-                *variant = Some(TtsVariant::Base);
-                return engine.as_mut();
-            }
-            Err(e) => {
-                tracing::error!("TTS: failed to swap to Base: {e}");
-                return None;
-            }
-        }
-    }
-
-    // Cold start — load from scratch
-    tracing::info!("TTS: loading Base model: {path}");
-    match qwen3_tts::Qwen3TtsEngine::new(&path) {
-        Ok(e) => {
-            *engine = Some(e);
-            *variant = Some(TtsVariant::Base);
-            engine.as_mut()
-        }
-        Err(e) => {
-            tracing::error!("TTS: failed to load Base model: {e}");
-            None
-        }
-    }
+    ensure_variant(engine, variant, current_path, TtsVariant::Base, None)
 }
 
 // ── Qwen3-TTS engine holder (used by inference thread) ─────────────
@@ -268,6 +434,7 @@ fn ensure_base<'a>(
 pub struct Qwen3TtsEngines {
     engine: Option<qwen3_tts::Qwen3TtsEngine>,
     variant: Option<TtsVariant>,
+    current_path: Option<String>,
     /// Cached reference audio samples for per-sentence voice cloning.
     cached_clone_ref: Option<Vec<f32>>,
 }
@@ -278,11 +445,16 @@ impl Qwen3TtsEngines {
         let mut engines = Self {
             engine: None,
             variant: None,
+            current_path: None,
             cached_clone_ref: None,
         };
         if eager_load {
             tracing::info!("Qwen3-TTS: eager-loading default model (CustomVoice)...");
-            ensure_customvoice(&mut engines.engine, &mut engines.variant);
+            ensure_customvoice(
+                &mut engines.engine,
+                &mut engines.variant,
+                &mut engines.current_path,
+            );
             let ok = engines.engine.is_some();
             tracing::info!("Qwen3-TTS: eager load complete (loaded={ok})");
         }
@@ -292,25 +464,45 @@ impl Qwen3TtsEngines {
     /// Explicitly load the appropriate engine for a model ID.
     /// Returns Ok if the engine was loaded (or was already loaded), Err if not found.
     pub fn load_model(&mut self, model_id: &str) -> eyre::Result<String> {
-        if model_id.contains("base") {
-            match ensure_base(&mut self.engine, &mut self.variant) {
-                Some(_) => Ok("Qwen3-TTS Base loaded".to_string()),
-                None => Err(eyre::eyre!("Qwen3-TTS Base model not found on disk. Expected a directory containing 'tts' and 'base' under ~/.OminiX/models/")),
-            }
-        } else {
-            match ensure_customvoice(&mut self.engine, &mut self.variant) {
-                Some(_) => Ok("Qwen3-TTS CustomVoice loaded".to_string()),
-                None => Err(eyre::eyre!("Qwen3-TTS CustomVoice model not found on disk. Expected a directory containing 'tts' and 'customvoice' under ~/.OminiX/models/")),
-            }
+        let desired_variant = TtsVariant::from_model_ref(model_id);
+        let requested_path = resolve_exact_tts_model(model_id, desired_variant).ok_or_else(|| {
+            eyre::eyre!(
+                "Qwen3-TTS {desired_variant} model not found for '{model_id}'. Expected a model directory with qwen3_tts config and weights under ~/.OminiX/models/"
+            )
+        })?;
+        let loaded_path = requested_path.to_string_lossy().to_string();
+
+        match ensure_variant(
+            &mut self.engine,
+            &mut self.variant,
+            &mut self.current_path,
+            desired_variant,
+            Some(requested_path),
+        ) {
+            Some(_) => Ok(format!("Qwen3-TTS {desired_variant} loaded: {loaded_path}")),
+            None => Err(eyre::eyre!(
+                "Failed to load Qwen3-TTS {desired_variant} model: {loaded_path}"
+            )),
+        }
+    }
+
+    pub fn unload(&mut self) -> Option<String> {
+        let prev_variant = self.variant.take().map(|variant| variant.as_str().to_string());
+        let prev_path = self.current_path.take();
+        self.engine = None;
+        self.cached_clone_ref = None;
+
+        match (prev_variant, prev_path) {
+            (Some(variant), Some(path)) => Some(format!("{variant} ({path})")),
+            (Some(variant), None) => Some(variant),
+            (None, Some(path)) => Some(path),
+            (None, None) => None,
         }
     }
 
     /// Currently loaded variant name, for status reporting.
     pub fn current_variant_name(&self) -> Option<&'static str> {
-        self.variant.map(|v| match v {
-            TtsVariant::CustomVoice => "customvoice",
-            TtsVariant::Base => "base",
-        })
+        self.variant.map(TtsVariant::as_str)
     }
 
     /// Handle a TTS request inline (called from the inference thread).
@@ -326,8 +518,12 @@ impl Qwen3TtsEngines {
                             .decode(b64)
                             .map_err(|e| eyre::eyre!("Invalid base64 in reference_audio: {e}"))?;
                         let tmp = ref_audio_to_tempfile(&raw)?;
-                        let engine = ensure_base(&mut self.engine, &mut self.variant)
-                            .ok_or_else(|| eyre::eyre!("Base TTS model not found on disk"))?;
+                        let engine = ensure_base(
+                            &mut self.engine,
+                            &mut self.variant,
+                            &mut self.current_path,
+                        )
+                        .ok_or_else(|| eyre::eyre!("Base TTS model not found on disk"))?;
                         let lang = request.language.as_deref().unwrap_or("chinese");
                         engine.synthesize_clone(
                             &request.input,
@@ -338,7 +534,11 @@ impl Qwen3TtsEngines {
                         )
                     })()
                 } else {
-                    let engine = ensure_customvoice(&mut self.engine, &mut self.variant);
+                    let engine = ensure_customvoice(
+                        &mut self.engine,
+                        &mut self.variant,
+                        &mut self.current_path,
+                    );
                     match engine {
                         Some(e) => e.synthesize(&request),
                         None => Err(eyre::eyre!("CustomVoice TTS model not found on disk")),
@@ -350,8 +550,12 @@ impl Qwen3TtsEngines {
             TtsRequest::SpeechClone { request, response_tx } => {
                 let result = (|| -> eyre::Result<Vec<u8>> {
                     let tmp = ref_audio_to_tempfile(&request.reference_audio)?;
-                    let engine = ensure_base(&mut self.engine, &mut self.variant)
-                        .ok_or_else(|| eyre::eyre!("Base TTS model not found for voice cloning"))?;
+                    let engine = ensure_base(
+                        &mut self.engine,
+                        &mut self.variant,
+                        &mut self.current_path,
+                    )
+                    .ok_or_else(|| eyre::eyre!("Base TTS model not found for voice cloning"))?;
                     engine.synthesize_clone(
                         &request.input,
                         tmp.path().to_str().unwrap(),
@@ -364,7 +568,11 @@ impl Qwen3TtsEngines {
             }
 
             TtsRequest::SpeechOneSentence { sentence, voice, language, speed, instruct, response_tx } => {
-                let result = match ensure_customvoice(&mut self.engine, &mut self.variant) {
+                let result = match ensure_customvoice(
+                    &mut self.engine,
+                    &mut self.variant,
+                    &mut self.current_path,
+                ) {
                     Some(engine) => engine.synthesize_one_sentence(
                         &sentence,
                         &voice,
@@ -385,8 +593,12 @@ impl Qwen3TtsEngines {
                     )?;
                     self.cached_clone_ref = Some(ref_samples);
                     // Ensure base engine is loaded
-                    ensure_base(&mut self.engine, &mut self.variant)
-                        .ok_or_else(|| eyre::eyre!("Base TTS model not found for voice cloning"))?;
+                    ensure_base(
+                        &mut self.engine,
+                        &mut self.variant,
+                        &mut self.current_path,
+                    )
+                    .ok_or_else(|| eyre::eyre!("Base TTS model not found for voice cloning"))?;
                     Ok(())
                 })();
                 let _ = response_tx.send(result);
@@ -401,7 +613,13 @@ impl Qwen3TtsEngines {
                     // Ensure Base variant is active (may need to swap back if interleaved)
                     if self.variant != Some(TtsVariant::Base) {
                         tracing::warn!("TTS: clone sentence found non-Base model loaded, swapping back");
-                        if ensure_base(&mut self.engine, &mut self.variant).is_none() {
+                        if ensure_base(
+                            &mut self.engine,
+                            &mut self.variant,
+                            &mut self.current_path,
+                        )
+                        .is_none()
+                        {
                             let _ = response_tx.send(Err(eyre::eyre!("Failed to swap back to Base model")));
                             return;
                         }
