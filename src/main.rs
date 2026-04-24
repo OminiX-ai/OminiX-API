@@ -35,6 +35,7 @@ mod training;
 mod types;
 mod utils;
 mod version;
+mod voice_registry;
 
 use config::Config;
 use inference::{InferenceRequest, TtsPoolConfig};
