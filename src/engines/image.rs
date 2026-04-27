@@ -36,6 +36,7 @@ use qwen_image_mlx::{
     QwenQuantizedTransformer, QwenConfig, QwenVAE, QwenTextEncoder,
     load_text_encoder, load_vae_from_dir, load_transformer_weights,
     FlowMatchEulerScheduler,
+    pack_latents, unpack_latents, build_edit_rope, ref_shape_from_latent,
 };
 
 use crate::types::{ImageGenerationRequest, ImageGenerationResponse, ImageData};
@@ -137,8 +138,7 @@ impl ImageEngine {
     /// to download from HuggingFace Hub.
     pub fn new(model_id: &str) -> Result<Self> {
         tracing::info!("Initializing image generation engine: {}", model_id);
-        let mem_before = mlx_rs_core::memory::memory_snapshot();
-        tracing::info!("GPU memory before load: {}", mem_before);
+        tracing::info!("Loading image model...");
 
         // Determine model type from the user-provided model ID
         let model_type = ImageModelType::from_model_id(model_id);
@@ -224,12 +224,8 @@ impl ImageEngine {
         let is_quantized_flux = model_type == ImageModelType::FluxKlein
             && model_dir.join("transformer/quantized_8bit.safetensors").exists();
 
-        // Pre-flight memory check — fail fast if clearly insufficient
         let estimated = Self::estimated_vram(model_type, is_quantized_flux);
-        if let Err(msg) = mlx_rs_core::memory::preflight_check(estimated) {
-            tracing::warn!("Memory preflight warning: {}", msg);
-            // Don't fail — the estimate is conservative and MLX may manage. Just warn.
-        }
+        tracing::info!("Estimated VRAM: {:.1}GB", estimated as f64 / 1e9);
 
         // Get paths and configs based on model type
         let (transformer_path, text_encoder_paths, vae_path, tokenizer_path, vae_config) = match model_type {
@@ -449,10 +445,7 @@ impl ImageEngine {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| eyre::eyre!("Failed to load tokenizer: {}", e))?;
 
-        let mem_after = mlx_rs_core::memory::memory_snapshot();
-        tracing::info!("Image engine ready. GPU memory: {} (loaded {:.1}MB)",
-            mem_after,
-            (mem_after.active as f64 - mem_before.active as f64) / 1e6);
+        tracing::info!("Image engine ready");
 
         Ok(Self {
             model_type,
@@ -516,8 +509,7 @@ impl ImageEngine {
 
     /// Generate images from a text prompt (with optional reference image for img2img)
     pub fn generate(&mut self, request: &ImageGenerationRequest) -> Result<ImageGenerationResponse> {
-        let gen_start_mem = mlx_rs_core::memory::memory_snapshot();
-        tracing::debug!("Generate start: {}", gen_start_mem);
+        tracing::debug!("Generate start");
 
         let (width, height) = parse_size(&request.size)?;
 
@@ -560,11 +552,7 @@ impl ImageEngine {
             });
         }
 
-        let gen_end_mem = mlx_rs_core::memory::memory_snapshot();
-        tracing::info!("Generate done: {} (delta {:.1}MB, peak {:.1}MB)",
-            gen_end_mem,
-            (gen_end_mem.active as f64 - gen_start_mem.active as f64) / 1e6,
-            gen_end_mem.peak as f64 / 1e6);
+        tracing::info!("Generate done ({} images)", data.len());
 
         Ok(ImageGenerationResponse {
             created: chrono::Utc::now().timestamp(),
@@ -584,25 +572,43 @@ impl ImageEngine {
         // Parse image (PNG/JPEG) using simple decoder
         let img = image::load_from_memory(&image_bytes)
             .context("Failed to parse image")?
-            .resize_exact(width, height, image::imageops::FilterType::Lanczos3)
-            .to_rgb8();
+            .resize_exact(width, height, image::imageops::FilterType::Lanczos3);
 
-        // Convert to MLX array [1, H, W, 3] in range [-1, 1]
-        let pixels: Vec<f32> = img.pixels()
-            .flat_map(|p| p.0.iter().map(|&v| (v as f32 / 127.5) - 1.0))
-            .collect();
+        match self.model_type {
+            ImageModelType::QwenImage => {
+                // Qwen VAE expects [B, 4, H, W] (RGBA, channels-first, [-1,1])
+                let rgba = img.to_rgba8();
+                let pixels: Vec<f32> = rgba.pixels()
+                    .flat_map(|p| p.0.iter().map(|&v| (v as f32 / 127.5) - 1.0))
+                    .collect();
+                // [1, H, W, 4] -> transpose to [1, 4, H, W]
+                let input = Array::from_slice(&pixels, &[1, height as i32, width as i32, 4]);
+                let input = input.transpose_axes(&[0, 3, 1, 2])
+                    .map_err(|e| eyre::eyre!("Transpose failed: {e}"))?;
 
-        let input = Array::from_slice(&pixels, &[1, height as i32, width as i32, 3]);
-
-        // Encode through VAE
-        let vae_encoder = self.vae_encoder.as_mut()
-            .ok_or_else(|| eyre::eyre!("VAE encoder not available for this model type"))?;
-        let latents = vae_encoder.encode_deterministic(&input)?;
-        latents.eval()?;
-
-        tracing::debug!("Encoded reference image to latents: {:?}", latents.shape());
-
-        Ok(latents)
+                let qwen_vae = self.qwen_vae.as_mut()
+                    .ok_or_else(|| eyre::eyre!("Qwen VAE not loaded"))?;
+                let latents = qwen_vae.encode(&input)
+                    .map_err(|e| eyre::eyre!("Qwen VAE encode failed: {e}"))?;
+                latents.eval().map_err(|e| eyre::eyre!("Eval failed: {e}"))?;
+                tracing::debug!("Qwen VAE encoded ref image to latents: {:?}", latents.shape());
+                Ok(latents)
+            }
+            _ => {
+                let img = img.to_rgb8();
+                // Convert to MLX array [1, H, W, 3] in range [-1, 1]
+                let pixels: Vec<f32> = img.pixels()
+                    .flat_map(|p| p.0.iter().map(|&v| (v as f32 / 127.5) - 1.0))
+                    .collect();
+                let input = Array::from_slice(&pixels, &[1, height as i32, width as i32, 3]);
+                let vae_encoder = self.vae_encoder.as_mut()
+                    .ok_or_else(|| eyre::eyre!("VAE encoder not available for this model type"))?;
+                let latents = vae_encoder.encode_deterministic(&input)?;
+                latents.eval()?;
+                tracing::debug!("Encoded reference image to latents: {:?}", latents.shape());
+                Ok(latents)
+            }
+        }
     }
 
     /// Generate image with img2img (starting from reference latents)
@@ -610,7 +616,7 @@ impl ImageEngine {
         match self.model_type {
             ImageModelType::FluxKlein => self.generate_flux(prompt, width, height, Some(ref_latents), strength),
             ImageModelType::ZImageTurbo => self.generate_zimage(prompt, width, height, Some(ref_latents), strength),
-            ImageModelType::QwenImage => Err(eyre::eyre!("img2img not supported for Qwen-Image")),
+            ImageModelType::QwenImage => self.generate_qwen_image_edit(prompt, width, height, ref_latents),
         }
     }
 
@@ -735,7 +741,7 @@ impl ImageEngine {
         if self.is_quantized_flux {
             tracing::info!("Dropping text encoder to free memory for denoising...");
             self.text_encoder = None;
-            mlx_rs_core::memory::clear_cache();
+            unsafe { mlx_sys::mlx_clear_cache(); }
         }
 
         // Setup latent dimensions
@@ -792,7 +798,7 @@ impl ImageEngine {
             let dt = t_next - t_curr;
             let scaled_v = ops::multiply(&v_pred, &Array::from_slice(&[dt], &[1]))?;
             latent = ops::add(&latent, &scaled_v)?;
-            mlx_rs_core::memory::eval_with_retry(&[&latent], 2)
+            latent.eval()
                 .map_err(|e| eyre::eyre!("Denoising step eval failed: {e}"))?;
 
             tracing::info!("  Step {}/{}: t={:.3}->{:.3}", step + 1, num_steps, t_curr, t_next);
@@ -808,7 +814,7 @@ impl ImageEngine {
 
         let vae_decoder = self.vae_decoder.as_mut().expect("FLUX VAE decoder must be present");
         let image = vae_decoder.forward(&latent_for_vae)?;
-        mlx_rs_core::memory::eval_with_retry(&[&image], 2)
+        image.eval()
             .map_err(|e| eyre::eyre!("VAE decode eval failed: {e}"))?;
         tracing::info!("VAE decode complete, shape: {:?}", image.shape());
 
@@ -837,33 +843,61 @@ impl ImageEngine {
             .map_err(|e| eyre::eyre!("Failed to load Qwen-Image text encoder: {e}"))?;
         tracing::info!("Qwen-Image text encoder loaded");
 
-        // Load transformer from sharded safetensors
+        // Load transformer weights — auto-detect GGUF (single file) vs sharded safetensors
         tracing::info!("Loading Qwen-Image transformer ({}-bit)...", qwen_config.quantization_bits);
-        let transformer_dir = model_dir.join("transformer");
-        let index_path = transformer_dir.join("model.safetensors.index.json");
-        if !index_path.exists() {
-            return Err(eyre::eyre!("Qwen-Image transformer index not found: {:?}", index_path));
-        }
-        let index_content = std::fs::read_to_string(&index_path)
-            .context("Failed to read transformer index")?;
-        let index: serde_json::Value = serde_json::from_str(&index_content)
-            .context("Failed to parse transformer index")?;
-        let weight_map = index["weight_map"].as_object()
-            .ok_or_else(|| eyre::eyre!("Invalid transformer index format"))?;
-        let mut shard_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for file in weight_map.values() {
-            if let Some(f) = file.as_str() {
-                shard_files.insert(f.to_string());
+        let all_weights: HashMap<String, Array>;
+
+        // Try GGUF first (edit model uses single .gguf file)
+        let gguf_candidates: Vec<_> = std::fs::read_dir(&model_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_lowercase();
+                name.ends_with(".gguf") && (name.contains("edit") || name.contains("diffusion"))
+            })
+            .collect();
+
+        if let Some(gguf_entry) = gguf_candidates.first() {
+            let gguf_path = gguf_entry.path();
+            tracing::info!("  Loading transformer from GGUF: {:?}", gguf_path);
+            all_weights = Array::load_gguf(&gguf_path)
+                .map_err(|e| eyre::eyre!("Failed to load GGUF: {e}"))?;
+            tracing::info!("  GGUF loaded ({} tensors)", all_weights.len());
+        } else {
+            // Fall back to sharded safetensors
+            let transformer_dir = model_dir.join("transformer");
+            let index_path = transformer_dir.join("model.safetensors.index.json");
+            if !index_path.exists() {
+                return Err(eyre::eyre!(
+                    "No GGUF or safetensors index found in {:?}. \
+                     Expected *edit*.gguf or transformer/model.safetensors.index.json",
+                    model_dir
+                ));
             }
+            let index_content = std::fs::read_to_string(&index_path)
+                .context("Failed to read transformer index")?;
+            let index: serde_json::Value = serde_json::from_str(&index_content)
+                .context("Failed to parse transformer index")?;
+            let weight_map = index["weight_map"].as_object()
+                .ok_or_else(|| eyre::eyre!("Invalid transformer index format"))?;
+            let mut shard_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for file in weight_map.values() {
+                if let Some(f) = file.as_str() {
+                    shard_files.insert(f.to_string());
+                }
+            }
+            let mut weights = HashMap::new();
+            for shard in &shard_files {
+                let shard_path = transformer_dir.join(shard);
+                tracing::info!("  Loading transformer shard: {}", shard);
+                let w = load_safetensors(&shard_path)
+                    .map_err(|e| eyre::eyre!("Failed to load shard {}: {}", shard, e))?;
+                weights.extend(w);
+            }
+            all_weights = weights;
         }
-        let mut all_weights: HashMap<String, Array> = HashMap::new();
-        for shard in &shard_files {
-            let shard_path = transformer_dir.join(shard);
-            tracing::info!("  Loading transformer shard: {}", shard);
-            let weights = load_safetensors(&shard_path)
-                .map_err(|e| eyre::eyre!("Failed to load transformer shard {}: {}", shard, e))?;
-            all_weights.extend(weights);
-        }
+
         let mut transformer = QwenQuantizedTransformer::new(qwen_config.clone())
             .map_err(|e| eyre::eyre!("Failed to create Qwen-Image transformer: {e}"))?;
         load_transformer_weights(&mut transformer, all_weights)
@@ -1015,6 +1049,227 @@ impl ImageEngine {
         let image = image.transpose_axes(&[0, 2, 3, 1])
             .map_err(|e| eyre::eyre!("Image transpose failed: {e}"))?;
         image.eval().map_err(|e| eyre::eyre!("Image eval failed: {e}"))?;
+
+        let shape = image.shape();
+        let out_height = shape[1] as u32;
+        let out_width = shape[2] as u32;
+        let image_flat = image.reshape(&[-1])
+            .map_err(|e| eyre::eyre!("Flatten failed: {e}"))?;
+        let image_data: Vec<f32> = image_flat.as_slice().to_vec();
+        let rgb_bytes: Vec<u8> = image_data.iter().map(|&v| v.round() as u8).collect();
+
+        rgb_to_png(&rgb_bytes, out_width, out_height)
+    }
+
+    /// Generate an edited image using Qwen-Image-Edit with reference latents.
+    /// ref_latents: VAE-encoded reference image [1, 16, H/8, W/8] (already normalized)
+    /// P0: CFG batched — cond+uncond run as batch=2 in a single forward, halving
+    /// weight-bandwidth pressure on the Q4_K_M projections.
+    fn generate_qwen_image_edit(
+        &mut self,
+        prompt: &str,
+        width: u32,
+        height: u32,
+        ref_latents: &Array,
+    ) -> Result<Vec<u8>> {
+        use mlx_rs::ops;
+
+        let batch = 1i32;
+        let num_steps = 20i32;
+        let cfg_scale = 2.5f32;
+        let latent_channels = 16i32;
+        let latent_h = height as i32 / 8;
+        let latent_w = width as i32 / 8;
+
+        tracing::info!("Encoding text prompts for CFG...");
+        let (pos_embeds, neg_embeds) = match self.text_encoder.as_mut() {
+            Some(TextEncoderVariant::QwenImage(enc)) => {
+                // Positive prompt
+                let chat_pos = format!(
+                    "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                    prompt
+                );
+                let enc_pos = self.tokenizer.encode(chat_pos.as_str(), true)
+                    .map_err(|e| eyre::eyre!("Tokenization failed: {e}"))?;
+                let ids_pos: Vec<i32> = enc_pos.get_ids().iter().map(|&x| x as i32).collect();
+                let input_pos = Array::from_slice(&ids_pos, &[batch, ids_pos.len() as i32]);
+                let pos = enc.forward(&input_pos)
+                    .map_err(|e| eyre::eyre!("Text encoding failed: {e}"))?
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .map_err(|e| eyre::eyre!("Cast failed: {e}"))?;
+                pos.eval().map_err(|e| eyre::eyre!("Eval failed: {e}"))?;
+
+                // Negative prompt (empty string)
+                let chat_neg = "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+                let enc_neg = self.tokenizer.encode(chat_neg, true)
+                    .map_err(|e| eyre::eyre!("Tokenization failed: {e}"))?;
+                let ids_neg: Vec<i32> = enc_neg.get_ids().iter().map(|&x| x as i32).collect();
+                let input_neg = Array::from_slice(&ids_neg, &[batch, ids_neg.len() as i32]);
+                let neg = enc.forward(&input_neg)
+                    .map_err(|e| eyre::eyre!("Text encoding failed: {e}"))?
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .map_err(|e| eyre::eyre!("Cast failed: {e}"))?;
+                neg.eval().map_err(|e| eyre::eyre!("Eval failed: {e}"))?;
+
+                (pos, neg)
+            }
+            _ => return Err(eyre::eyre!("Expected QwenImage text encoder")),
+        };
+
+        // P0: Pad cond/uncond to same length, stack as batch=2
+        let t_pos = pos_embeds.dim(1);
+        let t_neg = neg_embeds.dim(1);
+        let t_max = t_pos.max(t_neg);
+        let d = pos_embeds.dim(2);
+        let pos_padded = if t_pos < t_max {
+            let pad = Array::zeros::<f32>(&[1, t_max - t_pos, d])
+                .map_err(|e| eyre::eyre!("Pad alloc failed: {e}"))?;
+            ops::concatenate_axis(&[&pos_embeds, &pad], 1)
+                .map_err(|e| eyre::eyre!("Concat failed: {e}"))?
+        } else {
+            pos_embeds.clone()
+        };
+        let neg_padded = if t_neg < t_max {
+            let pad = Array::zeros::<f32>(&[1, t_max - t_neg, d])
+                .map_err(|e| eyre::eyre!("Pad alloc failed: {e}"))?;
+            ops::concatenate_axis(&[&neg_embeds, &pad], 1)
+                .map_err(|e| eyre::eyre!("Concat failed: {e}"))?
+        } else {
+            neg_embeds.clone()
+        };
+        let batched_prompt = ops::concatenate_axis(&[&pos_padded, &neg_padded], 0)
+            .map_err(|e| eyre::eyre!("Batch concat failed: {e}"))?; // [2, T, D]
+
+        // Build txt padding mask [2, T]: 1=real, 0=pad
+        let pos_mask_vals: Vec<f32> = (0..t_max).map(|i| if i < t_pos { 1.0 } else { 0.0 }).collect();
+        let neg_mask_vals: Vec<f32> = (0..t_max).map(|i| if i < t_neg { 1.0 } else { 0.0 }).collect();
+        let pos_mask = Array::from_slice(&pos_mask_vals, &[1, t_max]);
+        let neg_mask = Array::from_slice(&neg_mask_vals, &[1, t_max]);
+        let txt_pad_mask = ops::concatenate_axis(&[&pos_mask, &neg_mask], 0)
+            .map_err(|e| eyre::eyre!("Mask concat failed: {e}"))?; // [2, T]
+
+        tracing::info!("CFG batched: pos_len={}, neg_len={}, padded={}, cfg_scale={}", t_pos, t_neg, t_max, cfg_scale);
+
+        // Pack reference latents: [1, 16, H/8, W/8] -> [1, ref_seq, 64]
+        let ref_latent_h = ref_latents.dim(2);
+        let ref_latent_w = ref_latents.dim(3);
+        let ref_5d = ref_latents.reshape(&[batch, latent_channels, 1, ref_latent_h, ref_latent_w])
+            .map_err(|e| eyre::eyre!("Ref reshape failed: {e}"))?;
+        let ref_packed = pack_latents(&ref_5d)
+            .map_err(|e| eyre::eyre!("Ref pack failed: {e}"))?;
+        ref_packed.eval().map_err(|e| eyre::eyre!("Eval failed: {e}"))?;
+        tracing::info!("Ref latent packed: {:?}", ref_packed.shape());
+
+        let ref_shape = ref_shape_from_latent(ref_latent_h, ref_latent_w);
+
+        // Build edit RoPE (uses max of pos/neg seq lengths for text)
+        let img_shape = (1i32, latent_h / 2, latent_w / 2);
+        let ((img_cos, img_sin), (txt_cos, txt_sin)) = build_edit_rope(
+            img_shape,
+            &[ref_shape],
+            t_max,
+            10000.0,
+            [16, 56, 56],
+        ).map_err(|e| eyre::eyre!("Edit RoPE build failed: {e}"))?;
+
+        // Flow-matching scheduler
+        let scheduler = FlowMatchEulerScheduler::new(num_steps, 3.0);
+
+        // Initialize noise and pack: [1, C, 1, H, W] -> [1, main_seq, 64]
+        let noise = mlx_rs::random::normal::<f32>(
+            &[batch, latent_channels, 1, latent_h, latent_w], None, None, None,
+        ).map_err(|e| eyre::eyre!("Noise init failed: {e}"))?;
+        let noise_packed = pack_latents(&noise)
+            .map_err(|e| eyre::eyre!("Pack failed: {e}"))?;
+        let mut latents = scheduler.scale_noise(&noise_packed)
+            .map_err(|e| eyre::eyre!("Scale noise failed: {e}"))?;
+
+        let main_seq = latents.dim(1);
+        let packed_dim = latents.dim(2);
+
+        // Denoising loop with batched CFG
+        tracing::info!("Running Qwen-Image edit denoising ({} steps, CFG batched)...", num_steps);
+        for (idx, &t) in scheduler.timesteps().iter().enumerate() {
+            let timestep = Array::from_slice(&[t * 1000.0], &[batch]);
+
+            unsafe { mlx_sys::mlx_clear_cache(); }
+
+            // Broadcast latents to batch=2 for CFG
+            let latents_b = ops::broadcast_to(&latents, &[2, main_seq, packed_dim])
+                .map_err(|e| eyre::eyre!("Broadcast failed: {e}"))?;
+
+            // Single forward for cond+uncond
+            let both_pred = match &mut self.transformer {
+                TransformerVariant::QwenImage(transformer, _) => {
+                    transformer.forward_edit(
+                        &latents_b,
+                        &batched_prompt,
+                        &timestep,
+                        &[&ref_packed],
+                        (&img_cos, &img_sin),
+                        (&txt_cos, &txt_sin),
+                        Some(&txt_pad_mask),
+                    ).map_err(|e| eyre::eyre!("Edit forward failed: {e}"))?
+                }
+                _ => return Err(eyre::eyre!("Expected QwenImage transformer")),
+            };
+
+            // Split batch: cond=[0:1], uncond=[1:2]
+            let cond_pred = both_pred.index((0..1, .., ..));
+            let uncond_pred = both_pred.index((1..2, .., ..));
+
+            // CFG: combined = uncond + cfg_scale * (cond - uncond)
+            let diff = ops::subtract(&cond_pred, &uncond_pred)
+                .map_err(|e| eyre::eyre!("CFG diff failed: {e}"))?;
+            let scaled = ops::multiply(&diff, &Array::from_f32(cfg_scale))
+                .map_err(|e| eyre::eyre!("CFG scale failed: {e}"))?;
+            let v_pred = ops::add(&uncond_pred, &scaled)
+                .map_err(|e| eyre::eyre!("CFG add failed: {e}"))?;
+
+            // Euler step (already in packed space)
+            latents = scheduler.step(&v_pred, idx, &latents)
+                .map_err(|e| eyre::eyre!("Scheduler step failed: {e}"))?;
+            latents.eval().map_err(|e| eyre::eyre!("Eval failed: {e}"))?;
+
+            tracing::info!("  Step {}/{}: t={:.3}", idx + 1, num_steps, t);
+        }
+
+        // Unpack: [B, seq, 64] -> [B, 16, 1, H, W] -> [B, 16, H, W]
+        let latents_5d = unpack_latents(&latents, width as i32, height as i32)
+            .map_err(|e| eyre::eyre!("Unpack failed: {e}"))?;
+        let latents_2d = {
+            use mlx_rs::ops::indexing::IndexOp;
+            let indexed = latents_5d.index((.., .., 0i32, .., ..));
+            let numel = indexed.shape().iter().map(|&d| d as usize).product::<usize>();
+            let flat = indexed.reshape(&[numel as i32])
+                .map_err(|e| eyre::eyre!("Reshape failed: {e}"))?;
+            flat.reshape(&[batch, latent_channels, latent_h, latent_w])
+                .map_err(|e| eyre::eyre!("Reshape to 2d failed: {e}"))?
+        };
+
+        // Denormalize and decode
+        let latents_2d = QwenVAE::denormalize_latent(&latents_2d)
+            .map_err(|e| eyre::eyre!("Denormalize failed: {e}"))?;
+
+        tracing::info!("Decoding Qwen-Image edit result...");
+        let image = self.qwen_vae.as_mut()
+            .ok_or_else(|| eyre::eyre!("Qwen VAE not loaded"))?
+            .decode(&latents_2d)
+            .map_err(|e| eyre::eyre!("VAE decode failed: {e}"))?;
+        image.eval().map_err(|e| eyre::eyre!("Eval failed: {e}"))?;
+
+        // Convert [B, 3, H, W] in [-1, 1] to PNG
+        let image = ops::add(&image, &Array::from_slice(&[1.0f32], &[1]))
+            .map_err(|e| eyre::eyre!("Post-proc failed: {e}"))?;
+        let image = ops::multiply(&image, &Array::from_slice(&[127.5f32], &[1]))
+            .map_err(|e| eyre::eyre!("Scale failed: {e}"))?;
+        let image = ops::maximum(&image, &Array::from_slice(&[0.0f32], &[1]))
+            .map_err(|e| eyre::eyre!("Clip min failed: {e}"))?;
+        let image = ops::minimum(&image, &Array::from_slice(&[255.0f32], &[1]))
+            .map_err(|e| eyre::eyre!("Clip max failed: {e}"))?;
+        let image = image.transpose_axes(&[0, 2, 3, 1])
+            .map_err(|e| eyre::eyre!("Transpose failed: {e}"))?;
+        image.eval().map_err(|e| eyre::eyre!("Eval failed: {e}"))?;
 
         let shape = image.shape();
         let out_height = shape[1] as u32;

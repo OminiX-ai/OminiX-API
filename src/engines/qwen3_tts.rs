@@ -146,8 +146,7 @@ impl Qwen3TtsEngine {
             .map_err(|e| eyre::eyre!("Failed to load Qwen3-TTS: {e}"))?;
 
         let model_type = synthesizer.model_type();
-        let mem = mlx_rs_core::memory::memory_snapshot();
-        tracing::info!("Qwen3-TTS loaded (type: {model_type}, GPU: {})", mem);
+        tracing::info!("Qwen3-TTS loaded (type: {model_type})");
 
         if synthesizer.speaker_encoder.is_some() {
             tracing::info!("Speaker encoder available — voice cloning enabled");

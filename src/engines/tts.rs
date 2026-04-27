@@ -193,8 +193,7 @@ impl TtsEngine {
         cloner.set_reference_audio(ref_audio_path)
             .context("Failed to set reference audio")?;
 
-        let mem = mlx_rs_core::memory::memory_snapshot();
-        tracing::info!("TTS engine initialized with reference: {} (GPU: {})", ref_audio_path, mem);
+        tracing::info!("TTS engine initialized with reference: {}", ref_audio_path);
         tracing::info!(
             "Few-shot mode: {}",
             if cloner.few_shot_available() { "available (HuBERT loaded)" } else { "unavailable (no HuBERT)" }

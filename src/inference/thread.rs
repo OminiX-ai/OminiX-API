@@ -16,9 +16,10 @@ fn load_model_slot<E, F>(
 where
     F: FnOnce(&str) -> eyre::Result<E>,
 {
-    // Drop old engine to free memory
+    // Drop old engine to free memory, then clear MLX cache
     *slot = None;
     *name = None;
+    unsafe { mlx_sys::mlx_clear_cache(); }
 
     let engine = loader(model_id)?;
     tracing::info!("Model loaded successfully: {}", model_id);
@@ -323,6 +324,11 @@ pub fn inference_thread(
                     }
                     _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, qwen3_tts, image, vlm, or all", model_type)),
                 };
+                // Free MLX GPU memory cache after dropping model weights
+                if result.is_ok() {
+                    unsafe { mlx_sys::mlx_clear_cache(); }
+                    tracing::info!("Cleared MLX cache after unload");
+                }
                 let _ = response_tx.send(result);
             }
 

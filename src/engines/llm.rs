@@ -124,8 +124,7 @@ impl LlmEngine {
             }
         };
 
-        let mem = mlx_rs_core::memory::memory_snapshot();
-        tracing::info!("LLM model loaded (GPU: {})", mem);
+        tracing::info!("LLM model loaded");
 
         Ok(Self {
             model_type,
