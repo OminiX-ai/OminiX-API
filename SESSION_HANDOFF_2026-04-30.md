@@ -128,15 +128,96 @@ For CUDA work just `git clone https://github.com/OminiX-ai/OminiX-CUDA.git` — 
 
 ## Hosts and SSH info
 
-| Host | Role | SSH | Repo path | Notes |
-|---|---|---|---|---|
-| **ac01** | Ascend 910B (idle) | `ssh ac01` (`dev-modelarts.cn-southwest-2.huaweicloud.com:30412 ma-user`) | `/home/ma-user/work/OminiX-Ascend-w1` | Has #99 pad fix on `tmp_ac03_main` branch |
-| **ac02** | Ascend 910B (idle) | `ssh ac02` | (no repo at standard path) | Bring repo via bundle if needed |
-| **ac03** | Ascend 910B (where saga lives) | `ssh ac03` | `/home/ma-user/work/OminiX-Ascend` | HEAD `3daae48`. ALL saga + dumps live here. Working tree clean. |
-| **zgx-5b44** | NVIDIA GB10 Blackwell (CUDA QIE box) | `ssh zgx-5b44` | `/home/user1/ominix-cuda` | HEAD `86ce667a`. CUDA QIE work pushed to OminiX-CUDA main via `da979b819` merge. Pre-existing dirty files (`llm.hpp`, `tools/qwen_image_edit/CMakeLists.txt`, `tools/qwen_tts/CMakeLists.txt`) — NOT today's work, predates session. |
-| **zgx-3675** | NVIDIA GB10 Blackwell (CUDA TTS box) | `ssh zgx-3675` | `/home/user1/ominix-cuda` | HEAD `49e4db56`. CUDA TTS work pushed to OminiX-CUDA main via `3fa53afd1` merge. Pre-existing dirty files unrelated to today's work. |
+**For another agent on a fresh machine without the existing `~/.ssh/config` aliases**, here is everything needed to connect to each box. Each line gives a complete SSH command you can paste directly.
 
-ac03 SSH key: `/Users/yuechen/home/tensordock/KeyPair-4fbd-yue.pem` (per `~/.ssh/config`).
+### Ascend cluster (Huawei ModelArts notebooks)
+
+All three Ascend boxes share the same hostname (`dev-modelarts.cn-southwest-2.huaweicloud.com`), user (`ma-user`), and key (`/Users/yuechen/home/tensordock/KeyPair-4fbd-yue.pem`). They differ only by port. The key is a `.pem` file shared across all three boxes.
+
+| Host | Hostname | Port | User | Key | Role |
+|---|---|---|---|---|---|
+| **ac01** | `dev-modelarts.cn-southwest-2.huaweicloud.com` | **31984** | `ma-user` | `/Users/yuechen/home/tensordock/KeyPair-4fbd-yue.pem` | Idle. Has the OminiX-Ascend repo at `/home/ma-user/work/OminiX-Ascend-w1`. #99 pad fix lives here on branch `tmp_ac03_main` (commit `61c8e2f`). |
+| **ac02** | `dev-modelarts.cn-southwest-2.huaweicloud.com` | **31210** | `ma-user` | (same key as ac01) | Idle. No repo at standard path — bring via bundle if needed. |
+| **ac03** | `dev-modelarts.cn-southwest-2.huaweicloud.com` | **30412** | `ma-user` | (same key as ac01) | **Saga + dumps live here.** Repo at `/home/ma-user/work/OminiX-Ascend`. HEAD `3daae48`. Working tree clean. |
+
+Direct connect commands:
+
+```bash
+ssh -i /Users/yuechen/home/tensordock/KeyPair-4fbd-yue.pem -p 31984 ma-user@dev-modelarts.cn-southwest-2.huaweicloud.com  # ac01
+ssh -i /Users/yuechen/home/tensordock/KeyPair-4fbd-yue.pem -p 31210 ma-user@dev-modelarts.cn-southwest-2.huaweicloud.com  # ac02
+ssh -i /Users/yuechen/home/tensordock/KeyPair-4fbd-yue.pem -p 30412 ma-user@dev-modelarts.cn-southwest-2.huaweicloud.com  # ac03
+```
+
+If the next agent doesn't have the `.pem` key locally: it's a Huawei Cloud KeyPair. The user (Yue Chen) can re-issue or share it. The keys are NOT in the repo for security.
+
+`~/.ssh/config` aliases (for Mac local convenience):
+
+```
+Host ac01
+  HostName dev-modelarts.cn-southwest-2.huaweicloud.com
+  User ma-user
+  Port 31984
+  IdentityFile /Users/yuechen/home/tensordock/KeyPair-4fbd-yue.pem
+  StrictHostKeyChecking accept-new
+
+Host ac02
+  HostName dev-modelarts.cn-southwest-2.huaweicloud.com
+  User ma-user
+  Port 31210
+  IdentityFile /Users/yuechen/home/tensordock/KeyPair-4fbd-yue.pem
+  StrictHostKeyChecking accept-new
+
+Host ac03
+  HostName dev-modelarts.cn-southwest-2.huaweicloud.com
+  User ma-user
+  Port 30412
+  IdentityFile /Users/yuechen/home/tensordock/KeyPair-4fbd-yue.pem
+  StrictHostKeyChecking accept-new
+```
+
+### NVIDIA GB10 Blackwell cluster
+
+Both CUDA boxes share the same hostname (`163.192.33.32`), user (`user1`), and key (`~/.ssh/id_ed25519`). They differ only by port.
+
+| Host | Hostname | Port | User | Key | Role |
+|---|---|---|---|---|---|
+| **zgx-5b44** | `163.192.33.32` | **6022** | `user1` | `~/.ssh/id_ed25519` | CUDA QIE box. Repo at `/home/user1/ominix-cuda`. HEAD `86ce667a`. Pushed to OminiX-CUDA main via merge commit `da979b819`. |
+| **zgx-3675** | `163.192.33.32` | **6222** | `user1` | `~/.ssh/id_ed25519` | CUDA TTS box. Repo at `/home/user1/ominix-cuda`. HEAD `49e4db56`. Pushed to OminiX-CUDA main via merge commit `3fa53afd1`. |
+
+Direct connect commands:
+
+```bash
+ssh -i ~/.ssh/id_ed25519 -p 6022 user1@163.192.33.32  # zgx-5b44 (CUDA QIE)
+ssh -i ~/.ssh/id_ed25519 -p 6222 user1@163.192.33.32  # zgx-3675 (CUDA TTS)
+```
+
+`~/.ssh/config` aliases:
+
+```
+Host zgx-5b44
+  HostName 163.192.33.32
+  User user1
+  Port 6022
+  IdentityFile ~/.ssh/id_ed25519
+
+Host zgx-3675
+  HostName 163.192.33.32
+  User user1
+  Port 6222
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+The `id_ed25519` key is whatever ed25519 key the user uses for these boxes — typically already present on a developer machine via `ssh-keygen`. If absent, ask the user (Yue Chen) for the key. NOT in the repo.
+
+### Verify access
+
+```bash
+# Smoke test all five boxes:
+for h in ac01 ac02 ac03 zgx-5b44 zgx-3675; do
+  echo "=== $h ==="
+  ssh -o ConnectTimeout=5 -o BatchMode=yes $h 'hostname; uptime' 2>&1 | head -2
+done
+```
 
 ---
 
