@@ -3,3 +3,7 @@
 *.png
 ws_chunks/
 ws_multi_voice/
+.DS_Store
+.claude/
+tmp/
+*.bundle
