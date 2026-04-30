@@ -69,6 +69,22 @@ pub struct SpeechRequest {
 // Audio Speech Clone (Voice Cloning TTS)
 // ============================================================================
 
+/// Response body for a rejected TTS request whose `voice` field did not
+/// match any registered voice. Returned with HTTP 404 from
+/// `POST /v1/audio/tts/qwen3`. See `src/voice_registry.rs`.
+#[derive(Debug, Serialize)]
+pub struct VoiceNotFoundError {
+    /// Stable error tag: always `"voice_not_found"`.
+    pub error: &'static str,
+    /// Human-readable message including the requested voice and a hint
+    /// at the available set.
+    pub message: String,
+    /// Echo of the voice the client asked for.
+    pub requested_voice: String,
+    /// Canonical list of voices the client may request instead.
+    pub available_voices: Vec<String>,
+}
+
 /// Clone request built from multipart form fields (not JSON).
 #[derive(Debug)]
 pub struct SpeechCloneRequest {
