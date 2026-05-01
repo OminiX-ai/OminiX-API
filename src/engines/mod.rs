@@ -1,5 +1,6 @@
 pub mod ascend;
 pub mod asr;
+pub mod benchmark;
 pub mod image;
 pub mod llm;
 pub mod mflux;

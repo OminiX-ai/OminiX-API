@@ -74,6 +74,8 @@ pub fn build_router(state: AppState) -> Router {
                 .push(Router::with_path("videos/generations").post(handlers::video::videos_generations))
                 // VLM
                 .push(Router::with_path("vlm/completions").post(handlers::vlm::vlm_completions))
+                // Benchmark
+                .push(Router::with_path("benchmark").post(handlers::benchmark::run_benchmark))
                 // .push(Router::with_path("vlm/completions/ascend").post(handlers::vlm::vlm_completions_ascend))
                 // Voices
                 .push(Router::with_path("voices")

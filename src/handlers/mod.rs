@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod benchmark;
 pub mod chat;
 pub mod download;
 pub mod health;
