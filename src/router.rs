@@ -70,6 +70,8 @@ pub fn build_router(state: AppState) -> Router {
                 // Images
                 .push(Router::with_path("images/generations").post(handlers::image::images_generations))
                 // .push(Router::with_path("images/generations/ascend").post(handlers::image::images_generations_ascend))
+                // Video
+                .push(Router::with_path("videos/generations").post(handlers::video::videos_generations))
                 // VLM
                 .push(Router::with_path("vlm/completions").post(handlers::vlm::vlm_completions))
                 // .push(Router::with_path("vlm/completions/ascend").post(handlers::vlm::vlm_completions_ascend))

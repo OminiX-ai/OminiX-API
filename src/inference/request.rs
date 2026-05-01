@@ -44,6 +44,10 @@ pub enum InferenceRequest {
         request: ImageGenerationRequest,
         response_tx: oneshot::Sender<eyre::Result<ImageGenerationResponse>>,
     },
+    Video {
+        request: VideoGenerationRequest,
+        response_tx: oneshot::Sender<eyre::Result<VideoGenerationResponse>>,
+    },
     VlmCompletion {
         request: VlmCompletionRequest,
         response_tx: oneshot::Sender<eyre::Result<VlmCompletionResponse>>,
@@ -65,6 +69,11 @@ pub enum InferenceRequest {
     },
     /// Load/switch image generation model dynamically
     LoadImageModel {
+        model_id: String,
+        response_tx: oneshot::Sender<eyre::Result<String>>,
+    },
+    /// Load/switch video generation model dynamically
+    LoadVideoModel {
         model_id: String,
         response_tx: oneshot::Sender<eyre::Result<String>>,
     },
@@ -103,6 +112,7 @@ pub struct ModelStatus {
     pub tts: Option<String>,
     pub qwen3_tts: Option<String>,
     pub image: Option<String>,
+    pub video: Option<String>,
     pub vlm: Option<String>,
     /// Ascend NPU backend availability
     #[serde(skip_serializing_if = "Option::is_none")]

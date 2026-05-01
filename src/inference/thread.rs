@@ -1,7 +1,7 @@
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
-use crate::engines::{asr, image, llm, tts, vlm};
+use crate::engines::{asr, image, llm, mflux, pymlx_cosmos, pymlx_image_edit, pymlx_wan22, tts, video, vlm};
 use crate::inference::tts_pool::{Qwen3TtsEngines, TtsPoolConfig};
 
 use super::{InferenceRequest, ModelStatus};
@@ -48,14 +48,22 @@ pub fn inference_thread(
     let mut asr_engine: Option<asr::AsrEngine> = None;
     let mut tts_engine: Option<tts::TtsEngine> = None;
     let mut image_engine: Option<image::ImageEngine> = None;
+    let mut mflux_engine: Option<mflux::MfluxEngine> = None;
+    let mut video_engine: Option<video::VideoEngine> = None;
     let mut vlm_engine: Option<vlm::VlmEngine> = None;
     let mut qwen3_tts = Qwen3TtsEngines::new(tts_pool_config.eager_load);
+
+    // Python MLX subprocess engines (lazy-initialized)
+    let mut pymlx_image_edit_engine: Option<pymlx_image_edit::PymlxImageEditEngine> = None;
+    let mut pymlx_cosmos_engine: Option<pymlx_cosmos::PymlxCosmosEngine> = None;
+    let mut pymlx_wan22_engine: Option<pymlx_wan22::PymlxWan22Engine> = None;
 
     // Name tracking
     let mut current_llm_model: Option<String> = None;
     let mut current_asr_model: Option<String> = None;
     let mut current_tts_model: Option<String> = None;
     let mut current_image_model: Option<String> = None;
+    let mut current_video_model: Option<String> = None;
     let mut current_vlm_model: Option<String> = None;
 
     // Startup loading
@@ -179,33 +187,120 @@ pub fn inference_thread(
                 )));
             }
             InferenceRequest::Image { request, response_tx } => {
-                // Check if we need to switch models based on request
                 let requested_model = request.model.as_deref().unwrap_or("");
-                if !requested_model.is_empty() {
-                    let normalized = normalize_image_model(requested_model);
-                    let current_normalized = current_image_model.as_deref().unwrap_or("");
+                let model_type = image::ImageModelType::from_model_id(requested_model);
 
-                    if normalized != current_normalized || image_engine.is_none() {
-                        tracing::info!("Switching image model: {:?} -> {}", current_image_model, requested_model);
-                        image_engine = None;
-
-                        match image::ImageEngine::new(requested_model) {
-                            Ok(engine) => {
-                                tracing::info!("Image model {} loaded successfully", requested_model);
-                                current_image_model = Some(normalized.to_string());
-                                image_engine = Some(engine);
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to load image model {}: {}", requested_model, e);
+                let result = match model_type {
+                    image::ImageModelType::QwenImage => {
+                        // Qwen-Image → use mflux subprocess
+                        if mflux_engine.is_none() {
+                            match mflux::MfluxEngine::new(requested_model) {
+                                Ok(engine) => { mflux_engine = Some(engine); }
+                                Err(e) => { tracing::error!("Failed to init mflux: {}", e); }
                             }
                         }
+                        if let Some(ref engine) = mflux_engine {
+                            engine.generate(&request)
+                        } else {
+                            Err(eyre::eyre!("mflux engine not available. Install mflux: pip install mflux"))
+                        }
                     }
-                }
+                    image::ImageModelType::QwenImageEdit => {
+                        // Qwen-Image-Edit → Python MLX subprocess
+                        if pymlx_image_edit_engine.is_none() {
+                            match pymlx_image_edit::PymlxImageEditEngine::new(requested_model) {
+                                Ok(engine) => { pymlx_image_edit_engine = Some(engine); }
+                                Err(e) => { tracing::error!("Failed to init image edit engine: {}", e); }
+                            }
+                        }
+                        if let Some(ref engine) = pymlx_image_edit_engine {
+                            engine.generate(&request)
+                        } else {
+                            Err(eyre::eyre!("Image edit engine not available. Check Python environment."))
+                        }
+                    }
+                    image::ImageModelType::CosmosT2I => {
+                        // Cosmos Predict2 T2I → Python MLX subprocess
+                        if pymlx_cosmos_engine.is_none() {
+                            match pymlx_cosmos::PymlxCosmosEngine::new(requested_model) {
+                                Ok(engine) => { pymlx_cosmos_engine = Some(engine); }
+                                Err(e) => { tracing::error!("Failed to init Cosmos engine: {}", e); }
+                            }
+                        }
+                        if let Some(ref engine) = pymlx_cosmos_engine {
+                            engine.generate_image(&request)
+                        } else {
+                            Err(eyre::eyre!("Cosmos engine not available. Check Python environment."))
+                        }
+                    }
+                    _ => {
+                        // FLUX / Z-Image → existing Rust engine
+                        if !requested_model.is_empty() {
+                            let normalized = normalize_image_model(requested_model);
+                            let current_normalized = current_image_model.as_deref().unwrap_or("");
 
-                let result = if let Some(ref mut engine) = image_engine {
+                            if normalized != current_normalized || image_engine.is_none() {
+                                tracing::info!("Switching image model: {:?} -> {}", current_image_model, requested_model);
+                                image_engine = None;
+                                unsafe { mlx_sys::mlx_clear_cache(); }
+
+                                match image::ImageEngine::new(requested_model) {
+                                    Ok(engine) => {
+                                        tracing::info!("Image model {} loaded successfully", requested_model);
+                                        current_image_model = Some(normalized.to_string());
+                                        image_engine = Some(engine);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to load image model {}: {}", requested_model, e);
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(ref mut engine) = image_engine {
+                            engine.generate(&request)
+                        } else {
+                            Err(eyre::eyre!("Image model not loaded. Specify 'model': 'zimage' or 'flux' in your request."))
+                        }
+                    }
+                };
+                let _ = response_tx.send(result);
+            }
+
+            InferenceRequest::Video { request, response_tx } => {
+                let requested_model = request.model.as_deref().unwrap_or("");
+                let lower = requested_model.to_lowercase();
+
+                let result = if lower.contains("wan22-gguf") || lower.contains("wan2.2-gguf") || lower.contains("wan22_gguf") {
+                    // Wan 2.2 GGUF → Python MLX subprocess
+                    if pymlx_wan22_engine.is_none() {
+                        match pymlx_wan22::PymlxWan22Engine::new(requested_model) {
+                            Ok(engine) => { pymlx_wan22_engine = Some(engine); }
+                            Err(e) => { tracing::error!("Failed to init Wan2.2 GGUF engine: {}", e); }
+                        }
+                    }
+                    if let Some(ref engine) = pymlx_wan22_engine {
+                        engine.generate(&request)
+                    } else {
+                        Err(eyre::eyre!("Wan2.2 GGUF engine not available. Check Python environment."))
+                    }
+                } else if lower.contains("cosmos") && lower.contains("v2w") {
+                    // Cosmos V2W → Python MLX subprocess
+                    if pymlx_cosmos_engine.is_none() {
+                        match pymlx_cosmos::PymlxCosmosEngine::new(requested_model) {
+                            Ok(engine) => { pymlx_cosmos_engine = Some(engine); }
+                            Err(e) => { tracing::error!("Failed to init Cosmos engine: {}", e); }
+                        }
+                    }
+                    if let Some(ref engine) = pymlx_cosmos_engine {
+                        engine.generate_video(&request)
+                    } else {
+                        Err(eyre::eyre!("Cosmos V2W engine not available. Check Python environment."))
+                    }
+                } else if let Some(ref mut engine) = video_engine {
                     engine.generate(&request)
                 } else {
-                    Err(eyre::eyre!("Image model not loaded. Specify 'model': 'zimage' or 'flux' in your request."))
+                    Err(eyre::eyre!("Video model not loaded. Use POST /v1/models/load with model_type=video"))
                 };
                 let _ = response_tx.send(result);
             }
@@ -252,21 +347,77 @@ pub fn inference_thread(
                 let result = qwen3_tts.load_model(&model_dir);
                 let _ = response_tx.send(result);
             }
+            InferenceRequest::LoadVideoModel { model_id, response_tx } => {
+                tracing::info!("Loading video model: {}", model_id);
+                let result = load_model_slot(
+                    &mut video_engine,
+                    &mut current_video_model,
+                    &model_id,
+                    video::VideoEngine::new,
+                );
+                let _ = response_tx.send(result);
+            }
             InferenceRequest::LoadImageModel { model_id, response_tx } => {
+                let model_type = image::ImageModelType::from_model_id(&model_id);
                 let normalized = normalize_image_model(&model_id);
-                tracing::info!("Loading image model: {} (normalized: {})", model_id, normalized);
-                image_engine = None;
-                current_image_model = None;
-                let result = match image::ImageEngine::new(&model_id) {
-                    Ok(engine) => {
-                        tracing::info!("Image model {} loaded successfully", model_id);
-                        current_image_model = Some(normalized.to_string());
-                        image_engine = Some(engine);
-                        Ok(model_id)
+                tracing::info!("Loading image model: {} (normalized: {}, type: {:?})", model_id, normalized, model_type);
+
+                let result = match model_type {
+                    image::ImageModelType::QwenImage => {
+                        match mflux::MfluxEngine::new(&model_id) {
+                            Ok(engine) => {
+                                mflux_engine = Some(engine);
+                                current_image_model = Some(normalized.to_string());
+                                Ok(model_id)
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to init mflux for {}: {}", model_id, e);
+                                Err(e)
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to load image model {}: {}", model_id, e);
-                        Err(e)
+                    image::ImageModelType::QwenImageEdit => {
+                        match pymlx_image_edit::PymlxImageEditEngine::new(&model_id) {
+                            Ok(engine) => {
+                                pymlx_image_edit_engine = Some(engine);
+                                current_image_model = Some(normalized.to_string());
+                                Ok(model_id)
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to init image edit for {}: {}", model_id, e);
+                                Err(e)
+                            }
+                        }
+                    }
+                    image::ImageModelType::CosmosT2I => {
+                        match pymlx_cosmos::PymlxCosmosEngine::new(&model_id) {
+                            Ok(engine) => {
+                                pymlx_cosmos_engine = Some(engine);
+                                current_image_model = Some(normalized.to_string());
+                                Ok(model_id)
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to init Cosmos for {}: {}", model_id, e);
+                                Err(e)
+                            }
+                        }
+                    }
+                    _ => {
+                        image_engine = None;
+                        current_image_model = None;
+                        unsafe { mlx_sys::mlx_clear_cache(); }
+                        match image::ImageEngine::new(&model_id) {
+                            Ok(engine) => {
+                                tracing::info!("Image model {} loaded successfully", model_id);
+                                current_image_model = Some(normalized.to_string());
+                                image_engine = Some(engine);
+                                Ok(model_id)
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to load image model {}: {}", model_id, e);
+                                Err(e)
+                            }
+                        }
                     }
                 };
                 let _ = response_tx.send(result);
@@ -299,6 +450,11 @@ pub fn inference_thread(
                         let prev = current_image_model.take();
                         Ok(format!("Unloaded image model: {:?}", prev))
                     }
+                    "video" => {
+                        video_engine = None;
+                        let prev = current_video_model.take();
+                        Ok(format!("Unloaded video model: {:?}", prev))
+                    }
                     "vlm" => {
                         vlm_engine = None;
                         let prev = current_vlm_model.take();
@@ -314,15 +470,17 @@ pub fn inference_thread(
                         tts_engine = None;
                         let prev_qwen3_tts = qwen3_tts.unload();
                         image_engine = None;
+                        video_engine = None;
                         vlm_engine = None;
                         current_llm_model = None;
                         current_asr_model = None;
                         current_tts_model = None;
                         current_image_model = None;
+                        current_video_model = None;
                         current_vlm_model = None;
                         Ok(format!("Unloaded all models; Qwen3-TTS: {:?}", prev_qwen3_tts))
                     }
-                    _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, qwen3_tts, image, vlm, or all", model_type)),
+                    _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, qwen3_tts, image, video, vlm, or all", model_type)),
                 };
                 // Free MLX GPU memory cache after dropping model weights
                 if result.is_ok() {
@@ -339,6 +497,7 @@ pub fn inference_thread(
                     tts: current_tts_model.clone(),
                     qwen3_tts: qwen3_tts.current_variant_name().map(|s| s.to_string()),
                     image: current_image_model.clone(),
+                    video: current_video_model.clone(),
                     vlm: current_vlm_model.clone(),
                     ascend: None, // Populated by handler from AppState
                 };
