@@ -58,7 +58,7 @@ impl ImageModelType {
             ImageModelType::FluxKlein => &["flux-klein-4b", "flux-klein-4b-8bit"],
             ImageModelType::ZImageTurbo => &["zimage-turbo"],
             ImageModelType::QwenImage => &["qwen-image-2512-4bit", "qwen-image-2512-8bit"],
-            ImageModelType::QwenImageEdit => &["qwen-image-edit", "qwen-image-edit-2511"],
+            ImageModelType::QwenImageEdit => &["qwen-image-edit", "qwen-image-edit-2511", "qwen-image-edit-2511-q4km"],
             ImageModelType::CosmosT2I => &["cosmos-predict2-14b", "cosmos-t2i"],
         }
     }
