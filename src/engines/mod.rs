@@ -6,6 +6,7 @@ pub mod llm;
 pub mod mflux;
 pub mod pymlx;
 pub mod pymlx_cosmos;
+pub mod pymlx_flux;
 pub mod pymlx_image_edit;
 pub mod pymlx_wan22;
 pub mod qwen3_tts;

@@ -1,7 +1,7 @@
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
-use crate::engines::{asr, image, llm, mflux, pymlx_cosmos, pymlx_image_edit, pymlx_wan22, tts, video, vlm};
+use crate::engines::{asr, image, llm, mflux, pymlx_cosmos, pymlx_flux, pymlx_image_edit, pymlx_wan22, tts, video, vlm};
 use crate::inference::tts_pool::{Qwen3TtsEngines, TtsPoolConfig};
 
 use super::{InferenceRequest, ModelStatus};
@@ -56,6 +56,7 @@ pub fn inference_thread(
     // Python MLX subprocess engines (lazy-initialized)
     let mut pymlx_image_edit_engine: Option<pymlx_image_edit::PymlxImageEditEngine> = None;
     let mut pymlx_cosmos_engine: Option<pymlx_cosmos::PymlxCosmosEngine> = None;
+    let mut pymlx_flux_engine: Option<pymlx_flux::PymlxFluxEngine> = None;
     let mut pymlx_wan22_engine: Option<pymlx_wan22::PymlxWan22Engine> = None;
 
     // Name tracking
@@ -233,6 +234,20 @@ pub fn inference_thread(
                             Err(eyre::eyre!("Cosmos engine not available. Check Python environment."))
                         }
                     }
+                    image::ImageModelType::FluxKleinGguf => {
+                        // FLUX.2-klein GGUF → Python MLX subprocess
+                        if pymlx_flux_engine.is_none() {
+                            match pymlx_flux::PymlxFluxEngine::new(requested_model) {
+                                Ok(engine) => { pymlx_flux_engine = Some(engine); }
+                                Err(e) => { tracing::error!("Failed to init FLUX GGUF engine: {}", e); }
+                            }
+                        }
+                        if let Some(ref engine) = pymlx_flux_engine {
+                            engine.generate(&request)
+                        } else {
+                            Err(eyre::eyre!("FLUX GGUF engine not available. Check Python environment."))
+                        }
+                    }
                     _ => {
                         // FLUX / Z-Image → existing Rust engine
                         if !requested_model.is_empty() {
@@ -398,6 +413,19 @@ pub fn inference_thread(
                             }
                             Err(e) => {
                                 tracing::error!("Failed to init Cosmos for {}: {}", model_id, e);
+                                Err(e)
+                            }
+                        }
+                    }
+                    image::ImageModelType::FluxKleinGguf => {
+                        match pymlx_flux::PymlxFluxEngine::new(&model_id) {
+                            Ok(engine) => {
+                                pymlx_flux_engine = Some(engine);
+                                current_image_model = Some(normalized.to_string());
+                                Ok(model_id)
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to init FLUX GGUF for {}: {}", model_id, e);
                                 Err(e)
                             }
                         }
