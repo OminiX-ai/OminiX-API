@@ -81,6 +81,13 @@ pub async fn list_models(depot: &mut Depot, res: &mut Response) -> Result<(), St
             "endpoints": ["/v1/images/generations"]
         }));
     }
+    if let Some(ref id) = status.video {
+        data.push(serde_json::json!({
+            "id": id, "object": "model", "created": now,
+            "owned_by": "local", "type": "video",
+            "endpoints": ["/v1/videos/generations"]
+        }));
+    }
     if let Some(ref id) = status.vlm {
         data.push(serde_json::json!({
             "id": id, "object": "model", "created": now,

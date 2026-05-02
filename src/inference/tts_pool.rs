@@ -465,11 +465,21 @@ impl Qwen3TtsEngines {
     /// Returns Ok if the engine was loaded (or was already loaded), Err if not found.
     pub fn load_model(&mut self, model_id: &str) -> eyre::Result<String> {
         let desired_variant = TtsVariant::from_model_ref(model_id);
-        let requested_path = resolve_exact_tts_model(model_id, desired_variant).ok_or_else(|| {
-            eyre::eyre!(
-                "Qwen3-TTS {desired_variant} model not found for '{model_id}'. Expected a model directory with qwen3_tts config and weights under ~/.OminiX/models/"
-            )
-        })?;
+
+        // If the desired variant is already loaded, return immediately
+        if self.variant == Some(desired_variant) && self.engine.is_some() {
+            let path = self.current_path.clone().unwrap_or_default();
+            return Ok(format!("Qwen3-TTS {desired_variant} already loaded: {path}"));
+        }
+
+        // Try exact resolution first, fall back to scanning
+        let requested_path = resolve_exact_tts_model(model_id, desired_variant)
+            .or_else(|| find_tts_model(desired_variant).map(std::path::PathBuf::from))
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "Qwen3-TTS {desired_variant} model not found for '{model_id}'. Expected a model directory with qwen3_tts config and weights under ~/.OminiX/models/"
+                )
+            })?;
         let loaded_path = requested_path.to_string_lossy().to_string();
 
         match ensure_variant(

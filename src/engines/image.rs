@@ -45,8 +45,11 @@ use crate::types::{ImageGenerationRequest, ImageGenerationResponse, ImageData};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ImageModelType {
     FluxKlein,
+    FluxKleinGguf,
     ZImageTurbo,
     QwenImage,
+    QwenImageEdit,
+    CosmosT2I,
 }
 
 impl ImageModelType {
@@ -54,20 +57,28 @@ impl ImageModelType {
     pub fn config_aliases(&self) -> &'static [&'static str] {
         match self {
             ImageModelType::FluxKlein => &["flux-klein-4b", "flux-klein-4b-8bit"],
+            ImageModelType::FluxKleinGguf => &["flux-klein-4b-q4-gguf", "flux-klein-4b-q4"],
             ImageModelType::ZImageTurbo => &["zimage-turbo"],
             ImageModelType::QwenImage => &["qwen-image-2512-4bit", "qwen-image-2512-8bit"],
+            ImageModelType::QwenImageEdit => &["qwen-image-edit", "qwen-image-edit-2511", "qwen-image-edit-2511-q4km"],
+            ImageModelType::CosmosT2I => &["cosmos-predict2-14b", "cosmos-t2i", "cosmos-predict2-14b-t2i-q4km"],
         }
     }
 
     /// Detect model type from a user-provided model ID string
     pub fn from_model_id(model_id: &str) -> Self {
         let lower = model_id.to_lowercase();
-        if lower.contains("zimage") || lower.contains("z-image") {
+        if lower.contains("edit") && (lower.contains("qwen") || lower.contains("image")) {
+            ImageModelType::QwenImageEdit
+        } else if lower.contains("cosmos") {
+            ImageModelType::CosmosT2I
+        } else if lower.contains("zimage") || lower.contains("z-image") {
             ImageModelType::ZImageTurbo
         } else if lower.contains("qwen-image") || lower.contains("qwen_image") {
             ImageModelType::QwenImage
+        } else if lower.contains("flux") && (lower.contains("gguf") || lower.contains("q4")) {
+            ImageModelType::FluxKleinGguf
         } else {
-            // Default to FLUX for anything else (including "flux", "flux-klein-4b", etc.)
             ImageModelType::FluxKlein
         }
     }
@@ -76,9 +87,17 @@ impl ImageModelType {
     pub fn normalized_name(&self) -> &'static str {
         match self {
             ImageModelType::FluxKlein => "flux",
+            ImageModelType::FluxKleinGguf => "flux-gguf",
             ImageModelType::ZImageTurbo => "zimage",
             ImageModelType::QwenImage => "qwen-image",
+            ImageModelType::QwenImageEdit => "qwen-image-edit",
+            ImageModelType::CosmosT2I => "cosmos-t2i",
         }
+    }
+
+    /// Whether this model type uses a Python subprocess engine
+    pub fn uses_pymlx(&self) -> bool {
+        matches!(self, ImageModelType::QwenImageEdit | ImageModelType::CosmosT2I | ImageModelType::FluxKleinGguf)
     }
 }
 
@@ -128,6 +147,8 @@ impl ImageEngine {
             (ImageModelType::ZImageTurbo, _) => 5_000_000_000,
             // Qwen-Image: transformer ~3GB + text encoder ~2GB + VAE ~0.5GB
             (ImageModelType::QwenImage, _) => 6_000_000_000,
+            // These use Python subprocess engines, not the Rust ImageEngine
+            (ImageModelType::QwenImageEdit, _) | (ImageModelType::CosmosT2I, _) | (ImageModelType::FluxKleinGguf, _) => 0,
         }
     }
 
@@ -296,7 +317,9 @@ impl ImageEngine {
 
                 (trans, vec![te], vae, tok, config)
             }
-            ImageModelType::QwenImage => unreachable!("QwenImage is handled by new_qwen_image()"),
+            ImageModelType::QwenImage | ImageModelType::QwenImageEdit | ImageModelType::CosmosT2I | ImageModelType::FluxKleinGguf => {
+                unreachable!("handled by subprocess engines")
+            }
         };
 
         // Load Qwen3 text encoder (same config for both models)
@@ -353,7 +376,9 @@ impl ImageEngine {
                 encoder.update_flattened(weights_rc);
                 TextEncoderVariant::Quantized(encoder)
             }
-            ImageModelType::QwenImage => unreachable!("QwenImage is handled by new_qwen_image()"),
+            ImageModelType::QwenImage | ImageModelType::QwenImageEdit | ImageModelType::CosmosT2I | ImageModelType::FluxKleinGguf => {
+                unreachable!("handled by subprocess engines")
+            }
         };
         tracing::info!("Text encoder loaded");
 
@@ -407,7 +432,9 @@ impl ImageEngine {
                 tracing::info!("Z-Image transformer loaded (quantized)");
                 TransformerVariant::ZImage(trans, config)
             }
-            ImageModelType::QwenImage => unreachable!("QwenImage is handled by new_qwen_image()"),
+            ImageModelType::QwenImage | ImageModelType::QwenImageEdit | ImageModelType::CosmosT2I | ImageModelType::FluxKleinGguf => {
+                unreachable!("handled by subprocess engines")
+            }
         };
 
         // Load VAE (decoder and encoder)
@@ -617,6 +644,9 @@ impl ImageEngine {
             ImageModelType::FluxKlein => self.generate_flux(prompt, width, height, Some(ref_latents), strength),
             ImageModelType::ZImageTurbo => self.generate_zimage(prompt, width, height, Some(ref_latents), strength),
             ImageModelType::QwenImage => self.generate_qwen_image_edit(prompt, width, height, ref_latents),
+            ImageModelType::QwenImageEdit | ImageModelType::CosmosT2I | ImageModelType::FluxKleinGguf => {
+                unreachable!("handled by subprocess engines")
+            }
         }
     }
 
@@ -626,6 +656,9 @@ impl ImageEngine {
             ImageModelType::FluxKlein => self.generate_flux(prompt, width, height, None, 1.0),
             ImageModelType::ZImageTurbo => self.generate_zimage(prompt, width, height, None, 1.0),
             ImageModelType::QwenImage => self.generate_qwen_image(prompt, width, height),
+            ImageModelType::QwenImageEdit | ImageModelType::CosmosT2I | ImageModelType::FluxKleinGguf => {
+                unreachable!("handled by subprocess engines")
+            }
         }
     }
 
