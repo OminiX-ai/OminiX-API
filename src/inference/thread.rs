@@ -286,18 +286,18 @@ pub fn inference_thread(
                 let requested_model = request.model.as_deref().unwrap_or("");
                 let lower = requested_model.to_lowercase();
 
-                let result = if lower.contains("wan22-gguf") || lower.contains("wan2.2-gguf") || lower.contains("wan22_gguf") {
-                    // Wan 2.2 GGUF → Python MLX subprocess
+                let result = if lower.contains("wan2") || lower.contains("wan22") {
+                    // Wan 2.2 → Python subprocess (auto-detects MLX vs GGUF)
                     if pymlx_wan22_engine.is_none() {
                         match pymlx_wan22::PymlxWan22Engine::new(requested_model) {
                             Ok(engine) => { pymlx_wan22_engine = Some(engine); }
-                            Err(e) => { tracing::error!("Failed to init Wan2.2 GGUF engine: {}", e); }
+                            Err(e) => { tracing::error!("Failed to init Wan2.2 engine: {}", e); }
                         }
                     }
                     if let Some(ref engine) = pymlx_wan22_engine {
                         engine.generate(&request)
                     } else {
-                        Err(eyre::eyre!("Wan2.2 GGUF engine not available. Check Python environment."))
+                        Err(eyre::eyre!("Wan2.2 engine not available. Check Python environment."))
                     }
                 } else if lower.contains("cosmos") && lower.contains("v2w") {
                     // Cosmos V2W → Python MLX subprocess
