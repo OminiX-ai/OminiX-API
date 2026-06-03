@@ -3,9 +3,18 @@ use std::time::Duration;
 use salvo::prelude::*;
 
 use crate::engines::ascend;
+use crate::engines::sdcpp_image;
 use crate::error::render_error;
 use crate::inference::InferenceRequest;
 use crate::types::ImageGenerationRequest;
+
+/// Model IDs routed to the sd.cpp subprocess backend (bypasses the MLX
+/// inference thread). Currently only Qwen-Image-Edit-2511.
+const SDCPP_MODEL_IDS: &[&str] = &["qwen-image-edit-2511-sdcpp"];
+
+fn is_sdcpp_model(id: Option<&str>) -> bool {
+    matches!(id, Some(m) if SDCPP_MODEL_IDS.contains(&m))
+}
 
 use super::helpers::{get_state, send_and_wait};
 
@@ -29,6 +38,34 @@ pub async fn images_generations(
             tracing::error!("Failed to parse request: {}", e);
             StatusError::bad_request()
         })?;
+
+    // Top branch: route sd.cpp-backed models directly, bypassing the MLX
+    // inference thread. sd.cpp is a per-request subprocess with no resident
+    // state, so there's nothing to serialize through that channel.
+    if is_sdcpp_model(request.model.as_deref()) {
+        let cfg = state.sdcpp_config.as_ref().ok_or_else(|| {
+            tracing::error!(
+                "sd.cpp model requested but SDCPP_* env vars not configured"
+            );
+            StatusError::service_unavailable()
+        })?;
+        let cfg = (**cfg).clone();
+        let response = tokio::task::spawn_blocking(move || {
+            let engine = sdcpp_image::SdCppImageEngine::new(cfg)?;
+            engine.generate(&request)
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("sd.cpp image task join failed: {}", e);
+            StatusError::internal_server_error()
+        })?
+        .map_err(|e| {
+            tracing::error!("sd.cpp image error: {}", e);
+            StatusError::internal_server_error()
+        })?;
+        res.render(Json(response));
+        return Ok(());
+    }
 
     let response = send_and_wait(
         &state.inference_tx,

@@ -128,6 +128,23 @@ async fn main() -> eyre::Result<()> {
     // });
     let ascend_config: Option<std::sync::Arc<engines::ascend::AscendConfig>> = None;
 
+    // Initialize stable-diffusion.cpp subprocess backend if configured via env.
+    // Used for Qwen-Image-Edit-2511 (k-quant outlier-aware path, see
+    // Moxin-Studio/docs/2026-05-31-...implementation-report.md §3.8).
+    let sdcpp_config = engines::sdcpp_image::SdCppConfig::from_env().map(|cfg| {
+        tracing::info!(
+            "sd.cpp backend configured: bin={}, diff={}, vae={}, llm={}",
+            cfg.sd_bin.display(),
+            cfg.diffusion_model.display(),
+            cfg.vae.display(),
+            cfg.llm.display(),
+        );
+        if !cfg.is_available() {
+            tracing::warn!("sd.cpp config set but some files missing — requests will fail at runtime");
+        }
+        std::sync::Arc::new(cfg)
+    });
+
     // B3 §5.3.3: select Ascend TTS backend once at startup (ASCEND_TTS_TRANSPORT).
     // When `ascend_config` is None we don't build a backend — handlers that
     // need it already check `state.ascend_config` first and 503 if absent.
@@ -145,6 +162,7 @@ async fn main() -> eyre::Result<()> {
         download_cancel_flags,
         server_config,
         ascend_config,
+        sdcpp_config,
         ascend_tts_backend,
     };
 

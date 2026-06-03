@@ -4,6 +4,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::download;
 use crate::engines::ascend::AscendConfig;
+use crate::engines::sdcpp_image::SdCppConfig;
 use crate::engines::tts_trait::TextToSpeech;
 use crate::inference::InferenceRequest;
 use crate::server_config::ServerConfig;
@@ -31,6 +32,9 @@ pub struct AppState {
     pub server_config: Arc<ServerConfig>,
     /// Optional Ascend NPU backend configuration
     pub ascend_config: Option<Arc<AscendConfig>>,
+    /// Optional stable-diffusion.cpp subprocess backend for Qwen-Image-Edit-2511.
+    /// `None` when SDCPP_* env vars are absent.
+    pub sdcpp_config: Option<Arc<SdCppConfig>>,
     /// Shared TTS backend for Ascend endpoints (selected at startup via
     /// `ASCEND_TTS_TRANSPORT`: `ffi`|`subprocess`, default `subprocess`).
     /// `None` when `ascend_config` is `None`.

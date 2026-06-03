@@ -124,6 +124,44 @@ pub async fn load_model(
             }
         }
         "image" => {
+            // sd.cpp-backed models have no resident state — they spawn the
+            // sd-cli subprocess on each /v1/images/generations call. So
+            // /v1/models/load is a verify-only no-op: check the configured
+            // weight files exist and respond success without bothering the
+            // MLX inference thread.
+            if request.model == "qwen-image-edit-2511-sdcpp" {
+                let result_json = match state.sdcpp_config.as_ref() {
+                    Some(cfg) if cfg.is_available() => serde_json::json!({
+                        "status": "success",
+                        "model": request.model,
+                        "model_type": "image",
+                        "backend": "sdcpp",
+                        "loaded": false,
+                        "note": "sd.cpp models spawn per request; nothing to keep resident",
+                    }),
+                    Some(_) => {
+                        render_error(
+                            res,
+                            salvo::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "sd.cpp configured but binary or weight files missing on disk",
+                            "unavailable",
+                        );
+                        return Ok(());
+                    }
+                    None => {
+                        render_error(
+                            res,
+                            salvo::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "sd.cpp backend not configured (set SDCPP_BIN / SDCPP_DIFFUSION_MODEL / SDCPP_VAE / SDCPP_LLM)",
+                            "unavailable",
+                        );
+                        return Ok(());
+                    }
+                };
+                res.render(Json(result_json));
+                return Ok(());
+            }
+
             let (response_tx, response_rx) = oneshot::channel();
             state
                 .inference_tx

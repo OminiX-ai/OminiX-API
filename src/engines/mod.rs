@@ -3,6 +3,7 @@ pub mod asr;
 pub mod image;
 pub mod llm;
 pub mod qwen3_tts;
+pub mod sdcpp_image;
 pub mod tts;
 pub mod tts_backends;
 pub mod tts_trait;
