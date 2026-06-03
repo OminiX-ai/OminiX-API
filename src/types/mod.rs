@@ -9,6 +9,7 @@ mod download;
 mod error;
 mod image;
 mod training;
+mod video;
 mod vlm;
 mod voice;
 
@@ -18,5 +19,6 @@ pub use download::*;
 pub use error::*;
 pub use image::*;
 pub use training::*;
+pub use video::*;
 pub use vlm::*;
 pub use voice::*;

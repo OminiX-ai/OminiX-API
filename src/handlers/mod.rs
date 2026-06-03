@@ -7,5 +7,6 @@ pub mod image;
 pub mod models;
 pub mod training;
 pub mod version;
+pub mod video;
 pub mod vlm;
 pub mod ws_tts;

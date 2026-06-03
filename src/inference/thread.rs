@@ -1,7 +1,7 @@
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
-use crate::engines::{asr, image, llm, tts, vlm};
+use crate::engines::{asr, image, llm, tts, video, vlm};
 use crate::inference::tts_pool::{Qwen3TtsEngines, TtsPoolConfig};
 
 use super::{InferenceRequest, ModelStatus};
@@ -56,6 +56,7 @@ pub fn inference_thread(
     let mut current_asr_model: Option<String> = None;
     let mut current_tts_model: Option<String> = None;
     let mut current_image_model: Option<String> = None;
+    let mut current_video_model: Option<String> = None;
     let mut current_vlm_model: Option<String> = None;
 
     // Startup loading
@@ -210,6 +211,18 @@ pub fn inference_thread(
                 let _ = response_tx.send(result);
             }
 
+            InferenceRequest::Video { request, response_tx } => {
+                let model_hint = request
+                    .model
+                    .as_deref()
+                    .filter(|m| !m.is_empty())
+                    .or(current_video_model.as_deref());
+                let config = video::PythonMlxVideoConfig::from_env(model_hint);
+                let engine = video::PythonMlxVideoEngine::new(config);
+                let result = engine.generate(&request);
+                let _ = response_tx.send(result);
+            }
+
             InferenceRequest::VlmCompletion { request, response_tx } => {
                 let result = if let Some(ref mut engine) = vlm_engine {
                     engine.describe(&request)
@@ -271,6 +284,11 @@ pub fn inference_thread(
                 };
                 let _ = response_tx.send(result);
             }
+            InferenceRequest::LoadVideoModel { model_id, response_tx } => {
+                tracing::info!("Selecting video model: {}", model_id);
+                current_video_model = Some(model_id.clone());
+                let _ = response_tx.send(Ok(model_id));
+            }
 
             InferenceRequest::UnloadModel { model_type, response_tx } => {
                 tracing::info!("Unloading model type: {}", model_type);
@@ -299,6 +317,10 @@ pub fn inference_thread(
                         let prev = current_image_model.take();
                         Ok(format!("Unloaded image model: {:?}", prev))
                     }
+                    "video" => {
+                        let prev = current_video_model.take();
+                        Ok(format!("Unloaded video model: {:?}", prev))
+                    }
                     "vlm" => {
                         vlm_engine = None;
                         let prev = current_vlm_model.take();
@@ -319,10 +341,11 @@ pub fn inference_thread(
                         current_asr_model = None;
                         current_tts_model = None;
                         current_image_model = None;
+                        current_video_model = None;
                         current_vlm_model = None;
                         Ok(format!("Unloaded all models; Qwen3-TTS: {:?}", prev_qwen3_tts))
                     }
-                    _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, qwen3_tts, image, vlm, or all", model_type)),
+                    _ => Err(eyre::eyre!("Unknown model type: {}. Use: llm, asr, tts, qwen3_tts, image, video, vlm, or all", model_type)),
                 };
                 // Free MLX GPU memory cache after dropping model weights
                 if result.is_ok() {
@@ -339,6 +362,7 @@ pub fn inference_thread(
                     tts: current_tts_model.clone(),
                     qwen3_tts: qwen3_tts.current_variant_name().map(|s| s.to_string()),
                     image: current_image_model.clone(),
+                    video: current_video_model.clone(),
                     vlm: current_vlm_model.clone(),
                     ascend: None, // Populated by handler from AppState
                 };

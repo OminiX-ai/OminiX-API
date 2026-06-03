@@ -16,7 +16,7 @@ const MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 ///
 /// Request body:
 /// - model: Model ID or path (required)
-/// - model_type: "llm", "asr", "tts", or "image" (default: "llm")
+/// - model_type: "llm", "asr", "tts", "image", or "video" (default: "llm")
 #[handler]
 pub async fn load_model(
     req: &mut Request,
@@ -173,6 +173,18 @@ pub async fn load_model(
                 .map_err(|_| StatusError::internal_server_error())?;
             response_rx
         }
+        "video" => {
+            let (response_tx, response_rx) = oneshot::channel();
+            state
+                .inference_tx
+                .send(InferenceRequest::LoadVideoModel {
+                    model_id: request.model.clone(),
+                    response_tx,
+                })
+                .await
+                .map_err(|_| StatusError::internal_server_error())?;
+            response_rx
+        }
         "vlm" => {
             let (response_tx, response_rx) = oneshot::channel();
             state
@@ -202,7 +214,7 @@ pub async fn load_model(
                 res,
                 salvo::http::StatusCode::BAD_REQUEST,
                 &format!(
-                    "Unknown model_type: {}. Use: llm, asr, tts, qwen3_tts, image, or vlm",
+                    "Unknown model_type: {}. Use: llm, asr, tts, qwen3_tts, image, video, or vlm",
                     model_type
                 ),
                 "invalid_request_error",
@@ -243,7 +255,7 @@ pub async fn load_model(
 /// POST /v1/models/unload - Unload a model to free memory
 ///
 /// Request body:
-/// - model_type: "llm", "asr", "tts", "image", or "all"
+/// - model_type: "llm", "asr", "tts", "image", "video", or "all"
 #[handler]
 pub async fn unload_model(
     req: &mut Request,

@@ -227,6 +227,7 @@ async fn main() -> eyre::Result<()> {
     // tracing::info!("  POST /v1/images/generations/ascend (Image gen on Ascend)");
     tracing::info!("  --- Other ---");
     tracing::info!("  POST /v1/images/generations");
+    tracing::info!("  POST /v1/videos/generations");
     tracing::info!("  POST /v1/vlm/completions");
     tracing::info!("  WS   /ws/v1/tts");
     tracing::info!("  GET  /v1/voices");
