@@ -1,6 +1,6 @@
 //! Python MLX subprocess engine for Qwen-Image-Edit-2511 image editing.
 //!
-//! Wraps `infer_qwen_image_edit_op_p1.py` which performs diffusion-based image
+//! Wraps `infer_qwen_image_edit_op.py` which performs diffusion-based image
 //! editing using a Qwen2.5-VL text encoder, a GGUF diffusion model, and a VAE.
 //! Supports both reference-image editing (img2img) and text-only generation.
 
@@ -12,7 +12,7 @@ use eyre::{Context, Result};
 use crate::engines::pymlx;
 use crate::types::{ImageData, ImageGenerationRequest, ImageGenerationResponse};
 
-const SCRIPT_NAME: &str = "infer_qwen_image_edit_op_p1.py";
+const SCRIPT_NAME: &str = "infer_qwen_image_edit_op.py";
 const DEFAULT_MODEL_SUBDIR: &str = ".OminiX/models/qwen-image-edit-2511";
 const TIMEOUT: Duration = Duration::from_secs(600);
 

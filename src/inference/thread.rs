@@ -197,56 +197,64 @@ pub fn inference_thread(
                         if mflux_engine.is_none() {
                             match mflux::MfluxEngine::new(requested_model) {
                                 Ok(engine) => { mflux_engine = Some(engine); }
-                                Err(e) => { tracing::error!("Failed to init mflux: {}", e); }
+                                Err(e) => {
+                                    tracing::error!("Failed to init mflux: {}", e);
+                                    let _ = response_tx.send(Err(e.wrap_err(
+                                        "Failed to initialize mflux engine (install with: pip install mflux)",
+                                    )));
+                                    continue;
+                                }
                             }
                         }
-                        if let Some(ref engine) = mflux_engine {
-                            engine.generate(&request)
-                        } else {
-                            Err(eyre::eyre!("mflux engine not available. Install mflux: pip install mflux"))
-                        }
+                        mflux_engine.as_ref().unwrap().generate(&request)
                     }
                     image::ImageModelType::QwenImageEdit => {
                         // Qwen-Image-Edit → Python MLX subprocess
                         if pymlx_image_edit_engine.is_none() {
                             match pymlx_image_edit::PymlxImageEditEngine::new(requested_model) {
                                 Ok(engine) => { pymlx_image_edit_engine = Some(engine); }
-                                Err(e) => { tracing::error!("Failed to init image edit engine: {}", e); }
+                                Err(e) => {
+                                    tracing::error!("Failed to init image edit engine: {}", e);
+                                    let _ = response_tx.send(Err(e.wrap_err(
+                                        "Failed to initialize Qwen-Image-Edit engine",
+                                    )));
+                                    continue;
+                                }
                             }
                         }
-                        if let Some(ref engine) = pymlx_image_edit_engine {
-                            engine.generate(&request)
-                        } else {
-                            Err(eyre::eyre!("Image edit engine not available. Check Python environment."))
-                        }
+                        pymlx_image_edit_engine.as_ref().unwrap().generate(&request)
                     }
                     image::ImageModelType::CosmosT2I => {
                         // Cosmos Predict2 T2I → Python MLX subprocess
                         if pymlx_cosmos_engine.is_none() {
                             match pymlx_cosmos::PymlxCosmosEngine::new(requested_model) {
                                 Ok(engine) => { pymlx_cosmos_engine = Some(engine); }
-                                Err(e) => { tracing::error!("Failed to init Cosmos engine: {}", e); }
+                                Err(e) => {
+                                    tracing::error!("Failed to init Cosmos engine: {}", e);
+                                    let _ = response_tx.send(Err(e.wrap_err(
+                                        "Failed to initialize Cosmos engine",
+                                    )));
+                                    continue;
+                                }
                             }
                         }
-                        if let Some(ref engine) = pymlx_cosmos_engine {
-                            engine.generate_image(&request)
-                        } else {
-                            Err(eyre::eyre!("Cosmos engine not available. Check Python environment."))
-                        }
+                        pymlx_cosmos_engine.as_ref().unwrap().generate_image(&request)
                     }
                     image::ImageModelType::FluxKleinGguf => {
                         // FLUX.2-klein GGUF → Python MLX subprocess
                         if pymlx_flux_engine.is_none() {
                             match pymlx_flux::PymlxFluxEngine::new(requested_model) {
                                 Ok(engine) => { pymlx_flux_engine = Some(engine); }
-                                Err(e) => { tracing::error!("Failed to init FLUX GGUF engine: {}", e); }
+                                Err(e) => {
+                                    tracing::error!("Failed to init FLUX GGUF engine: {}", e);
+                                    let _ = response_tx.send(Err(e.wrap_err(
+                                        "Failed to initialize FLUX.2-klein GGUF engine",
+                                    )));
+                                    continue;
+                                }
                             }
                         }
-                        if let Some(ref engine) = pymlx_flux_engine {
-                            engine.generate(&request)
-                        } else {
-                            Err(eyre::eyre!("FLUX GGUF engine not available. Check Python environment."))
-                        }
+                        pymlx_flux_engine.as_ref().unwrap().generate(&request)
                     }
                     _ => {
                         // FLUX / Z-Image → existing Rust engine
@@ -291,27 +299,31 @@ pub fn inference_thread(
                     if pymlx_wan22_engine.is_none() {
                         match pymlx_wan22::PymlxWan22Engine::new(requested_model) {
                             Ok(engine) => { pymlx_wan22_engine = Some(engine); }
-                            Err(e) => { tracing::error!("Failed to init Wan2.2 engine: {}", e); }
+                            Err(e) => {
+                                tracing::error!("Failed to init Wan2.2 engine: {}", e);
+                                let _ = response_tx.send(Err(e.wrap_err(
+                                    "Failed to initialize Wan2.2 engine",
+                                )));
+                                continue;
+                            }
                         }
                     }
-                    if let Some(ref engine) = pymlx_wan22_engine {
-                        engine.generate(&request)
-                    } else {
-                        Err(eyre::eyre!("Wan2.2 engine not available. Check Python environment."))
-                    }
+                    pymlx_wan22_engine.as_ref().unwrap().generate(&request)
                 } else if lower.contains("cosmos") && lower.contains("v2w") {
                     // Cosmos V2W → Python MLX subprocess
                     if pymlx_cosmos_engine.is_none() {
                         match pymlx_cosmos::PymlxCosmosEngine::new(requested_model) {
                             Ok(engine) => { pymlx_cosmos_engine = Some(engine); }
-                            Err(e) => { tracing::error!("Failed to init Cosmos engine: {}", e); }
+                            Err(e) => {
+                                tracing::error!("Failed to init Cosmos engine: {}", e);
+                                let _ = response_tx.send(Err(e.wrap_err(
+                                    "Failed to initialize Cosmos V2W engine",
+                                )));
+                                continue;
+                            }
                         }
                     }
-                    if let Some(ref engine) = pymlx_cosmos_engine {
-                        engine.generate_video(&request)
-                    } else {
-                        Err(eyre::eyre!("Cosmos V2W engine not available. Check Python environment."))
-                    }
+                    pymlx_cosmos_engine.as_ref().unwrap().generate_video(&request)
                 } else if let Some(ref mut engine) = video_engine {
                     engine.generate(&request)
                 } else {
