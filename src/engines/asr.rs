@@ -157,8 +157,19 @@ impl AsrEngine {
             }
             AsrBackend::Qwen3Asr { model } => {
                 let language = request.language.as_deref().unwrap_or("auto");
-                let text = model.transcribe_samples(&samples, language)
+                // Cap generated tokens to bound runaway autoregressive decoding.
+                // The crate default (8192) lets degenerate multi-token repetition
+                // loops run to the ceiling — minutes of latency + ~1.9 GB KV-cache.
+                // Mirrors moxin-tts dora-qwen3-asr (1024 cap + post-call cache clear).
+                let config = qwen3_asr_mlx::SamplingConfig {
+                    max_tokens: 1024,
+                    ..Default::default()
+                };
+                let text = model
+                    .transcribe_samples_with_config(&samples, language, &config)
                     .map_err(|e| eyre::eyre!("Qwen3-ASR transcription failed: {:?}", e))?;
+                // Release MLX KV-cache buffers so repeated runaway calls can't accumulate.
+                unsafe { mlx_sys::mlx_clear_cache(); }
 
                 Ok(TranscriptionResponse {
                     text,
@@ -251,12 +262,21 @@ fn decode_with_ffmpeg(audio_bytes: &[u8]) -> Result<(Vec<f32>, f32)> {
         .spawn()
         .context("ffmpeg not found — install with: brew install ffmpeg")?;
 
-    // Write audio bytes to ffmpeg stdin
-    child.stdin.take().unwrap().write_all(audio_bytes)
-        .context("Failed to write to ffmpeg stdin")?;
+    // Stream stdin on a separate thread so the main thread can drain stdout/stderr
+    // concurrently via wait_with_output(). Writing the whole input before reading
+    // output deadlocks: once ffmpeg's decoded PCM fills the ~64 KB stdout pipe
+    // buffer (any audio longer than ~2 s of 16k mono), ffmpeg blocks on write(stdout)
+    // while we block on write(stdin) → both stuck forever at 0% CPU.
+    let mut stdin = child.stdin.take().unwrap();
+    let input = audio_bytes.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+        // `stdin` dropped here closes the pipe so ffmpeg sees EOF.
+    });
 
     let output = child.wait_with_output()
         .context("ffmpeg process failed")?;
+    let _ = writer.join();
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
