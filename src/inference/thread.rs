@@ -73,6 +73,11 @@ pub fn inference_thread(
                 if let Some(ref engine) = asr_engine {
                     current_asr_model = Some(engine.backend_name().to_string());
                 }
+                // Warm up so the first real request doesn't pay MLX graph
+                // compilation (~5s for Qwen3-ASR).
+                if let Some(ref mut engine) = asr_engine {
+                    engine.warmup();
+                }
             }
             Err(e) => tracing::warn!("Failed to load ASR model: {}", e),
         }
@@ -356,6 +361,12 @@ pub fn inference_thread(
             // Qwen3-TTS (serialized through the same queue as ASR/LLM)
             InferenceRequest::Qwen3Tts(tts_request) => {
                 qwen3_tts.handle(tts_request);
+            }
+            // Periodic keep-warm so the first ASR after idle isn't cold.
+            InferenceRequest::KeepWarmAsr => {
+                if let Some(ref mut engine) = asr_engine {
+                    engine.warmup();
+                }
             }
         }
     }

@@ -115,6 +115,23 @@ async fn main() -> eyre::Result<()> {
         .context("Failed to receive ready signal from inference thread")?;
     tracing::info!("Inference thread ready");
 
+    // Keep ASR warm: periodically re-run a short inference so the MLX graph /
+    // model pages aren't released after idle (first-after-idle cold start is
+    // otherwise ~5s). No-op when no ASR model is configured.
+    if !config.asr_model_dir.is_empty() {
+        let warm_tx = inference_tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(180));
+            tick.tick().await; // consume the immediate first tick (startup already warmed)
+            loop {
+                tick.tick().await;
+                if warm_tx.send(InferenceRequest::KeepWarmAsr).await.is_err() {
+                    break; // inference thread shut down
+                }
+            }
+        });
+    }
+
     // // Initialize Ascend backend if configured via environment
     // let ascend_config = engines::ascend::AscendConfig::from_env().map(|cfg| {
     //     tracing::info!("Ascend backend configured: bin_dir={}", cfg.bin_dir.display());

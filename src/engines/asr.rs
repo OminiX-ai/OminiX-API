@@ -168,6 +168,44 @@ impl AsrEngine {
             }
         }
     }
+
+    /// Run one short dummy inference so the first real request doesn't pay the
+    /// MLX graph-compilation cost (~5s for Qwen3-ASR). Errors are non-fatal.
+    pub fn warmup(&mut self) {
+        // Low-amplitude tone, NOT silence: all-zero input drives Qwen3-ASR's
+        // mel/encoder into a degenerate state that hangs the decode.
+        let samples: Vec<f32> = (0..16000)
+            .map(|i| 0.02f32 * (i as f32 * 0.06f32).sin())
+            .collect(); // ~1s @ 16kHz
+        let result: Result<()> = match &mut self.backend {
+            AsrBackend::Paraformer { model, vocab } => {
+                let mut model = model.clone();
+                funasr_mlx::transcribe(&mut model, &samples, vocab)
+                    .map(|_| ())
+                    .context("Paraformer warmup failed")
+            }
+            AsrBackend::SenseVoiceQwen { model } => model
+                .transcribe_samples(&samples, 16000)
+                .map(|_| ())
+                .map_err(|e| eyre::eyre!("{:?}", e)),
+            AsrBackend::Qwen3Asr { model } => {
+                let config = qwen3_asr_mlx::SamplingConfig {
+                    max_tokens: 4,
+                    ..Default::default()
+                };
+                let r = model
+                    .transcribe_samples_with_config(&samples, "Chinese", &config)
+                    .map(|_| ())
+                    .map_err(|e| eyre::eyre!("{:?}", e));
+                unsafe { mlx_sys::mlx_clear_cache(); }
+                r
+            }
+        };
+        match result {
+            Ok(_) => tracing::info!("ASR warmup complete"),
+            Err(e) => tracing::warn!("ASR warmup failed (non-fatal): {}", e),
+        }
+    }
 }
 
 /// Decode audio from request: accepts a local file path (starts with '/') or base64-encoded audio.
