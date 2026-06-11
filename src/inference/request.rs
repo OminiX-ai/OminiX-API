@@ -93,6 +93,9 @@ pub enum InferenceRequest {
     },
     /// Qwen3-TTS request (routed through inference queue to serialize GPU access)
     Qwen3Tts(super::tts_pool::TtsRequest),
+    /// Fire-and-forget: re-run a short ASR inference to keep the MLX graph /
+    /// model pages warm so the first real request after idle isn't cold.
+    KeepWarmAsr,
 }
 
 /// Current status of all models
