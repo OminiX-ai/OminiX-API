@@ -41,9 +41,13 @@ struct VoiceConfig {
     #[serde(default)]
     #[allow(dead_code)]
     speed_factor: Option<f32>,
-    /// Finetuned VITS model weights (from voice cloning training)
+    /// Per-voice fine-tuned GPT (T2S) weights (MLX safetensors). When both this
+    /// and `vits_weights` are set, the voice is rendered with its own
+    /// fine-tuned model instead of cloning on the base model.
     #[serde(default)]
-    #[allow(dead_code)]
+    gpt_weights: Option<String>,
+    /// Per-voice fine-tuned VITS (SoVITS) weights (MLX safetensors).
+    #[serde(default)]
     vits_weights: Option<String>,
 }
 
@@ -243,15 +247,30 @@ impl TtsEngine {
                 let ref_audio = voices.resolve_path(&voice.ref_audio);
                 let ref_text = voice.ref_text.clone();
                 let codes_path = voice.codes_path.as_ref().map(|c| voices.resolve_path(c));
-                (ref_audio, ref_text, codes_path)
+                let gpt_weights = voice.gpt_weights.as_ref().map(|w| voices.resolve_path(w));
+                let vits_weights = voice.vits_weights.as_ref().map(|w| voices.resolve_path(w));
+                (ref_audio, ref_text, codes_path, gpt_weights, vits_weights)
             })
         });
 
-        if let Some((ref_audio, ref_text, codes_path)) = registry_match {
+        if let Some((ref_audio, ref_text, codes_path, gpt_weights, vits_weights)) = registry_match {
             if !Path::new(&ref_audio).exists() {
                 return Err(eyre::eyre!(
                     "Voice '{}' reference audio not found: {}", voice_name, ref_audio
                 ));
+            }
+
+            // Per-voice fine-tuned weights: swap the T2S+VITS models BEFORE
+            // setting the reference, so the prompt is computed against this
+            // voice's own model. BERT/HuBERT stay resident (cheap switch).
+            // Both must be present; otherwise the voice clones on the base.
+            if let (Some(gpt), Some(vits)) = (&gpt_weights, &vits_weights) {
+                tracing::info!("Voice '{}': loading fine-tuned weights", voice_name);
+                self.cloner
+                    .reload_voice_weights(gpt, vits)
+                    .with_context(|| {
+                        format!("failed to load fine-tuned weights for voice '{voice_name}'")
+                    })?;
             }
 
             if let Some(codes) = codes_path {
