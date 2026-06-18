@@ -159,12 +159,24 @@ pub async fn load_model(
                 .map_err(|_| StatusError::internal_server_error())?;
             response_rx
         }
+        "video" | "video_generation" | "video_gen" => {
+            let (response_tx, response_rx) = oneshot::channel();
+            state
+                .inference_tx
+                .send(InferenceRequest::LoadVideoModel {
+                    model_id: request.model.clone(),
+                    response_tx,
+                })
+                .await
+                .map_err(|_| StatusError::internal_server_error())?;
+            response_rx
+        }
         _ => {
             render_error(
                 res,
                 salvo::http::StatusCode::BAD_REQUEST,
                 &format!(
-                    "Unknown model_type: {}. Use: llm, asr, tts, qwen3_tts, image, or vlm",
+                    "Unknown model_type: {}. Use: llm, asr, tts, qwen3_tts, image, video, or vlm",
                     model_type
                 ),
                 "invalid_request_error",
