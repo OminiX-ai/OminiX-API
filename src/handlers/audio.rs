@@ -10,7 +10,8 @@ use crate::engines::qwen3_tts;
 use crate::engines::tts_trait::{TtsCloneRequest, TtsRequest as TtsTraitRequest, TtsResponse};
 use crate::error::render_error;
 use crate::inference::{AudioChunk, InferenceRequest, TtsRequest};
-use crate::types::{SpeechCloneRequest, SpeechRequest, TranscriptionRequest};
+use crate::types::{SpeechCloneRequest, SpeechRequest, TranscriptionRequest, VoiceNotFoundError};
+use crate::voice_registry::VoiceRegistry;
 
 use super::helpers::{get_state, send_and_wait};
 
@@ -174,10 +175,41 @@ pub async fn tts_qwen3(
     let wants_wav = req.query::<String>("format").as_deref() == Some("wav")
         || request.response_format == "wav";
 
+    // Resolve the requested voice through the same normalization as before
+    // (empty/"default" -> "vivian"), then reject unknown names with 404.
+    // Silent fallback to a default voice is what prompted this endpoint —
+    // fm_tts callers were getting 200 + audio in the wrong voice because
+    // an unregistered `voice` string was being swallowed downstream.
+    let resolved_voice = normalize_voice(request.voice.clone());
+    let registry = VoiceRegistry::load();
+    if !registry.contains(&resolved_voice) {
+        let requester = request_peer(req);
+        let available = registry.available_voices().to_vec();
+        tracing::info!(
+            "rejected TTS request: unknown voice {} (available: {}) from {}",
+            resolved_voice,
+            available.join(", "),
+            requester,
+        );
+        let message = format!(
+            "Voice '{}' is not registered. Available: {}",
+            resolved_voice,
+            available.join(", "),
+        );
+        res.status_code(salvo::http::StatusCode::NOT_FOUND);
+        res.render(Json(VoiceNotFoundError {
+            error: "voice_not_found",
+            message,
+            requested_voice: resolved_voice,
+            available_voices: available,
+        }));
+        return Ok(());
+    }
+
     let chunk_rx = spawn_per_sentence_tts(
         state.inference_tx.clone(),
         qwen3_tts::split_sentences(&request.input),
-        normalize_voice(request.voice),
+        resolved_voice,
         request.language.unwrap_or_else(|| "chinese".to_string()),
         request.speed,
         request.instruct,
@@ -193,6 +225,30 @@ pub async fn tts_qwen3(
         stream_pcm_response(chunk_rx, res);
     }
     Ok(())
+}
+
+/// Best-effort client identifier for log lines. Prefers
+/// `X-Forwarded-For` / `X-Real-IP` (gateway-provided), else the peer
+/// socket. Falls back to "unknown" so logs stay single-line.
+fn request_peer(req: &Request) -> String {
+    if let Some(fwd) = req.headers().get("x-forwarded-for") {
+        if let Ok(s) = fwd.to_str() {
+            if let Some(first) = s.split(',').next() {
+                let trimmed = first.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+    if let Some(real) = req.headers().get("x-real-ip") {
+        if let Ok(s) = real.to_str() {
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    req.remote_addr().to_string()
 }
 
 /// POST /v1/audio/tts/clone — Qwen3-TTS voice cloning (Base model)
@@ -890,4 +946,194 @@ fn stream_pcm_response(chunk_rx: mpsc::Receiver<AudioChunk>, res: &mut Response)
         .insert("Transfer-Encoding", "chunked".parse().unwrap());
 
     res.stream(stream);
+}
+
+#[cfg(test)]
+mod tests {
+    //! Handler-level tests for `POST /v1/audio/tts/qwen3` voice validation.
+    //!
+    //! These exercise the new 404 behavior without touching the real TTS
+    //! pipeline. The 404 rejection short-circuits before any inference
+    //! request is sent, so a dummy receiver is sufficient.
+    //!
+    //! For happy-path requests (registered voice) the test spawns a stub
+    //! receiver that answers each `SpeechOneSentence` with a tiny PCM
+    //! buffer, mirroring what the real inference thread would produce.
+    use super::*;
+    use crate::inference::TtsRequest as CoreTtsRequest;
+    use crate::state::AppState;
+    use salvo::test::{ResponseExt, TestClient};
+    use serde_json::Value;
+    use std::sync::Arc;
+    use tokio::sync::{broadcast, mpsc};
+
+    /// Build an `AppState` whose `inference_tx` is consumed by a stub
+    /// that answers Qwen3 TTS sentence requests with a 4-byte PCM blob.
+    /// Other channels drop their messages (they're not exercised by
+    /// `tts_qwen3`).
+    fn make_test_state() -> AppState {
+        let (inference_tx, mut inference_rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(req) = inference_rx.recv().await {
+                if let crate::inference::InferenceRequest::Qwen3Tts(tts_req) = req {
+                    match tts_req {
+                        CoreTtsRequest::SpeechOneSentence { response_tx, .. } => {
+                            let _ = response_tx.send(Ok(vec![0u8; 4]));
+                        }
+                        CoreTtsRequest::CloneOneSentence { response_tx, .. } => {
+                            let _ = response_tx.send(Ok(vec![0u8; 4]));
+                        }
+                        CoreTtsRequest::PrepareCloneRef { response_tx, .. } => {
+                            let _ = response_tx.send(Ok(()));
+                        }
+                        CoreTtsRequest::Speech { response_tx, .. } => {
+                            let _ = response_tx.send(Ok(vec![0u8; 4]));
+                        }
+                        CoreTtsRequest::SpeechClone { response_tx, .. } => {
+                            let _ = response_tx.send(Ok(vec![0u8; 4]));
+                        }
+                    }
+                }
+            }
+        });
+        let (training_tx, _training_rx) = mpsc::channel(1);
+        let (progress_tx, _) = broadcast::channel(1);
+        let (download_tx, _download_rx) = mpsc::channel(1);
+        let (download_progress_tx, _) = broadcast::channel(1);
+        AppState {
+            inference_tx,
+            training_tx,
+            progress_tx,
+            cancel_flag: Default::default(),
+            download_tx,
+            download_progress_tx,
+            download_cancel_flags: Default::default(),
+            server_config: Arc::new(crate::server_config::ServerConfig::default()),
+            ascend_config: None,
+            ascend_tts_backend: None,
+        }
+    }
+
+    fn make_test_service() -> salvo::Service {
+        let state = make_test_state();
+        let router = Router::new().push(Router::with_path("v1/audio/tts/qwen3").post(tts_qwen3));
+        let router = router.hoop(salvo::affix_state::inject(state));
+        salvo::Service::new(router)
+    }
+
+    /// Point the registry at a scratch file so tests don't accidentally
+    /// accept voices from the developer's real `~/.OminiX/models/voices.json`.
+    /// Env mutation is serialized by `voice_test_guard`.
+    fn set_voices_json_to_empty() -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(file.path(), r#"{"voices":{}}"#).unwrap();
+        std::env::set_var("OMINIX_VOICES_JSON", file.path());
+        file
+    }
+
+    fn set_voices_json_with(content: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(file.path(), content).unwrap();
+        std::env::set_var("OMINIX_VOICES_JSON", file.path());
+        file
+    }
+
+    /// Serialize tests that mutate `OMINIX_VOICES_JSON`. A tokio-aware
+    /// mutex is used because the guard is held across await points
+    /// within each test.
+    async fn voice_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        use std::sync::OnceLock;
+        use tokio::sync::Mutex;
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().await
+    }
+
+    #[tokio::test]
+    async fn should_return_404_when_voice_is_unknown() {
+        let _guard = voice_test_guard().await;
+        let _temp = set_voices_json_to_empty();
+        let service = make_test_service();
+
+        let mut res = TestClient::post("http://127.0.0.1:5800/v1/audio/tts/qwen3")
+            .json(&serde_json::json!({"voice": "yangmi", "input": "test"}))
+            .send(&service)
+            .await;
+
+        assert_eq!(res.status_code.unwrap().as_u16(), 404);
+        let body: Value = res.take_json().await.expect("json body");
+        assert_eq!(body["error"], "voice_not_found");
+        assert_eq!(body["requested_voice"], "yangmi");
+        assert!(
+            body["available_voices"]
+                .as_array()
+                .expect("available_voices array")
+                .iter()
+                .any(|v| v == "vivian"),
+            "expected vivian in available_voices: {body}"
+        );
+        let msg = body["message"].as_str().unwrap();
+        assert!(msg.contains("yangmi"));
+        assert!(msg.contains("vivian"));
+    }
+
+    #[tokio::test]
+    async fn should_return_200_when_voice_is_registered_preset() {
+        let _guard = voice_test_guard().await;
+        let _temp = set_voices_json_to_empty();
+        let service = make_test_service();
+
+        // Ask for WAV so the handler awaits the stub receiver's PCM and
+        // returns a complete body rather than streaming chunked.
+        let res = TestClient::post("http://127.0.0.1:5800/v1/audio/tts/qwen3?format=wav")
+            .json(&serde_json::json!({"voice": "vivian", "input": "hello"}))
+            .send(&service)
+            .await;
+
+        assert_eq!(res.status_code.unwrap().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn should_return_200_when_voice_field_is_missing() {
+        let _guard = voice_test_guard().await;
+        let _temp = set_voices_json_to_empty();
+        let service = make_test_service();
+
+        let res = TestClient::post("http://127.0.0.1:5800/v1/audio/tts/qwen3?format=wav")
+            .json(&serde_json::json!({"input": "hello"}))
+            .send(&service)
+            .await;
+
+        // Empty voice normalizes to "vivian" which is a preset — happy path.
+        assert_eq!(res.status_code.unwrap().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn should_return_200_when_voice_matches_custom_alias() {
+        let _guard = voice_test_guard().await;
+        let _temp = set_voices_json_with(r#"{"voices":{"mia_clone":{"aliases":["mia"]}}}"#);
+        let service = make_test_service();
+
+        let res = TestClient::post("http://127.0.0.1:5800/v1/audio/tts/qwen3?format=wav")
+            .json(&serde_json::json!({"voice": "mia", "input": "hi"}))
+            .send(&service)
+            .await;
+
+        assert_eq!(res.status_code.unwrap().as_u16(), 200);
+    }
+
+    #[test]
+    fn should_include_requested_voice_when_error_serializes() {
+        // Sanity-check the VoiceNotFoundError shape matches the contract.
+        let err = VoiceNotFoundError {
+            error: "voice_not_found",
+            message: "Voice 'x' is not registered. Available: vivian".into(),
+            requested_voice: "x".into(),
+            available_voices: vec!["vivian".into()],
+        };
+        let v: Value = serde_json::from_str(&serde_json::to_string(&err).unwrap()).unwrap();
+        assert_eq!(v["error"], "voice_not_found");
+        assert_eq!(v["requested_voice"], "x");
+        assert_eq!(v["available_voices"][0], "vivian");
+        assert!(v["message"].as_str().unwrap().contains("vivian"));
+    }
 }
