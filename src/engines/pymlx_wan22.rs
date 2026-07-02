@@ -14,7 +14,7 @@ use crate::types::{VideoGenerationRequest, VideoGenerationResponse, VideoFrameDa
 
 const SCRIPT_GGUF: &str = "infer_wan22_gguf.py";
 const SCRIPT_MLX: &str = "infer_wan22_mlx.py";
-const TIMEOUT: Duration = Duration::from_secs(900);
+const TIMEOUT: Duration = Duration::from_secs(3600);
 
 const DEFAULT_GUIDANCE_SCALE: f32 = 5.0;
 const DEFAULT_FPS: i32 = 16;
@@ -115,26 +115,46 @@ impl PymlxWan22Engine {
         let height_str = height.to_string();
         let num_frames_str = num_frames.to_string();
         let steps_str = request.steps.to_string();
-        let guidance_str = format!("{:.1}", DEFAULT_GUIDANCE_SCALE);
+        let guidance_str = format!("{:.2}", request.guide_scale.unwrap_or(DEFAULT_GUIDANCE_SCALE));
+        let seed_str = request.seed.unwrap_or(-1).to_string();
         let output_str = output_path.to_string_lossy().to_string();
         let model_dir_str = model_dir.to_string_lossy().to_string();
+        let prepared_image = prepare_input_image(request.image.as_deref())?;
+        let image_str = prepared_image.as_ref().map(|(path, _)| path.clone());
 
-        let args: Vec<&str> = vec![
-            "generate",
-            "--model-dir", &model_dir_str,
-            "-p", &request.prompt,
-            "--width", &width_str,
-            "--height", &height_str,
-            "--num-frames", &num_frames_str,
-            "--steps", &steps_str,
-            "--guide-scale", &guidance_str,
-            "--seed", "-1",
-            "--output", &output_str,
+        let mut args: Vec<String> = vec![
+            "generate".to_string(),
+            "--model-dir".to_string(), model_dir_str,
+            "-p".to_string(), request.prompt.clone(),
+            "--width".to_string(), width_str,
+            "--height".to_string(), height_str,
+            "--num-frames".to_string(), num_frames_str,
+            "--steps".to_string(), steps_str,
+            "--guide-scale".to_string(), guidance_str,
+            "--seed".to_string(), seed_str,
+            "--output".to_string(), output_str,
         ];
 
-        pymlx::run_and_read_output(
-            &self.python, &self.script, &args, &output_path, TIMEOUT,
-        ).context("Wan2.2 MLX video inference failed")
+        if let Some(negative_prompt) = non_empty(request.negative_prompt.as_deref()) {
+            args.push("--negative-prompt".to_string());
+            args.push(negative_prompt.to_string());
+        }
+
+        if let Some(image) = image_str {
+            args.push("--image".to_string());
+            args.push(image);
+        }
+
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = pymlx::run_and_read_output(
+            &self.python, &self.script, &arg_refs, &output_path, TIMEOUT,
+        ).context("Wan2.2 MLX video inference failed");
+
+        if let Some((_, Some(temp_path))) = prepared_image {
+            let _ = std::fs::remove_file(temp_path);
+        }
+
+        result
     }
 
     fn run_gguf(
@@ -159,34 +179,77 @@ impl PymlxWan22Engine {
         let num_frames_str = num_frames.to_string();
         let steps_str = request.steps.to_string();
         let fps_str = DEFAULT_FPS.to_string();
-        let guidance_str = format!("{:.1}", DEFAULT_GUIDANCE_SCALE);
+        let guidance_str = format!("{:.2}", request.guide_scale.unwrap_or(DEFAULT_GUIDANCE_SCALE));
+        let seed_str = request.seed.unwrap_or(-1).to_string();
         let output_str = output_path.to_string_lossy().to_string();
         let diffusion_str = diffusion_model.to_string_lossy().to_string();
         let t5_str = t5_model.to_string_lossy().to_string();
         let vae_str = vae_model.to_string_lossy().to_string();
 
-        let args: Vec<&str> = vec![
-            "--diffusion-model", &diffusion_str,
-            "--t5xxl", &t5_str,
-            "--vae", &vae_str,
-            "--prompt", &request.prompt,
-            "--width", &width_str,
-            "--height", &height_str,
-            "--video-frames", &num_frames_str,
-            "--fps", &fps_str,
-            "--sampling-steps", &steps_str,
-            "--sampling-method", "euler",
-            "--cfg-scale", &guidance_str,
-            "--seed", "-1",
-            "--mode", "vid_gen",
-            "--verbose",
-            "--output", &output_str,
+        if non_empty(request.image.as_deref()).is_some() {
+            return Err(eyre::eyre!(
+                "Wan2.2 image-to-video requires the MLX safetensors backend; the GGUF wrapper only supports text-to-video."
+            ));
+        }
+
+        let mut args: Vec<String> = vec![
+            "--diffusion-model".to_string(), diffusion_str,
+            "--t5xxl".to_string(), t5_str,
+            "--vae".to_string(), vae_str,
+            "--prompt".to_string(), request.prompt.clone(),
+            "--width".to_string(), width_str,
+            "--height".to_string(), height_str,
+            "--video-frames".to_string(), num_frames_str,
+            "--fps".to_string(), fps_str,
+            "--sampling-steps".to_string(), steps_str,
+            "--sampling-method".to_string(), "euler".to_string(),
+            "--cfg-scale".to_string(), guidance_str,
+            "--seed".to_string(), seed_str,
+            "--mode".to_string(), "vid_gen".to_string(),
+            "--verbose".to_string(),
+            "--output".to_string(), output_str,
         ];
 
+        if let Some(negative_prompt) = non_empty(request.negative_prompt.as_deref()) {
+            args.push("--negative-prompt".to_string());
+            args.push(negative_prompt.to_string());
+        }
+
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         pymlx::run_and_read_output(
-            &self.python, &self.script, &args, &output_path, TIMEOUT,
+            &self.python, &self.script, &arg_refs, &output_path, TIMEOUT,
         ).context("Wan2.2 GGUF video inference failed")
     }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn prepare_input_image(image: Option<&str>) -> Result<Option<(String, Option<PathBuf>)>> {
+    let Some(image) = non_empty(image) else {
+        return Ok(None);
+    };
+
+    let expanded = crate::utils::expand_tilde(image);
+    let path = PathBuf::from(&expanded);
+    if path.exists() {
+        return Ok(Some((expanded, None)));
+    }
+
+    let data = image
+        .split_once(',')
+        .filter(|(prefix, _)| prefix.starts_with("data:"))
+        .map(|(_, payload)| payload)
+        .unwrap_or(image);
+
+    let bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        data,
+    ).context("Failed to decode video input image as base64")?;
+
+    let temp_path = pymlx::write_temp_file("wan22-ref", "png", &bytes)?;
+    Ok(Some((temp_path.to_string_lossy().to_string(), Some(temp_path))))
 }
 
 fn detect_model_format() -> Result<(ModelFormat, &'static str)> {
@@ -209,14 +272,20 @@ fn detect_model_format() -> Result<(ModelFormat, &'static str)> {
         return Ok((ModelFormat::Mlx { model_dir: mlx_dir }, SCRIPT_MLX));
     }
 
-    // Fall back to GGUF
-    let gguf_dir = PathBuf::from(&home).join(".OminiX/models/wan2.2");
-    if gguf_dir.is_dir() {
-        return Ok((ModelFormat::Gguf { model_dir: gguf_dir }, SCRIPT_GGUF));
+    // Fall back to GGUF installs.
+    for relative_dir in [
+        ".OminiX/models/wan2.2-5b-q4km",
+        ".OminiX/models/wan2.2-5b-q8",
+        ".OminiX/models/wan2.2",
+    ] {
+        let gguf_dir = PathBuf::from(&home).join(relative_dir);
+        if gguf_dir.is_dir() {
+            return Ok((ModelFormat::Gguf { model_dir: gguf_dir }, SCRIPT_GGUF));
+        }
     }
 
     Err(eyre::eyre!(
-        "Wan2.2 model not found. Place MLX model in ~/.OminiX/models/wan2.2-5b/mlx_model_4bit/ or GGUF model in ~/.OminiX/models/wan2.2/"
+        "Wan2.2 model not found. Place MLX model in ~/.OminiX/models/wan2.2-5b/mlx_model_4bit/ or GGUF model in ~/.OminiX/models/wan2.2-5b-q4km/, ~/.OminiX/models/wan2.2-5b-q8/, or ~/.OminiX/models/wan2.2/"
     ))
 }
 

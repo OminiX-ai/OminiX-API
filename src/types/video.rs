@@ -5,12 +5,20 @@ pub struct VideoGenerationRequest {
     pub prompt: String,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
     #[serde(default = "default_size")]
     pub size: String,
     #[serde(default = "default_num_frames")]
     pub num_frames: i32,
     #[serde(default = "default_steps")]
     pub steps: i32,
+    #[serde(default, alias = "guidance_scale")]
+    pub guide_scale: Option<f32>,
+    #[serde(default)]
+    pub seed: Option<i64>,
     #[serde(default = "default_response_format")]
     #[allow(dead_code)]
     pub response_format: String,
