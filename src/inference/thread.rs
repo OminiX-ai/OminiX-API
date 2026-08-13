@@ -1,10 +1,52 @@
+use std::collections::VecDeque;
+use std::time::Instant;
+
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
 use crate::engines::{asr, image, llm, tts, vlm};
 use crate::inference::tts_pool::{Qwen3TtsEngines, TtsPoolConfig};
+use crate::types::{TranscriptionRequest, TranscriptionResponse};
 
 use super::{InferenceRequest, ModelStatus};
+
+/// One transcription waiting to be served, with the caller to reply to.
+struct PendingTranscribe {
+    request: TranscriptionRequest,
+    response_tx: oneshot::Sender<eyre::Result<TranscriptionResponse>>,
+}
+
+/// Run a coalesced group of transcriptions and reply to each caller.
+///
+/// The engine returns one result per request in order, so a failure — a bad
+/// audio file, a language that could not share the batch — is delivered only to
+/// the caller it belongs to.
+fn serve_transcribe_batch(
+    asr_engine: &mut Option<asr::AsrEngine>,
+    batch: Vec<PendingTranscribe>,
+) {
+    let Some(engine) = asr_engine.as_mut() else {
+        for item in batch {
+            let _ = item.response_tx.send(Err(eyre::eyre!(
+                "ASR model not loaded. Use POST /v1/models/load with model_type=asr"
+            )));
+        }
+        return;
+    };
+
+    if batch.len() > 1 {
+        tracing::debug!("ASR batch of {}", batch.len());
+    }
+
+    let (requests, senders): (Vec<_>, Vec<_>) =
+        batch.into_iter().map(|p| (p.request, p.response_tx)).unzip();
+    let results = engine.transcribe_batch(&requests);
+
+    for (tx, result) in senders.into_iter().zip(results) {
+        let _ = tx.send(result);
+    }
+}
 
 /// Helper to load a model into a slot, freeing the old one first.
 fn load_model_slot<E, F>(
@@ -112,8 +154,36 @@ pub fn inference_thread(
     tracing::info!("Inference thread ready, processing requests...");
     tracing::info!("Dynamic model loading enabled - use POST /v1/models/load to switch models");
 
+    let max_batch = config.asr_max_batch();
+    let batch_window = config.asr_batch_window();
+    tracing::info!("Host: {}", config.describe_host());
+    tracing::info!(
+        "ASR batching: mode={} max_batch={} window={}ms",
+        config.asr_mode.as_str(),
+        max_batch,
+        batch_window.as_millis()
+    );
+    if !config.asr_use_ane() && config.chip.generation() > 0 && config.chip.generation() < 5 {
+        tracing::info!(
+            "ASR Neural Engine offload not used on {} — GPU-only. \
+             The ANE only becomes a useful second unit from M5 onward.",
+            config.chip.as_str()
+        );
+    }
+
+    // Requests pulled off the channel while forming a batch but not part of it.
+    // They are served, in arrival order, before the channel is read again.
+    let mut deferred: VecDeque<InferenceRequest> = VecDeque::new();
+
     // Process requests
-    while let Some(request) = rx.blocking_recv() {
+    loop {
+        let request = match deferred.pop_front() {
+            Some(r) => r,
+            None => match rx.blocking_recv() {
+                Some(r) => r,
+                None => break,
+            },
+        };
         match request {
             InferenceRequest::Chat { request, response_tx } => {
                 let result = if let Some(ref mut engine) = llm_engine {
@@ -137,12 +207,73 @@ pub fn inference_thread(
                         }
                     }
                 }
-                let result = if let Some(ref mut engine) = asr_engine {
-                    engine.transcribe(&request)
-                } else {
-                    Err(eyre::eyre!("ASR model not loaded. Use POST /v1/models/load with model_type=asr"))
-                };
-                let _ = response_tx.send(result);
+
+                let mut batch = vec![PendingTranscribe { request, response_tx }];
+
+                // Coalesce. The rule is opportunistic: take what has already
+                // arrived, and only wait for more once there is evidence of
+                // load. A lone request at low load is therefore never delayed,
+                // which is what usually makes batching hurt latency.
+                //
+                // This needs no tuning to find the right batch size. At a given
+                // offered load the queue depth settles at arrival-rate times
+                // service-time, so the batch that forms is the one the load
+                // actually justifies.
+                if max_batch > 1 {
+                    let can_batch =
+                        asr_engine.as_ref().is_some_and(|e| e.supports_batching());
+                    if can_batch {
+                        let deadline = Instant::now() + batch_window;
+                        loop {
+                            if batch.len() >= max_batch {
+                                break;
+                            }
+                            match rx.try_recv() {
+                                Ok(InferenceRequest::Transcribe {
+                                    request,
+                                    expected_backend: exp,
+                                    response_tx,
+                                }) => {
+                                    // A mismatched backend can't join the batch;
+                                    // answer it here rather than dropping it.
+                                    let mismatch = exp.as_deref().and_then(|want| {
+                                        asr_engine.as_ref().map(|e| e.backend_name()).and_then(
+                                            |actual| (actual != want).then(|| (want.to_string(), actual)),
+                                        )
+                                    });
+                                    match mismatch {
+                                        Some((want, actual)) => {
+                                            let _ = response_tx.send(Err(eyre::eyre!(
+                                                "Expected {} ASR but {} is loaded. Use POST /v1/models/load with model_type=asr to switch.",
+                                                want, actual
+                                            )));
+                                        }
+                                        None => batch.push(PendingTranscribe {
+                                            request,
+                                            response_tx,
+                                        }),
+                                    }
+                                }
+                                Ok(other) => deferred.push_back(other),
+                                Err(TryRecvError::Empty) => {
+                                    // Nothing queued. Only linger if a batch is
+                                    // already forming and there is time left.
+                                    if batch.len() < 2
+                                        || batch_window.is_zero()
+                                        || Instant::now() >= deadline
+                                    {
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_micros(200));
+                                }
+                                Err(TryRecvError::Disconnected) => break,
+                            }
+                        }
+                    }
+                }
+
+                serve_transcribe_batch(&mut asr_engine, batch);
+                continue;
             }
             // Speech via inference thread: only for GPT-SoVITS (tts_engine).
             // Qwen3-TTS Speech requests go to the TTS pool instead.

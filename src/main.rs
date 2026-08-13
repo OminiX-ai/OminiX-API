@@ -18,6 +18,7 @@ use eyre::Context;
 use salvo::prelude::*;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+mod chip;
 mod config;
 mod error;
 mod server_config;
