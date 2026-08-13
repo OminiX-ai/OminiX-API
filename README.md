@@ -84,6 +84,9 @@ ominix-api --app-manifest my-app.ominix.toml
 | `PORT` | `8080` | HTTP server port |
 | `LLM_MODEL` | `mlx-community/Mistral-7B-Instruct-v0.2-4bit` | HuggingFace model ID |
 | `ASR_MODEL_DIR` | (empty) | Path to Paraformer model directory |
+| `ASR_MODE` | `conversational` | ASR batching: `off`, `interactive`, `conversational`, `offline` — see [docs/asr-batching.md](docs/asr-batching.md) |
+| `ASR_MAX_BATCH` | (from mode) | Override the batch size chosen by `ASR_MODE` |
+| `ASR_USE_ANE` | M5+ only | Allow ASR encoder work on the Neural Engine. Off on M1–M4 regardless — see [Apple silicon generations](#apple-silicon-generations) |
 | `TTS_REF_AUDIO` | (empty) | Path to reference audio for voice cloning |
 | `IMAGE_MODEL` | (empty) | Image model: `zimage` or `flux` |
 | `FLUX_MODEL_DIR` | (auto-download) | Custom path to FLUX.2-klein model |
@@ -1190,7 +1193,86 @@ For high-concurrency TTS workloads, the planned architecture is a **dynamic inst
 - Idle instances are reclaimed after a configurable timeout
 - System RAM is checked before spawning (`sysctl hw.memsize` - current usage)
 
+## Apple silicon generations
+
+The server identifies the host chip at startup and reports it:
+
+```
+INFO Host: chip=M5 gpu_neural_accelerators=true asr_ane=enabled
+```
+
+| Generation | GPU Neural Accelerators | ASR on the Neural Engine |
+|------------|-------------------------|--------------------------|
+| M1 – M4 | no | **not used** |
+| M5 and later | yes (Metal 4 tensor ops) | permitted |
+
+Every Apple silicon Mac has a Neural Engine, but reaching it requires a Core ML
+port — MLX has no ANE backend on any generation. Through M4 that port is not
+worth making for ASR: the ANE cannot beat the GPU path at transformer decode,
+and running it alongside returns little. M5 changes the arithmetic, because its
+GPU gained Neural Accelerators and the two became genuinely separate units worth
+running at once. So ANE use is enabled from M5 onward and off before it.
+
+`ASR_USE_ANE=1|0` overrides in either direction, for benchmarking a generation
+the default excludes. Note that the ANE **encoder-offload path is not yet
+implemented** — this setting currently expresses policy and gates what a future
+offload scheduler is permitted to do.
+
 ## Performance
+
+### ASR — Qwen3-ASR on Apple M5 Max (40 GPU cores, 128 GB)
+
+Measured against LibriSpeech `test-clean` — 2,620 real utterances, 5.4 h of
+audio, scored for word error rate so the throughput numbers cannot come from
+degenerate output. Sessions are open-loop: each simulated speaker produces one
+second of audio per second of wall clock.
+
+| Configuration | Concurrent sessions | p50 latency | WER |
+|---------------|--------------------:|------------:|----:|
+| 1.7B 8-bit, 1 process, no batching | 31 | 754 ms | 1.69% |
+| 1.7B 4-bit, 1 process, no batching | 40 | 290 ms | 1.30% |
+| 1.7B 4-bit, 1 process, batching | 70 | 487 ms | 1.30% |
+| 1.7B 4-bit, 2 processes, batching | 90 | 1,098 ms | 1.30% |
+| **1.7B 4-bit, 3 processes, batching** | **105** | 1,725 ms | 1.30% |
+
+**Recommended operating point: ~95 sessions across 3 processes** (p50 598 ms).
+Saturation is abrupt — latency goes near-vertical within a few extra sessions —
+so leaving headroom matters more than squeezing out the last five channels. At
+90 sessions the GPU runs at 84% mean utilisation (95% p90); memory is 5.1 GB
+total, nowhere near a constraint on 128 GB.
+
+Batching throughput at 16 concurrent clients:
+
+| `ASR_MODE` | Max batch | Throughput | p50 | vs `off` |
+|------------|----------:|-----------:|----:|---------:|
+| `off` | 1 | 38.0 ×RT | 2,391 ms | 1.00× |
+| `interactive` | 4 | 66.8 ×RT | 1,270 ms | 1.76× |
+| `conversational` | 8 | 73.2 ×RT | 1,249 ms | 1.93× |
+| `offline` | 32 | 79.8 ×RT | 981 ms | 2.10× |
+
+Batching improves latency as well as throughput here: at a fixed number of
+waiting clients the queue drains roughly twice as fast. Correctness is
+unaffected — across 48 utterances, transcripts produced in batches of 8 were
+identical to the same utterances transcribed one at a time.
+
+Model variants, single stream:
+
+| Model | Size | Throughput | p50 | WER |
+|-------|-----:|-----------:|----:|----:|
+| Qwen3-ASR 1.7B 8-bit | 2.3 GB | 38.3 ×RT | 154 ms | 1.69% |
+| Qwen3-ASR 1.7B 4-bit | 1.5 GB | 46.2 ×RT | 103 ms | 1.30% |
+| Qwen3-ASR 0.6B 8-bit | 0.97 GB | 64.2 ×RT | 74 ms | 2.86% |
+
+4-bit is both faster and more accurate than 8-bit on this model — decode is
+memory-bandwidth-bound, so halving the weight bytes attacks the dominant cost.
+
+> Requires MLX 0.32.0 or newer. Earlier builds compute RoPE incorrectly at
+> sequence length 1 with batch > 1, which is exactly the shape batched decode
+> uses; the server probes for the defect at startup and falls back to
+> single-request decoding rather than returning corrupt transcripts. See
+> [docs/asr-batching.md](docs/asr-batching.md).
+
+### Other tasks
 
 Benchmarks on Apple M3 Max (128GB):
 

@@ -180,6 +180,125 @@ impl AsrEngine {
         }
     }
 
+    /// Whether this backend can transcribe a batch in one pass.
+    ///
+    /// Two conditions. Only Qwen3-ASR implements batched decode — the others are
+    /// driven one request at a time. And the linked MLX must handle RoPE
+    /// correctly at sequence length 1 with a batch above 1, which builds before
+    /// MLX 0.32.0 do not; on those, batching would silently return wrong
+    /// transcripts for every item after the first, so it stays off.
+    pub fn supports_batching(&self) -> bool {
+        matches!(self.backend, AsrBackend::Qwen3Asr { .. }) && mlx_supports_batching()
+    }
+
+    /// Transcribe several requests together.
+    ///
+    /// Returns one result per request, in the order supplied, so a single bad
+    /// input fails only its own caller rather than the whole batch. Audio
+    /// decoding happens per request and its failures are reported individually;
+    /// only the successfully decoded requests reach the model.
+    pub fn transcribe_batch(
+        &mut self,
+        requests: &[TranscriptionRequest],
+    ) -> Vec<Result<TranscriptionResponse>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        if requests.len() == 1 || !self.supports_batching() {
+            return requests.iter().map(|r| self.transcribe(r)).collect();
+        }
+
+        // Decode everything first, keeping failures in place so one bad input
+        // cannot take down its neighbours.
+        let decoded: Vec<Result<(Vec<f32>, f32)>> =
+            requests.iter().map(decode_audio).collect();
+
+        // The language is baked into the prompt, so only requests sharing one
+        // can ride in the same batch. The rest fall back to individual calls.
+        let language = requests[0].language.as_deref().unwrap_or("auto").to_string();
+        let idx: Vec<usize> = (0..requests.len())
+            .filter(|&i| {
+                decoded[i].is_ok()
+                    && requests[i].language.as_deref().unwrap_or("auto") == language
+            })
+            .collect();
+
+        let config = qwen3_asr_mlx::SamplingConfig {
+            // Same cap as the single-request path. Under batching it is also a
+            // memory guard: a runaway generation multiplies its KV cache by the
+            // batch size, so raising it costs far more than it appears to.
+            max_tokens: 1024,
+            ..Default::default()
+        };
+
+        let mut batched: Vec<Option<Result<TranscriptionResponse>>> =
+            (0..requests.len()).map(|_| None).collect();
+
+        if !idx.is_empty() {
+            // Copy durations out before borrowing `decoded` for the sample slices.
+            let durations: Vec<f32> =
+                idx.iter().map(|&i| decoded[i].as_ref().unwrap().1).collect();
+
+            let outcome = {
+                let samples: Vec<&[f32]> = idx
+                    .iter()
+                    .map(|&i| decoded[i].as_ref().unwrap().0.as_slice())
+                    .collect();
+                match &mut self.backend {
+                    AsrBackend::Qwen3Asr { model } => {
+                        model.transcribe_batch(&samples, &language, &config)
+                    }
+                    // supports_batching() was checked above.
+                    _ => unreachable!("non-Qwen3 backend reached the batched path"),
+                }
+            };
+            unsafe { mlx_sys::mlx_clear_cache(); }
+
+            match outcome {
+                Ok(texts) if texts.len() == idx.len() => {
+                    for ((&slot, text), duration) in
+                        idx.iter().zip(texts).zip(&durations)
+                    {
+                        batched[slot] = Some(Ok(TranscriptionResponse {
+                            text,
+                            language: Some(language.clone()),
+                            duration: Some(*duration),
+                        }));
+                    }
+                }
+                Ok(texts) => {
+                    for &slot in &idx {
+                        batched[slot] = Some(Err(eyre::eyre!(
+                            "Qwen3-ASR batch returned {} transcripts for {} inputs",
+                            texts.len(),
+                            idx.len()
+                        )));
+                    }
+                }
+                Err(e) => {
+                    for &slot in &idx {
+                        batched[slot] =
+                            Some(Err(eyre::eyre!("Qwen3-ASR batch failed: {:?}", e)));
+                    }
+                }
+            }
+        }
+
+        // Whatever the batch didn't cover: decode failures keep their own error,
+        // a differing language gets its own single-request pass.
+        let mut out = Vec::with_capacity(requests.len());
+        for (i, (req, dec)) in requests.iter().zip(decoded).enumerate() {
+            out.push(match batched[i].take() {
+                Some(r) => r,
+                None => match dec {
+                    Err(e) => Err(e),
+                    Ok(_) => self.transcribe(req),
+                },
+            });
+        }
+        out
+    }
+
     /// Run one short dummy inference so the first real request doesn't pay the
     /// MLX graph-compilation cost (~5s for Qwen3-ASR). Errors are non-fatal.
     pub fn warmup(&mut self) {
@@ -217,6 +336,26 @@ impl AsrEngine {
             Err(e) => tracing::warn!("ASR warmup failed (non-fatal): {}", e),
         }
     }
+}
+
+/// Probe the linked MLX once for the batched-decode defect, and remember it.
+///
+/// See `qwen3_asr_mlx::batched_decode_supported`. Cached because the probe
+/// allocates and runs a kernel, and the answer cannot change at runtime.
+fn mlx_supports_batching() -> bool {
+    use std::sync::OnceLock;
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let ok = qwen3_asr_mlx::batched_decode_supported();
+        if !ok {
+            tracing::warn!(
+                "ASR batching disabled: this MLX build mis-handles RoPE at sequence \
+                 length 1 with batch > 1 (fixed in MLX 0.32.0). Serving one request \
+                 at a time — correct, but without the batching speedup."
+            );
+        }
+        ok
+    })
 }
 
 /// Decode audio from request: accepts a local file path (starts with '/') or base64-encoded audio.
