@@ -15,6 +15,32 @@ pub async fn health(res: &mut Response) {
     })));
 }
 
+/// GET /readyz - Readiness check for configured external inference routes.
+///
+/// Process liveness remains `/health`. When no OminiX-SGLang route is
+/// configured, local-only operation is immediately ready.
+#[handler]
+pub async fn readiness(depot: &mut Depot, res: &mut Response) -> Result<(), StatusError> {
+    let state = get_state(depot)?;
+    let Some(router) = &state.sglang_router else {
+        res.render(Json(serde_json::json!({
+            "status": "ready",
+            "sglang_cuda": {"configured": false}
+        })));
+        return Ok(());
+    };
+
+    let status = router.status().await;
+    if !status.model_ready {
+        res.status_code(salvo::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+    res.render(Json(serde_json::json!({
+        "status": if status.model_ready { "ready" } else { "not_ready" },
+        "sglang_cuda": status
+    })));
+    Ok(())
+}
+
 /// GET /v1/models - List available models (queries live status + TTS pool)
 #[handler]
 pub async fn list_models(depot: &mut Depot, res: &mut Response) -> Result<(), StatusError> {
@@ -34,12 +60,31 @@ pub async fn list_models(depot: &mut Depot, res: &mut Response) -> Result<(), St
     let now = chrono::Utc::now().timestamp();
     let mut data = Vec::new();
 
+    if let Some(router) = &state.sglang_router {
+        if router.status().await.model_ready {
+            for id in router.model_ids() {
+                data.push(serde_json::json!({
+                    "id": id, "object": "model", "created": now,
+                    "owned_by": "ominix-sglang", "type": "llm",
+                    "backend": "cuda-worker-v0",
+                    "endpoints": ["/v1/chat/completions"]
+                }));
+            }
+        }
+    }
+
     if let Some(ref id) = status.llm {
-        data.push(serde_json::json!({
-            "id": id, "object": "model", "created": now,
-            "owned_by": "local", "type": "llm",
-            "endpoints": ["/v1/chat/completions"]
-        }));
+        let routed_remotely = state
+            .sglang_router
+            .as_ref()
+            .is_some_and(|router| router.routes_model(id));
+        if !routed_remotely {
+            data.push(serde_json::json!({
+                "id": id, "object": "model", "created": now,
+                "owned_by": "local", "type": "llm",
+                "endpoints": ["/v1/chat/completions"]
+            }));
+        }
     }
     if let Some(ref id) = status.asr {
         let endpoint = match id.as_str() {
@@ -169,9 +214,20 @@ pub async fn model_status(depot: &mut Depot, res: &mut Response) -> Result<(), S
         });
     }
 
+    let sglang_cuda = match &state.sglang_router {
+        Some(router) => serde_json::to_value(router.status().await).unwrap_or_default(),
+        None => serde_json::json!({
+            "configured": false,
+            "models": [],
+            "shim_reachable": false,
+            "model_ready": false
+        }),
+    };
+
     res.render(Json(serde_json::json!({
         "status": "success",
-        "models": status
+        "models": status,
+        "sglang_cuda": sglang_cuda
     })));
     Ok(())
 }

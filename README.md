@@ -45,7 +45,7 @@ VERSION=1.0.0 INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.
 ## Build from Source
 
 <details>
-<summary>For contributors (requires Rust 1.82+ and Xcode Command Line Tools)</summary>
+<summary>For contributors (requires Rust 1.82+, protoc, and Xcode Command Line Tools)</summary>
 
 ```bash
 # Clone both repositories
@@ -82,6 +82,7 @@ ominix-api --app-manifest my-app.ominix.toml
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8080` | HTTP server port |
+| `OMINIX_API_HOST` | `0.0.0.0` locally; `127.0.0.1` with CUDA routing | HTTP bind host |
 | `LLM_MODEL` | `mlx-community/Mistral-7B-Instruct-v0.2-4bit` | HuggingFace model ID |
 | `ASR_MODEL_DIR` | (empty) | Path to Paraformer model directory |
 | `ASR_MODE` | `conversational` | ASR batching: `off`, `interactive`, `conversational`, `offline` — see [docs/asr-batching.md](docs/asr-batching.md) |
@@ -96,12 +97,71 @@ ominix-api --app-manifest my-app.ominix.toml
 | `VOICES_CONFIG` | `~/.dora/models/primespeech/voices.json` | Path to voice registry file |
 | `TTS_VOICES_DIR` | (none) | Allowed directory for voice file path references |
 | `OMINIX_APP_MANIFEST` | (none) | Path to app manifest (`ominix.toml`) for startup validation |
+| `OMINIX_V0_SCHEDULER_URL` | (none) | Authenticated OminiX-SGLang worker-v0 shim base URL; enables explicit CUDA routing |
+| `OMINIX_V0_SCHEDULER_MODELS` | (none) | Comma-separated, case-sensitive public model IDs routed to the shim |
+| `OMINIX_V0_SERVED_MODEL` | (none) | Exact model identity expected from the shim's scheduler |
+| `OMINIX_V0_SCHEDULER_TOKEN` | (none) | Internal bearer token used only for API-to-shim requests |
+| `OMINIX_V0_SCHEDULER_TIMEOUT_SECS` | `1800` | CUDA generation timeout, from 1 to 86400 seconds |
+| `OMINIX_V0_CHAT_TEMPLATE_KWARGS_JSON` | `{}` | Optional JSON object passed to the shim tokenizer's chat template |
+
+### CUDA LLM routing through OminiX-SGLang
+
+OminiX-API does not guess from GPU availability. Configure exact model IDs so
+the same public name cannot silently switch between a local MLX checkpoint and
+a CUDA checkpoint. Mapped requests fail closed when the remote worker is
+unavailable; only unmapped models use the existing local inference path.
+
+For the C2Rust FP8 + DFlash worker described by the OminiX-SGLang recipe:
+
+```bash
+: "${OMINIX_C2RUST_WORKER_TOKEN:?set the internal worker token}"
+
+OMINIX_V0_SCHEDULER_URL=http://127.0.0.1:19091 \
+OMINIX_V0_SCHEDULER_MODELS=C2Rust-FP8-DFlash \
+OMINIX_V0_SERVED_MODEL=C2Rust-FP8-DFlash \
+OMINIX_V0_SCHEDULER_TOKEN="$OMINIX_C2RUST_WORKER_TOKEN" \
+OMINIX_V0_SCHEDULER_TIMEOUT_SECS=1800 \
+OMINIX_V0_CHAT_TEMPLATE_KWARGS_JSON='{"enable_thinking":false}' \
+ominix-api
+```
+
+The URL must point to the authenticated worker-v0 HTTP/SSE shim, not directly
+to SGLang's gRPC port. Plain HTTP is accepted only for loopback; use HTTPS for
+a worker on another host. The API validates the configured served-model
+identity through `/get_model_info`. `/health` reports process liveness, while
+`/readyz` returns `503` until the configured CUDA model is reachable and ready.
+
+OminiX-API remains a macOS/Apple-Silicon process. When OminiX-SGLang runs on a
+remote CUDA host, either expose the shim through an authenticated HTTPS service
+or carry its loopback listener over a managed SSH tunnel:
+
+```bash
+ssh -o ExitOnForwardFailure=yes -N -L 19091:127.0.0.1:19091 cuda-worker.example
+```
+
+With that tunnel, keep `OMINIX_V0_SCHEDULER_URL=http://127.0.0.1:19091`. The
+shim must run in gRPC mode, report the exact `OMINIX_V0_SERVED_MODEL`, and
+reject generation envelopes for any other model identity.
+
+When CUDA routing is enabled, OminiX-API binds to loopback by default. This
+server does not yet implement public-client authentication; expose it through
+an authenticated TLS reverse proxy. Set `OMINIX_API_HOST=0.0.0.0` only when
+that boundary (or an equivalently trusted private network) is in place. The
+worker token authenticates API-to-shim traffic and is not a public API key.
+Wildcard CORS is also disabled in CUDA-routing mode; configure browser origins
+at the authenticated proxy rather than exposing the loopback server directly.
+
+The initial remote route supports plain-string text chat, including true
+streaming. It rejects multipart/multimodal content and structured tool calls
+because worker-v0 currently exposes text/token deltas but not OpenAI tool-call
+deltas.
 
 ## Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
+| `/readyz` | GET | Readiness check, including configured OminiX-SGLang models |
 | `/v1/version` | GET | Server capabilities and version info |
 | `/v1/models` | GET | List loaded models |
 | `/v1/models/status` | GET | Get current model status for each category |
@@ -1132,6 +1192,8 @@ To add a new capability (e.g., video generation):
 **Key Design Points:**
 
 - **Actor Model**: MLX models don't implement `Send`/`Sync`, so all models run on a dedicated inference thread. HTTP and WebSocket handlers communicate via bounded async channels.
+
+- **Explicit CUDA Routing**: Exact model IDs can bypass the MLX actor and use an authenticated OminiX-SGLang worker-v0 shim. The route is configuration-driven and never falls back locally after a remote failure.
 
 - **One Model Per Slot**: Each category has exactly one model slot. Loading a new model automatically unloads the previous one to free GPU memory.
 

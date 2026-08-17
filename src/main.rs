@@ -42,6 +42,30 @@ use inference::{InferenceRequest, TtsPoolConfig};
 use state::AppState;
 use types::{DownloadProgressEvent, TrainingProgressEvent};
 
+fn host_port(host: &str, port: u16) -> String {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn discovery_url(listen_host: &str, port: u16) -> String {
+    let host = listen_host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(listen_host);
+    let reachable_host = match host {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        host => host,
+    };
+    format!("http://{}", host_port(reachable_host, port))
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     // Initialize tracing
@@ -54,11 +78,44 @@ async fn main() -> eyre::Result<()> {
 
     let mut config = Config::from_env();
     let server_config = std::sync::Arc::new(server_config::ServerConfig::load());
-    tracing::info!("Starting OminiX-API v{} on port {}", version::full_version(), config.port);
+    let sglang_router = engines::sglang::SglangRouter::from_env()?;
+    tracing::info!(
+        "Starting OminiX-API v{} on port {}",
+        version::full_version(),
+        config.port
+    );
 
-    // Apply server_config allowlist to CLI-specified models.
-    // This lets agents serve only a subset of available models.
+    // Apply the gatekeeper before collision checks so a blocked local model is
+    // cleared rather than mistaken for an active backend.
     config.apply_server_config(&server_config);
+
+    if let Some(router) = &sglang_router {
+        for model in router.model_ids() {
+            if !server_config.is_model_allowed("llm", &model) {
+                eyre::bail!(
+                    "OminiX-SGLang route {:?} is blocked by allowed_models.llm",
+                    model
+                );
+            }
+        }
+        if !server_config.is_model_allowed("llm", router.served_model()) {
+            eyre::bail!(
+                "OminiX-SGLang served model {:?} is blocked by allowed_models.llm",
+                router.served_model()
+            );
+        }
+        if !config.llm_model.is_empty() && router.routes_model(&config.llm_model) {
+            eyre::bail!(
+                "LLM_MODEL collides with an exact OminiX-SGLang route; configure one backend for model {:?}",
+                config.llm_model
+            );
+        }
+        tracing::info!(
+            models = ?router.model_ids(),
+            "Configured explicit OminiX-SGLang CUDA model routing"
+        );
+    }
+    let has_sglang_router = sglang_router.is_some();
 
     // Validate app manifest if provided
     if let Some(ref manifest_path) = config.app_manifest {
@@ -162,27 +219,44 @@ async fn main() -> eyre::Result<()> {
         download_progress_tx,
         download_cancel_flags,
         server_config,
+        sglang_router: sglang_router.map(std::sync::Arc::new),
         ascend_config,
         ascend_tts_backend,
     };
 
     let router = router::build_router(state);
 
-    let listen_addr = format!("0.0.0.0:{}", config.port);
+    // Preserve the existing bind behavior for local-only MLX deployments. A
+    // configured CUDA route defaults to loopback because this API currently
+    // delegates public authentication/TLS to a reverse proxy.
+    let default_host = if has_sglang_router {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    };
+    let listen_host = std::env::var("OMINIX_API_HOST")
+        .ok()
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| default_host.to_string());
+    let listen_addr = host_port(&listen_host, config.port);
     let acceptor = TcpListener::new(&listen_addr).bind().await;
 
     tracing::info!("HTTP server listening on http://{}", listen_addr);
 
-    // Write discovery file so other tools can find us without hardcoded URLs
-    // Use 127.0.0.1 (not localhost) to avoid IPv6 resolution issues.
-    // reqwest resolves localhost to ::1 first, which fails if we only bind IPv4.
-    let api_url = format!("http://127.0.0.1:{}", config.port);
+    // Write a reachable address for the configured bind. Wildcard listeners
+    // advertise IPv4 loopback; concrete IPv4, IPv6, and hostname binds retain
+    // their selected host.
+    let api_url = discovery_url(&listen_host, config.port);
     if let Some(home) = std::env::var_os("HOME") {
         let discovery_dir = std::path::Path::new(&home).join(".ominix");
         let _ = std::fs::create_dir_all(&discovery_dir);
         let discovery_file = discovery_dir.join("api_url");
         if let Err(e) = std::fs::write(&discovery_file, &api_url) {
-            tracing::warn!("Failed to write discovery file {}: {e}", discovery_file.display());
+            tracing::warn!(
+                "Failed to write discovery file {}: {e}",
+                discovery_file.display()
+            );
         } else {
             tracing::info!("Discovery file: {}", discovery_file.display());
         }
@@ -190,6 +264,7 @@ async fn main() -> eyre::Result<()> {
 
     tracing::info!("Endpoints:");
     tracing::info!("  GET  /health");
+    tracing::info!("  GET  /readyz");
     tracing::info!("  GET  /v1/version");
     tracing::info!("  --- Models ---");
     tracing::info!("  GET  /v1/models");
@@ -238,4 +313,24 @@ async fn main() -> eyre::Result<()> {
     Server::new(acceptor).serve(router).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod routing_address_tests {
+    use super::*;
+
+    #[test]
+    fn formats_ipv4_and_ipv6_listener_addresses() {
+        assert_eq!(host_port("127.0.0.1", 8080), "127.0.0.1:8080");
+        assert_eq!(host_port("::1", 8080), "[::1]:8080");
+        assert_eq!(host_port("[::1]", 8080), "[::1]:8080");
+    }
+
+    #[test]
+    fn discovery_tracks_concrete_hosts_and_maps_wildcards_to_loopback() {
+        assert_eq!(discovery_url("0.0.0.0", 8080), "http://127.0.0.1:8080");
+        assert_eq!(discovery_url("::", 8080), "http://127.0.0.1:8080");
+        assert_eq!(discovery_url("::1", 8080), "http://[::1]:8080");
+        assert_eq!(discovery_url("192.0.2.10", 8080), "http://192.0.2.10:8080");
+    }
 }
