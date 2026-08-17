@@ -70,6 +70,23 @@ pub async fn load_model(
         return Ok(());
     }
 
+    // An exact public alias has one backend. Do not let dynamic loading create
+    // a hidden local model that chat routing will continue to send remotely.
+    if model_type == "llm"
+        && state
+            .sglang_router
+            .as_ref()
+            .is_some_and(|router| router.routes_model(&request.model))
+    {
+        render_error(
+            res,
+            salvo::http::StatusCode::CONFLICT,
+            "This model id is reserved for an OminiX-SGLang CUDA route",
+            "model_route_conflict",
+        );
+        return Ok(());
+    }
+
     let inference_request = match model_type {
         "llm" => {
             let (response_tx, response_rx) = oneshot::channel();

@@ -4,6 +4,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::download;
 use crate::engines::ascend::AscendConfig;
+use crate::engines::sglang::SglangRouter;
 use crate::engines::tts_trait::TextToSpeech;
 use crate::inference::InferenceRequest;
 use crate::server_config::ServerConfig;
@@ -29,6 +30,9 @@ pub struct AppState {
     pub download_cancel_flags: download::DownloadCancelFlags,
     /// Server config (model gatekeeper)
     pub server_config: Arc<ServerConfig>,
+    /// Optional exact model-id router for the authenticated OminiX-SGLang
+    /// worker-v0 boundary. Unmapped models continue to use `inference_tx`.
+    pub sglang_router: Option<Arc<SglangRouter>>,
     /// Optional Ascend NPU backend configuration
     pub ascend_config: Option<Arc<AscendConfig>>,
     /// Shared TTS backend for Ascend endpoints (selected at startup via

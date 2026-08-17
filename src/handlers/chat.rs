@@ -30,6 +30,34 @@ pub async fn chat_completions(
 
     let is_streaming = request.stream.unwrap_or(false);
 
+    // Exact, administrator-configured model ids route to OminiX-SGLang. A
+    // mapped route is fail-closed: transport/protocol failures never fall back
+    // to a different local MLX model.
+    if let Some(router) = state
+        .sglang_router
+        .as_ref()
+        .filter(|router| router.routes_model(&request.model))
+    {
+        if let Err(error) = router.render_chat_completion(&request, res).await {
+            tracing::error!(
+                model = %request.model,
+                error_class = error.log_class(),
+                "OminiX-SGLang request failed"
+            );
+            let status = if error.is_client_error() {
+                salvo::http::StatusCode::BAD_REQUEST
+            } else if error.is_timeout() {
+                salvo::http::StatusCode::GATEWAY_TIMEOUT
+            } else if error.is_unavailable() {
+                salvo::http::StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                salvo::http::StatusCode::BAD_GATEWAY
+            };
+            crate::error::render_error(res, status, error.public_message(), "upstream_error");
+        }
+        return Ok(());
+    }
+
     // Detect multimodal (image) content → route to VLM engine
     let image_b64 = request.messages.iter().rev().find_map(|m| {
         m.content.as_ref().and_then(|c| c.image_base64())

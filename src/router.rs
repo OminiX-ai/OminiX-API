@@ -5,16 +5,26 @@ use crate::handlers;
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
+    let cuda_routing_enabled = state.sglang_router.is_some();
     let cors = Cors::new()
         .allow_origin(AllowOrigin::any())
         .allow_methods(AllowMethods::any())
         .allow_headers(AllowHeaders::any())
         .into_handler();
 
-    Router::new()
-        .hoop(affix_state::inject(state))
-        .hoop(cors)
+    let router = Router::new().hoop(affix_state::inject(state));
+    // With a CUDA route, loopback is the default security boundary. Wildcard
+    // CORS would let arbitrary web pages spend local/remote compute through a
+    // browser, so only the backward-compatible local-MLX mode enables it.
+    let router = if cuda_routing_enabled {
+        router
+    } else {
+        router.hoop(cors)
+    };
+
+    router
         .push(Router::with_path("health").get(handlers::health::health))
+        .push(Router::with_path("readyz").get(handlers::health::readiness))
         .push(Router::with_path("version").get(handlers::version::get_version))
         .push(
             Router::with_path("v1")
